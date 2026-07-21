@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Run dsctl against Kalodata classic REST via local rewrite proxy (read-only).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROXY_PY="$ROOT/scripts/ds-classic-proxy.py"
+HOST="${DS_PROXY_HOST:-127.0.0.1}"
+PORT="${DS_PROXY_PORT:-18765}"
+ENV_FILE="${DS_ENV_FILE:-$HOME/.config/dsctl/kalodata-341.env}"
+UPSTREAM_DEFAULT="https://ds-offline.kalowave.com/dolphinscheduler"
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "missing env file: $ENV_FILE" >&2
+  exit 1
+fi
+
+# Load DS_API_TOKEN / DS_VERSION / DS_API_URL without printing secrets
+eval "$(
+  python3 - <<PY
+from pathlib import Path
+vals = {}
+for line in Path("$ENV_FILE").read_text().splitlines():
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    k, v = line.split("=", 1)
+    k, v = k.strip(), v.strip().strip('"').strip("'")
+    if k in {"DS_API_URL", "DS_API_TOKEN", "DS_VERSION"}:
+        vals[k] = v
+import shlex
+for k, v in vals.items():
+    print(f"export {k}={shlex.quote(v)}")
+PY
+)"
+
+UPSTREAM="${DS_UPSTREAM_URL:-${DS_API_URL:-$UPSTREAM_DEFAULT}}"
+export DS_UPSTREAM_URL="$UPSTREAM"
+export DS_PROXY_READONLY="${DS_PROXY_READONLY:-1}"
+export DS_VERSION="${DS_VERSION:-3.4.1}"
+export DS_DEFAULT_PROJECT_CODE="${DS_DEFAULT_PROJECT_CODE:-9892432515424}"
+
+if ! curl -fsS "http://${HOST}:${PORT}/dolphinscheduler/actuator/health" >/dev/null 2>&1; then
+  DS_UPSTREAM_URL="$UPSTREAM" DS_PROXY_HOST="$HOST" DS_PROXY_PORT="$PORT" \
+    nohup python3 "$PROXY_PY" >/tmp/ds-classic-proxy.log 2>&1 &
+  echo $! >/tmp/ds-classic-proxy.pid
+  for _ in $(seq 1 40); do
+    if curl -fsS "http://${HOST}:${PORT}/dolphinscheduler/actuator/health" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.15
+  done
+fi
+
+if ! curl -fsS "http://${HOST}:${PORT}/dolphinscheduler/actuator/health" >/dev/null 2>&1; then
+  echo "proxy failed to start; see /tmp/ds-classic-proxy.log" >&2
+  exit 1
+fi
+
+export DS_API_URL="http://${HOST}:${PORT}/dolphinscheduler"
+exec dsctl "$@"

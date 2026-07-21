@@ -1,0 +1,25 @@
+{
+  "allowed_users": ["ou_xxx"],
+  "allowed_chats": [],
+  "alert_chat_ids": [],
+  "ds_project_code": "YOUR_DS_PROJECT_CODE",
+  "ds_readonly": true,
+  "sql_repo_path": "/path/to/your-pipeline-sql-repo",
+  "alert_watch": {
+    "enabled": true,
+    "interval_seconds": 90,
+    "lookback_minutes": 180,
+    "max_pages": 8,
+    "max_per_tick": 5,
+    "fetch_log": true,
+    "auto_register": true,
+    "notify_chat_ids": [],
+    "notify_user_ids": ["ou_xxx"]
+  },
+  "projects": {
+    "remote": "/path/to/dolphin-feishu-bot"
+  },
+  "model": "auto",
+  "max_reply_chars": 6000,
+  "alert_prompt_path": "/Users/you/.cursor/agents/alert/PROMPT.md"
+}

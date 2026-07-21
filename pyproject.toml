@@ -1,0 +1,17 @@
+[project]
+name = "feishu-cursor-remote"
+version = "0.1.0"
+description = "A small Feishu bot bridge for safe local Cursor Agent tasks."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "cursor-sdk",
+]
+
+[project.scripts]
+feishu-cursor-remote = "feishu_cursor_remote.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+

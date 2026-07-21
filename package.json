@@ -1,0 +1,21 @@
+{
+  "name": "dolphin-feishu-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Feishu private-chat bot bridge for DolphinScheduler classic REST (diagnose, slow jobs, failure alerts)",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/Riffizzz/dolphin-feishu-bot.git"
+  },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@cursor/sdk": "latest"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
