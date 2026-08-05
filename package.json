@@ -6,7 +6,7 @@
   "description": "Feishu private-chat bot bridge for DolphinScheduler classic REST (diagnose, slow jobs, failure alerts)",
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/Riffizzz/data-engineering-dolphin-bot.git"
+    "url": "git+ssh://git@github.com/Kalodata/data-engineering-dolphin-bot.git"
   },
   "scripts": {
     "start": "node src/main.mjs",

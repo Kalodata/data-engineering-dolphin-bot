@@ -92,7 +92,7 @@ https://<你的公网或隧道>/feishu/card
 ## 快速开始（自建一份桥）
 
 ```bash
-git clone git@github.com:Riffizzz/data-engineering-dolphin-bot.git
+git clone git@github.com:Kalodata/data-engineering-dolphin-bot.git
 cd data-engineering-dolphin-bot
 npm install
 
