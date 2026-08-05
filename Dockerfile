@@ -14,6 +14,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY src ./src
+COPY allowlist.json ./allowlist.json
 COPY config.ecs.example.json ./config.ecs.example.json
 COPY scripts/ecs/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh \

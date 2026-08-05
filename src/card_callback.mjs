@@ -73,13 +73,20 @@ export function startCardCallbackServer({
 
       if (verificationToken) {
         const token = body.token || body.header?.token;
-        if (token && token !== verificationToken) {
-          log("[card-callback] token mismatch");
+        if (!token || token !== verificationToken) {
+          log("[card-callback] token missing or mismatch");
           json(res, 200, {
-            toast: { type: "error", content: "verification_token 不匹配，请检查 config.json" },
+            toast: { type: "error", content: "verification_token 验证失败" },
           });
           return;
         }
+      } else {
+        // Token not configured → fail-closed: reject all non-url_verification requests
+        log("[card-callback] verification_token not configured, rejecting");
+        json(res, 200, {
+          toast: { type: "error", content: "服务未配置 verification_token，拒绝所有回调" },
+        });
+        return;
       }
 
       if (encryptKey && body.encrypt) {

@@ -77,6 +77,7 @@ import {
   startCardCallbackServer,
   createConfirmStore,
 } from "./card_callback.mjs";
+import { createAuditLog } from "./audit_log.mjs";
 
 loadDotEnv(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.env"));
 
@@ -125,6 +126,8 @@ const ALERT_HINTS = [
 let failureWatcher = null;
 /** Shared config for card callback handler. */
 let runtimeConfig = null;
+/** Audit log for write operations (rerun / force-success). */
+let auditLog = null;
 function loadDotEnv(envPath) {
   if (!fs.existsSync(envPath)) return;
   for (const rawLine of fs.readFileSync(envPath, "utf8").split("\n")) {
@@ -248,6 +251,18 @@ function loadConfig(configPath) {
       };
     })(),
   };
+  // Merge allowlist.json (committed to git) into allowed_users / notify_user_ids
+  const allowlistPath = path.resolve(path.dirname(resolvedConfigPath), "allowlist.json");
+  if (fs.existsSync(allowlistPath)) {
+    const al = JSON.parse(fs.readFileSync(allowlistPath, "utf8"));
+    for (const id of al.allowed_users ?? []) config.allowedUsers.add(id);
+    for (const id of al.notify_user_ids ?? []) {
+      if (!config.alertWatch.notifyUserIds.includes(id)) {
+        config.alertWatch.notifyUserIds.push(id);
+      }
+    }
+  }
+
   // Effective poll interval after webhook mode is known
   config.alertWatch.effectiveIntervalSeconds = resolveAlertPollIntervalSeconds(config);
   return config;
@@ -958,19 +973,31 @@ async function handleConfirm(config, message, accepted) {
 
 async function executePendingWrite(config, pending) {
   const ds = getDsClient(config);
-  if (pending.kind === "force-success") {
-    const taskId = Number(pending.taskInstanceId);
-    await ds.forceTaskSuccess(taskId);
-    return (
-      `已强制成功：任务 #${taskId} → FORCED_SUCCESS\n` +
-      `若工作流仍红/下游未继续，可再点告警卡「重跑」或回「重跑 <实例id>」。`
-    );
+  const auditBase = {
+    openId: pending.openId || "unknown",
+    action: pending.kind,
+    detail: pending.summary || "",
+  };
+  try {
+    let resultText;
+    if (pending.kind === "force-success") {
+      const taskId = Number(pending.taskInstanceId);
+      await ds.forceTaskSuccess(taskId);
+      resultText =
+        `已强制成功：任务 #${taskId} → FORCED_SUCCESS\n` +
+        `若工作流仍红/下游未继续，可再点告警卡「重跑」或回「重跑 <实例id>」。`;
+    } else {
+      await ds.execute(pending.processInstanceId, pending.executeType);
+      resultText =
+        `已提交：实例 #${pending.processInstanceId} → ${pending.executeType}\n` +
+        `请到 DS UI 或稍后 /tasks ${pending.processInstanceId} 查看状态。`;
+    }
+    auditLog?.write({ ...auditBase, ok: true });
+    return resultText;
+  } catch (err) {
+    auditLog?.write({ ...auditBase, ok: false, error: err.message });
+    throw err;
   }
-  await ds.execute(pending.processInstanceId, pending.executeType);
-  return (
-    `已提交：实例 #${pending.processInstanceId} → ${pending.executeType}\n` +
-    `请到 DS UI 或稍后 /tasks ${pending.processInstanceId} 查看状态。`
-  );
 }
 
 async function handleAlert(config, alertText, message) {
@@ -1508,9 +1535,8 @@ async function handleMessage(config, message) {
     return;
   }
   if (config.allowedUsers.size > 0 && !config.allowedUsers.has(message.senderId)) {
-    console.error(
-      `Ignored sender ${message.senderId} (allowlist: ${[...config.allowedUsers].join(", ") || "(empty)"})`,
-    );
+    console.error(`[auth] blocked sender ${message.senderId} (not in allowlist)`);
+    await sendText({ chatId: message.chatId, text: "您无权使用此 Bot，如需访问请联系管理员。" });
     return;
   }
   if (config.allowedChats.size > 0 && !config.allowedChats.has(message.chatId) && !alertChat) {
@@ -1656,12 +1682,11 @@ async function handleCardAction(action) {
   if (!config) {
     return { toast: { type: "error", content: "bot 未就绪" } };
   }
-  if (
-    config.allowedUsers.size > 0 &&
-    action.openId &&
-    !config.allowedUsers.has(action.openId)
-  ) {
-    return { toast: { type: "error", content: "无权限" } };
+  if (config.allowedUsers.size > 0) {
+    if (!action.openId || !config.allowedUsers.has(action.openId)) {
+      console.error(`[auth] blocked card action openId=${action.openId || "(none)"} action=${action.action}`);
+      return { toast: { type: "error", content: "无权限：您不在授权用户列表中" } };
+    }
   }
 
   const chatId = action.chatId;
@@ -1862,6 +1887,9 @@ async function main() {
   const configPath = configFlagIndex >= 0 ? process.argv[configFlagIndex + 1] : "config.json";
   const config = loadConfig(configPath);
   runtimeConfig = config;
+  auditLog = createAuditLog(
+    path.resolve(path.dirname(config.configPath), ".data/audit.jsonl"),
+  );
 
   const child = startEventConsumer();
   await waitForReady(child);
