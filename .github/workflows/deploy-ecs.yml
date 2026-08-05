@@ -1,21 +1,16 @@
-# Optional GitHub Actions — push main → ECR + ECS update (ops must have created Service once).
-# Secrets: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or OIDC role).
+# CI/CD: main → ECR + ECS update-service（OIDC，无 AK/SK）
+# Role: arn:aws:iam::136376784788:role/dolphin-bot-cicd
+# 首次：push 出镜像后，由运维建 Task Definition + Service；之后本 workflow 只 force-new-deployment。
+# OIDC 信任目前仅 main（非 main 会 AssumeRoleWithWebIdentity 拒绝）。
 name: deploy-ecs
 
 on:
-  workflow_dispatch:
   push:
     branches: [main]
-    paths:
-      - "src/**"
-      - "Dockerfile"
-      - "package.json"
-      - "package-lock.json"
-      - "deploy/ecs/**"
-      - "scripts/ecs/**"
-      - "config.ecs.example.json"
+  workflow_dispatch:
 
 permissions:
+  id-token: write
   contents: read
 
 jobs:
@@ -26,48 +21,36 @@ jobs:
       AWS_ACCOUNT_ID: "136376784788"
       ECS_CLUSTER: dolphin-bot
       ECS_SERVICE: dolphin-bot
-      ECR_REPO: dolphin-bot
+      ECR: 136376784788.dkr.ecr.ap-southeast-1.amazonaws.com/dolphin-bot
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS
+      - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::136376784788:role/dolphin-bot-cicd
+          aws-region: ap-southeast-1
 
-      - name: Login ECR
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      - uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push
-        env:
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          IMG="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
-          docker build -t "$IMG:$IMAGE_TAG" -t "$IMG:latest" .
-          docker push "$IMG:$IMAGE_TAG"
-          docker push "$IMG:latest"
-          echo "IMAGE=$IMG:$IMAGE_TAG" >> "$GITHUB_ENV"
-
-      - name: Register task definition and update service
+      - name: Build & push
         run: |
           set -euo pipefail
-          TD=$(mktemp)
-          jq --arg img "$IMAGE" \
-            '.containerDefinitions[0].image=$img' \
-            deploy/ecs/task-definition.json > "$TD"
-          ARN=$(aws ecs register-task-definition \
-            --cli-input-json "file://$TD" \
-            --query 'taskDefinition.taskDefinitionArn' --output text)
+          docker build -t "$ECR:${GITHUB_SHA}" -t "$ECR:latest" .
+          docker push "$ECR:${GITHUB_SHA}"
+          docker push "$ECR:latest"
+
+      - name: Deploy (force new deployment)
+        run: |
+          set -euo pipefail
+          # Service 未创建时会失败——预期：先有镜像，运维建好 Service 后再跑或 re-run。
           aws ecs update-service \
             --cluster "$ECS_CLUSTER" \
             --service "$ECS_SERVICE" \
-            --task-definition "$ARN" \
-            --desired-count 1 \
-            --force-new-deployment
+            --force-new-deployment \
+            --region "$AWS_REGION"
           aws ecs wait services-stable \
             --cluster "$ECS_CLUSTER" \
-            --services "$ECS_SERVICE"
-          echo "deployed $ARN"
+            --services "$ECS_SERVICE" \
+            --region "$AWS_REGION" \
+            || echo "::warning::wait services-stable timed out or failed; check ECS console"

@@ -79,15 +79,14 @@ https://<你的公网或隧道>/feishu/card
 
 ## ECS / Fargate 部署
 
-坐标见 [`deploy/ecs/cicd.env`](deploy/ecs/cicd.env)（Cluster/Service/ECR=`dolphin-bot`）。说明：[`docs/ecs-deploy.md`](docs/ecs-deploy.md)。
+坐标见 [`deploy/ecs/cicd.env`](deploy/ecs/cicd.env)。CI 用 **GitHub Actions OIDC**（角色 `dolphin-bot-cicd`，无 AK/SK）。说明：[`docs/ecs-deploy.md`](docs/ecs-deploy.md)。
 
 ```bash
-# 运维已建好 Service 后，有 Docker + 部署 IAM：
+# 本地有权限时也可：
 ./scripts/ecs/deploy.sh
-# 或 GitHub Actions：.github/workflows/deploy-ecs.yml
 ```
 
-切流前本机桥 + 隧道继续服务卡片按钮。
+`main` push → `.github/workflows/deploy-ecs.yml`（先推镜像；Service 建好后再 force deploy）。
 
 ## 快速开始（自建一份桥）
 
