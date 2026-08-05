@@ -80,6 +80,13 @@ export function startCardCallbackServer({
           });
           return;
         }
+      } else {
+        // Token not configured → fail-closed: reject all non-url_verification requests
+        log("[card-callback] verification_token not configured, rejecting");
+        json(res, 200, {
+          toast: { type: "error", content: "服务未配置 verification_token，拒绝所有回调" },
+        });
+        return;
       }
 
       if (encryptKey && body.encrypt) {

@@ -251,6 +251,18 @@ function loadConfig(configPath) {
       };
     })(),
   };
+  // Merge allowlist.json (committed to git) into allowed_users / notify_user_ids
+  const allowlistPath = path.resolve(path.dirname(resolvedConfigPath), "allowlist.json");
+  if (fs.existsSync(allowlistPath)) {
+    const al = JSON.parse(fs.readFileSync(allowlistPath, "utf8"));
+    for (const id of al.allowed_users ?? []) config.allowedUsers.add(id);
+    for (const id of al.notify_user_ids ?? []) {
+      if (!config.alertWatch.notifyUserIds.includes(id)) {
+        config.alertWatch.notifyUserIds.push(id);
+      }
+    }
+  }
+
   // Effective poll interval after webhook mode is known
   config.alertWatch.effectiveIntervalSeconds = resolveAlertPollIntervalSeconds(config);
   return config;
