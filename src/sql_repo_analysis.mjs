@@ -65,7 +65,6 @@ export function extractSqlStructure(sqlText) {
   while ((m = overwriteRe.exec(text))) {
     let t = m[1].replace(/`/g, "").trim();
     if (!t) continue;
-    // Keep template names readable; skip only pure garbage
     if (/^\$\{/.test(t)) continue;
     targets.push(t);
   }
@@ -76,15 +75,13 @@ export function extractSqlStructure(sqlText) {
     let t = m[1].replace(/`/g, "").trim();
     if (!t || /^\$\{/.test(t)) continue;
     if (/^(SELECT|WITH|LATERAL)$/i.test(t)) continue;
-    if (/^[A-Z]$/i.test(t)) continue; // alias
+    if (/^[A-Z]$/i.test(t)) continue;
     sources.add(t);
   }
-  // drop targets from sources for clearer "依赖"
   for (const t of targets) sources.delete(t);
 
   const partitions = [];
-  const partRe =
-    /PARTITION\s*\(\s*([^)]+)\)/gi;
+  const partRe = /PARTITION\s*\(\s*([^)]+)\)/gi;
   while ((m = partRe.exec(text))) {
     partitions.push(m[1].replace(/\s+/g, " ").trim().slice(0, 120));
   }
@@ -111,20 +108,119 @@ export function recentSqlCommits(repoRoot, filePath, { n = 3 } = {}) {
     const rel = path.relative(repoRoot, filePath);
     const out = execFileSync(
       "git",
-      ["-C", repoRoot, "log", `-${n}`, "--format=%h %ad %s", "--date=short", "--", rel],
+      ["-C", repoRoot, "log", `-${n}`, "--format=%h|%ad|%s", "--date=short", "--", rel],
       { encoding: "utf8", timeout: 5000 },
     ).trim();
     if (!out) return [];
-    return out.split("\n").filter(Boolean).slice(0, n);
+    return out.split("\n").filter(Boolean).map((line) => {
+      const [hash, date, ...rest] = line.split("|");
+      return {
+        hash: hash || "",
+        date: date || "",
+        subject: rest.join("|") || "",
+        label: `${hash} ${date} ${rest.join("|")}`.trim(),
+      };
+    });
   } catch {
     return [];
   }
 }
 
+/** Parse origin remote into https github base + default branch guess. */
+export function resolveGithubRepo(repoRoot) {
+  try {
+    const url = execFileSync("git", ["-C", repoRoot, "remote", "get-url", "origin"], {
+      encoding: "utf8",
+      timeout: 3000,
+    }).trim();
+    let m = url.match(/github\.com[:/]([^/]+)\/([^/.]+)(?:\.git)?$/i);
+    if (!m) return null;
+    const owner = m[1];
+    const repo = m[2];
+    let branch = "main";
+    try {
+      branch = execFileSync("git", ["-C", repoRoot, "rev-parse", "--abbrev-ref", "HEAD"], {
+        encoding: "utf8",
+        timeout: 3000,
+      }).trim() || "main";
+      if (branch === "HEAD") {
+        branch =
+          execFileSync("git", ["-C", repoRoot, "rev-parse", "--short", "HEAD"], {
+            encoding: "utf8",
+            timeout: 3000,
+          }).trim() || "main";
+      }
+    } catch {
+      branch = "main";
+    }
+    return {
+      owner,
+      repo,
+      branch,
+      baseUrl: `https://github.com/${owner}/${repo}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function githubBlobUrl(github, relativePath, { line = null, hash = null } = {}) {
+  if (!github?.baseUrl || !relativePath) return "";
+  const ref = hash || github.branch || "main";
+  let url = `${github.baseUrl}/blob/${ref}/${relativePath.replace(/^\/+/, "")}`;
+  if (line) url += `#L${line}`;
+  return url;
+}
+
+export function githubCommitUrl(github, hash) {
+  if (!github?.baseUrl || !hash) return "";
+  return `${github.baseUrl}/commit/${hash}`;
+}
+
+/** Pull identifiers from Spark/Hive error text for code search. */
+export function extractErrorTokens(logText) {
+  const log = String(logText || "");
+  const tokens = new Set();
+  const patterns = [
+    /cannot resolve [`'"]?([A-Za-z_][\w.]*)[`'"]?/gi,
+    /Table or view not found:\s*[`'"]?([A-Za-z_][\w.]*)[`'"]?/gi,
+    /Column [`'"]?([A-Za-z_][\w.]*)[`'"]? cannot/gi,
+    /\[UNRESOLVED_COLUMN[^\]]*\]\s*[`'"]?([A-Za-z_][\w.]*)[`'"]?/gi,
+    /Partition\s+([A-Za-z_][\w=,. ]+)/gi,
+  ];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(log))) {
+      const t = String(m[1] || "").replace(/[`'"]/g, "").trim();
+      if (t && t.length > 1) tokens.add(t);
+    }
+  }
+  return [...tokens].slice(0, 8);
+}
+
+/** Find first SQL line that mentions any token (1-based). */
+export function findSqlLineForTokens(sqlText, tokens) {
+  if (!tokens?.length) return null;
+  const lines = String(sqlText || "").split(/\r?\n/);
+  const lowerTokens = tokens.map((t) => t.toLowerCase());
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line || /^\s*--/.test(line)) continue;
+    const low = line.toLowerCase();
+    for (const t of lowerTokens) {
+      const leaf = t.split(".").pop();
+      if (leaf && low.includes(leaf.toLowerCase())) {
+        return { line: i + 1, snippet: line.trim().slice(0, 100), token: t };
+      }
+    }
+  }
+  return null;
+}
+
 /**
- * Build short repo-backed analysis for alert cards (no LLM).
- * Only returns actionable lines when log/category suggests SQL/partition root cause;
- * engine/connection failures skip the dump (script path still resolved for 脚本行).
+ * Build repo + GitHub backed analysis for alert/diagnose cards.
+ * - Engine/connection: still attach script + recent commits + GitHub (排除代码侧 / 近改)
+ * - SQL/partition: map error tokens → SQL line + GitHub deep link
  */
 export function analyzeSqlAgainstFailure({
   repoRoot,
@@ -143,45 +239,17 @@ export function analyzeSqlAgainstFailure({
       useful: false,
       absPath: null,
       relativePath: sqlFile,
-      lines: [],
+      lines: [`仓库未找到脚本：${sqlFile}`],
     };
   }
 
   const relativePath = path.relative(repoRoot, absPath);
   const log = String(logText || "");
   const cat = String(category || "");
-
-  // Infra / engine: script path is enough; don't paste table/partition inventory.
-  if (
-    /连接\/会话|引擎\/集群|超时/.test(cat) ||
-    /TTransportException|Socket closed|NodeId\.getHost|TA_OUTPUT_FAILED|TezTask|org\.apache\.tez/i.test(
-      log,
-    )
-  ) {
-    return {
-      found: true,
-      useful: false,
-      absPath,
-      relativePath,
-      lines: [],
-    };
-  }
-
-  const worthRepo =
-    /SQL|分区\/路径/.test(cat) ||
-    /AnalysisException|SemanticException|ParseException|cannot resolve|Table or view not found|InvalidInputException|Partition.+not found|Path does not exist|cannot find partition/i.test(
-      log,
-    );
-
-  if (!worthRepo) {
-    return {
-      found: true,
-      useful: false,
-      absPath,
-      relativePath,
-      lines: [],
-    };
-  }
+  const github = resolveGithubRepo(repoRoot);
+  const commits = recentSqlCommits(repoRoot, absPath, { n: 3 });
+  const blobUrl = githubBlobUrl(github, relativePath);
+  const commitUrl = commits[0] ? githubCommitUrl(github, commits[0].hash) : "";
 
   let sqlText = "";
   try {
@@ -197,30 +265,97 @@ export function analyzeSqlAgainstFailure({
   }
 
   const struct = extractSqlStructure(sqlText);
-  const commits = recentSqlCommits(repoRoot, absPath);
   const lines = [];
 
-  // Correlate log with SQL first — this is the value-add.
-  const logHitTables = struct.sources
-    .concat(struct.targets)
-    .filter((t) => {
-      const leaf = t.toLowerCase().split(".").pop();
-      return leaf && log.toLowerCase().includes(leaf);
-    });
+  // Infra / engine / quality gate: don't pretend SQL rewrite is the fix.
+  if (
+    /连接\/会话|引擎\/集群|超时|数据质量/.test(cat) ||
+    /TTransportException|Socket closed|NodeId\.getHost|TA_OUTPUT_FAILED|TezTask|MetadataFetchFailed|FetchFailedException|org\.apache\.tez|expected:\s*\[.*\].*matched:\s*false|quality check/i.test(
+      log,
+    )
+  ) {
+    if (/数据质量|expected:\s*\[.*\].*matched:\s*false|quality check/i.test(`${cat}\n${log}`)) {
+      const q = log.match(/expected:\s*(\[[^\]]+\])\s*,\s*actual:\s*([-\d.eE]+)/i);
+      lines.push(
+        q
+          ? `质量门禁：期望${q[1]} 实际${q[2]} → 先查表指标，再考虑改阈值或修数`
+          : "质量门禁失败 → 先查表指标与阈值，不是改本脚本语法",
+      );
+      if (blobUrl) lines.push(`相关脚本（非本次直接挂点）：${blobUrl}`);
+      if (commits[0]) lines.push(`近改：${commits[0].label}`);
+      return {
+        found: true,
+        useful: true,
+        absPath,
+        relativePath,
+        struct,
+        commits: commits.map((c) => c.label),
+        githubUrl: commitUrl || blobUrl,
+        lines: lines.slice(0, 4),
+      };
+    }
+    lines.push("代码侧：本次像引擎/集群抖动，优先不当脚本逻辑缺陷");
+    if (commits[0]) {
+      const ageDays = commitAgeDays(commits[0].date);
+      const ageNote =
+        ageDays != null && ageDays <= 14
+          ? `（${ageDays} 天内有改动，若反复失败再看）`
+          : "";
+      lines.push(`近改：${commits[0].label}${ageNote}`);
+      if (commitUrl) lines.push(`GitHub：${commitUrl}`);
+    } else if (blobUrl) {
+      lines.push(`脚本：${blobUrl}`);
+    }
+    return {
+      found: true,
+      useful: true,
+      absPath,
+      relativePath,
+      struct,
+      commits: commits.map((c) => c.label),
+      githubUrl: commitUrl || blobUrl,
+      lines: lines.slice(0, 4),
+    };
+  }
+
+  const worthDeep =
+    /SQL|分区\/路径|资源/.test(cat) ||
+    /AnalysisException|SemanticException|ParseException|cannot resolve|Table or view not found|InvalidInputException|Partition.+not found|Path does not exist|cannot find partition|OutOfMemory/i.test(
+      log,
+    );
+
+  const tokens = extractErrorTokens(log);
+  const hit = findSqlLineForTokens(sqlText, tokens);
 
   if (/AnalysisException|SemanticException|ParseException|cannot resolve|Table or view not found/i.test(log)) {
-    if (logHitTables.length) {
-      lines.push(`日志点名：${logHitTables.slice(0, 3).join(", ")} → 查本脚本对应段`);
+    if (hit) {
+      lines.push(`代码定位：L${hit.line} 含「${hit.token}」→ ${hit.snippet}`);
+      const deep = githubBlobUrl(github, relativePath, {
+        line: hit.line,
+        hash: commits[0]?.hash,
+      });
+      if (deep) lines.push(`GitHub：${deep}`);
     } else {
       lines.push("日志为 SQL 语义/解析错误 → 对照本脚本与上游表结构");
+      if (blobUrl) lines.push(`脚本：${blobUrl}`);
     }
   } else if (/InvalidInputException|Partition.+not found|Path does not exist|cannot find partition/i.test(log)) {
     const part = struct.partitions[0];
     lines.push(
       part
-        ? `分区缺失风险：脚本按 ${part} 读写下游 → 核对参数与上游是否已产出`
+        ? `分区缺失风险：脚本按 ${part} 读写 → 核对参数与上游是否已产出`
         : "日志像分区/路径缺失 → 核对参数日期与上游分区",
     );
+    if (hit) lines.push(`相关行：L${hit.line} ${hit.snippet}`);
+    if (blobUrl) lines.push(`脚本：${blobUrl}`);
+  } else if (worthDeep) {
+    if (hit) {
+      lines.push(`代码线索：L${hit.line} ${hit.snippet}`);
+      const deep = githubBlobUrl(github, relativePath, { line: hit.line });
+      if (deep) lines.push(`GitHub：${deep}`);
+    } else if (blobUrl) {
+      lines.push(`脚本：${blobUrl}`);
+    }
   }
 
   if (struct.targets.length) {
@@ -231,7 +366,12 @@ export function analyzeSqlAgainstFailure({
     lines.push(`写入：${preferred.join(", ")}`);
   }
 
-  // Only list deps that appear in the error, else skip long inventory.
+  const logHitTables = struct.sources
+    .concat(struct.targets)
+    .filter((t) => {
+      const leaf = t.toLowerCase().split(".").pop();
+      return leaf && log.toLowerCase().includes(leaf);
+    });
   if (logHitTables.length) {
     lines.push(`相关依赖：${logHitTables.slice(0, 4).join(", ")}`);
   }
@@ -246,8 +386,11 @@ export function analyzeSqlAgainstFailure({
     lines.push("注意：INSERT OVERWRITE + 常假过滤，存在空写冲分区风险");
   }
 
-  if (commits.length) {
-    lines.push(`近改：${commits[0]}`);
+  if (commits[0] && !lines.some((l) => l.startsWith("近改") || l.includes("commit"))) {
+    lines.push(`近改：${commits[0].label}`);
+    if (commitUrl && !lines.some((l) => l.includes("github.com"))) {
+      lines.push(`GitHub：${commitUrl}`);
+    }
   }
 
   return {
@@ -256,7 +399,15 @@ export function analyzeSqlAgainstFailure({
     absPath,
     relativePath,
     struct,
-    commits,
-    lines: lines.slice(0, 5),
+    commits: commits.map((c) => c.label),
+    githubUrl: commitUrl || blobUrl,
+    lines: lines.slice(0, 6),
   };
+}
+
+function commitAgeDays(dateStr) {
+  if (!dateStr) return null;
+  const t = Date.parse(dateStr);
+  if (!Number.isFinite(t)) return null;
+  return Math.floor((Date.now() - t) / 86400000);
 }

@@ -15,3 +15,6 @@ config.json
 tmp-*/
 *.xml
 !**/fixtures/**/*.xml
+hs_err_*.log
+*.class
+scripts/hive-ro/HiveRo.class

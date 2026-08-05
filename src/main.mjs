@@ -8,24 +8,75 @@ import { fileURLToPath } from "node:url";
 
 import {
   Ds32Client,
+  buildActionPlaybook,
+  buildProcessInstanceUiUrl,
   classifyFailure,
   extractLogHighlights,
+  formatCountryDailyBoard,
   formatFailedList,
   formatPracticalDiagnosis,
+  formatProgressReport,
   formatSlowStageJobs,
   formatTaskList,
   interpretNaturalLanguage,
+  listCountryDailyBoard,
+  listRunningProgress,
   loadDsEnv,
   WH_STAGE_NAME_RE,
+  formatTaskIdentity,
+  formatFailedTasksPickList,
 } from "./ds32_client.mjs";
+import { enrichFailureContext } from "./deep_enrich.mjs";
+import { analyzeSqlAgainstFailure } from "./sql_repo_analysis.mjs";
 import {
   buildPlannerPrompt,
   executeDsPlan,
   heuristicDsPlan,
+  heuristicPlanIsConcrete,
   looksLikeDsOps,
   parsePlannerJson,
 } from "./ds_adaptive.mjs";
-import { startFailureWatcher } from "./failure_watcher.mjs";
+import { resolveCountryCode } from "./country_code.mjs";
+import {
+  formatAlertReport,
+  formatAlertCard,
+  materializeTaskAlert,
+  markTaskNotified,
+  startFailureWatcher,
+} from "./failure_watcher.mjs";
+import {
+  buildEvidenceAwareAlertPrompt,
+  gatherAlertEvidence,
+  shouldUseAlertTemplate,
+} from "./alert_evidence.mjs";
+import {
+  FEEDBACK_HINT,
+  parseFeedback,
+  recordFeedback,
+  rememberAlertForFeedback,
+} from "./alert_feedback.mjs";
+import { startDsAlertIngress } from "./ds_alert_ingress.mjs";
+import {
+  describeAlertMode,
+  resolveAlertPollIntervalSeconds,
+  resolveWebhookToken,
+} from "./alert_mode.mjs";
+import {
+  welcomeCard,
+  helpCard,
+  confirmCard,
+  doneCard,
+  cancelledCard,
+  diagnoseCard,
+  forceSuccessPickCard,
+  disabledConfirmCard,
+  failedListCard,
+  slowJobsCard,
+} from "./feishu_cards.mjs";
+import {
+  startCardCallbackServer,
+  createConfirmStore,
+} from "./card_callback.mjs";
 
 loadDotEnv(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.env"));
 
@@ -34,25 +85,25 @@ const DEFAULT_ALERT_PROMPT_PATH = path.join(
   os.homedir(),
   ".cursor/agents/alert/PROMPT.md",
 );
-const HELP_TEXT = `可以像 Cursor 一样直接打字（复杂 DS 排查会自动规划并查数，不必死记命令）。
-
-默认项目：kalo_data_online:daily（9892432515424）
-模式：只读查看（禁止重跑 / 停止 / 改定义）
+const HELP_TEXT = `可以像 Cursor 一样直接打字（复杂 DS 排查会自动规划并查数）。
 
 自然语言示例：
-「只看数仓层、印尼分区、stage>15m 的慢 job」
-「最近失败出了什么问题」
+「最近失败」「诊断 1939974」「重跑」「强制成功」
+「id分区进度」「各国天级进度」「只看数仓层、印尼、stage>15m 的慢 job」
 
-快捷（可选）：
-/diagnose  /failed  /slow  /slow wh id  /tasks  /log  /help
+写操作弹确认卡（点按钮或回 YES）；仍禁止改工作流定义。
+告警卡可点：诊断 / 重跑 / 有用 / 误报。
+快捷：/progress id  /board  /failed  /diagnose
+高级：/slow /tasks /log /mcp /status /help`;
 
-告警：定时扫 daily 新 FAILURE（过滤 ROUTER/CHECK VALID），私聊推【工作流告警】（只读，不自动修）。
-
-DS 凭证：~/.config/dsctl/offline.env。有日志原文直接粘贴。`;
-
-/** @type {Map<string, {kind: string, processInstanceId: number, executeType: string, expiresAt: number}>} */
-const pendingConfirms = new Map();
 const CONFIRM_TTL_MS = 5 * 60 * 1000;
+const pendingConfirms = createConfirmStore({ ttlMs: CONFIRM_TTL_MS });
+
+/** Last FAILURE / diagnosed process instance per chat — for bare「重跑」. */
+const lastFailureByChat = new Map();
+
+/** Last diagnosed / logged FAILURE task id — for bare「强制成功」. */
+const lastTaskByChat = new Map();
 
 /** @type {Map<string, Array<{role: string, text: string}>>} */
 const chatHistories = new Map();
@@ -70,6 +121,10 @@ const ALERT_HINTS = [
   "任务失败",
 ];
 
+/** Set by main() so p2p chats can register as alert recipients. */
+let failureWatcher = null;
+/** Shared config for card callback handler. */
+let runtimeConfig = null;
 function loadDotEnv(envPath) {
   if (!fs.existsSync(envPath)) return;
   for (const rawLine of fs.readFileSync(envPath, "utf8").split("\n")) {
@@ -115,6 +170,19 @@ function loadConfig(configPath) {
     sqlRepoPath: raw.sql_repo_path
       ? path.resolve(raw.sql_repo_path)
       : path.resolve(os.homedir(), "data-analysis-tiktok"),
+    enablePrLookup: raw.enable_pr_lookup !== false,
+    hiveProbe: (() => {
+      const h = raw.hive_probe || {};
+      return {
+        enabled: h.enabled !== false,
+        /** Alerts: default off (SHOW PARTITIONS can be slow). Diagnose: on. */
+        onAlert: h.on_alert === true,
+        onDiagnose: h.on_diagnose !== false,
+        jdbcUrl: h.jdbc_url || process.env.HIVE_JDBC_URL || "jdbc:hive2://localhost:10001",
+        jdbcJar: h.jdbc_jar || process.env.HIVE_JDBC_JAR || "",
+        timeoutMs: Number(h.timeout_ms ?? 90_000),
+      };
+    })(),
     alertWatch: (() => {
       const w = raw.alert_watch || {};
       const statePath = path.resolve(
@@ -124,23 +192,66 @@ function loadConfig(configPath) {
       return {
         enabled: w.enabled !== false,
         intervalSeconds: Number(w.interval_seconds ?? 90),
+        /** Used when ds_alert_webhook.prefer_push — slower compensation scan. */
+        fallbackIntervalSeconds: Number(w.fallback_interval_seconds ?? 600),
         lookbackMinutes: Number(w.lookback_minutes ?? 180),
         pageSize: Number(w.page_size ?? 50),
         maxPages: Number(w.max_pages ?? 8),
         maxPerTick: Number(w.max_per_tick ?? 5),
+        /** Wait for DS auto-retry before push; skip if workflow/task already SUCCESS. */
+        healHoldMinutes: Number(w.heal_hold_minutes ?? 15),
         fetchLog: w.fetch_log !== false,
         autoRegister: w.auto_register !== false,
         notifyUserIds: Array.isArray(w.notify_user_ids) ? w.notify_user_ids : [],
         notifyChatIds: Array.isArray(w.notify_chat_ids) ? w.notify_chat_ids : [],
         statePath,
+        dedupePath: path.resolve(
+          path.dirname(resolvedConfigPath),
+          w.dedupe_path || ".data/alert-dedupe.json",
+        ),
+      };
+    })(),
+    alertFeedback: (() => {
+      const f = raw.alert_feedback || {};
+      return {
+        enabled: f.enabled !== false,
+        statePath: path.resolve(
+          path.dirname(resolvedConfigPath),
+          f.state_path || ".data/alert-feedback.json",
+        ),
+      };
+    })(),
+    dsAlertWebhook: (() => {
+      const d = raw.ds_alert_webhook || {};
+      return {
+        enabled: d.enabled === true,
+        port: Number(d.port ?? 18766),
+        path: d.path || "/ds-alert",
+        bind: d.bind || "127.0.0.1",
+        token: String(d.token || process.env.DS_ALERT_WEBHOOK_TOKEN || ""),
+        /** When webhook enabled, default prefer_push=true (poll becomes fallback). */
+        preferPush: d.enabled === true && d.prefer_push !== false,
+      };
+    })(),
+    feishuCardCallback: (() => {
+      const c = raw.feishu_card_callback || {};
+      return {
+        /** Default on so confirm buttons work when tunnel/URL is configured. */
+        enabled: c.enabled !== false,
+        port: Number(c.port ?? 18767),
+        path: c.path || "/feishu/card",
+        bind: c.bind || "127.0.0.1",
+        verificationToken: String(
+          c.verification_token || process.env.FEISHU_VERIFICATION_TOKEN || "",
+        ),
+        encryptKey: String(c.encrypt_key || process.env.FEISHU_ENCRYPT_KEY || ""),
       };
     })(),
   };
+  // Effective poll interval after webhook mode is known
+  config.alertWatch.effectiveIntervalSeconds = resolveAlertPollIntervalSeconds(config);
   return config;
 }
-
-/** Set by main() so p2p chats can register as alert recipients. */
-let failureWatcher = null;
 
 export function parseContent(content) {
   if (!content) return "";
@@ -172,8 +283,15 @@ export function parseMessage(payload) {
   return { messageId, chatId, chatType, senderId, text };
 }
 
+/** Strip leading @mentions so group 「@bot /progress id」 parses as a slash command. */
+export function stripBotMention(text) {
+  return String(text || "")
+    .replace(/^(?:\s*(?:@_user_\d+|@[\w.\-｜|\u4e00-\u9fff]+))+\s*/iu, "")
+    .trim();
+}
+
 export function parseCommand(text) {
-  const trimmed = text.trim();
+  const trimmed = stripBotMention(text);
   if (!trimmed.startsWith("/")) return null;
   const parts = trimmed.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
   return parts.map((part) => part.replace(/^(['"])(.*)\1$/, "$2"));
@@ -187,6 +305,98 @@ export function looksLikeAlert(text) {
 
 export function isAlertChat(config, chatId) {
   return config.alertChatIds.has(chatId);
+}
+
+/** Feishu IM poorly renders Markdown tables — flatten |a|b| rows. */
+export function sanitizeFeishuReply(text) {
+  const lines = String(text || "").split("\n");
+  const out = [];
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/g, "");
+    if (/^\s*\|?\s*:?-{2,}\s*(\|\s*:?-{2,}\s*)+\|?\s*$/.test(line)) continue;
+    if (/^\s*\|.+\|\s*$/.test(line)) {
+      const cells = line
+        .split("|")
+        .map((c) => c.trim())
+        .filter(Boolean);
+      if (cells.length >= 2) out.push(`· ${cells.join(" — ")}`);
+      else if (cells.length === 1) out.push(`· ${cells[0]}`);
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+export function looksLikeMcpQuestion(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  return (
+    /^\/?mcp\b/i.test(t) ||
+    /mcp\s*状态|mcp状态|MCP\s*(连|通|好不好|挂了|可用)/i.test(t) ||
+    /有没有\s*mcp|mcp\s*连上|ds-offline\s*mcp|Cursor\s*MCP/i.test(t)
+  );
+}
+
+/** Bot / DS 连通性、帮助 — 免 Agent。 */
+export function looksLikeBotStatus(text) {
+  const t = String(text || "").trim();
+  if (!t || t.length > 80) return false;
+  if (looksLikeMcpQuestion(t)) return false;
+  if (/^(help|\/help|帮助|你好|在吗|hello)$/i.test(t)) return true;
+  return (
+    /bot\s*(在|还)?(运行|在跑|活着)|还在运行吗|在线吗|活着吗/i.test(t) ||
+    /^(状态|\/status)\b/i.test(t) ||
+    /ds\s*(通|连|状态)|token\s*(失效|过期|坏)|告警\s*(轮询|在跑吗)/i.test(t)
+  );
+}
+
+/**
+ * Feishu bot does NOT use Cursor MCP. Explain architecture + probe DS REST.
+ */
+export async function formatMcpArchitectureStatus(config) {
+  const env = loadDsEnv();
+  const repoRoot =
+    config.projects?.remote ||
+    config.alertCwd ||
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const mcpPath = path.join(repoRoot, "mcp/ds-server.mjs");
+  const mcpFile = fs.existsSync(mcpPath);
+
+  let dsLine = "未配置（缺 DS_API_URL / TOKEN）";
+  if (env.apiUrl && env.apiToken) {
+    try {
+      const ds = getDsClient(config);
+      await ds.listProcessInstances({ pageSize: 1 });
+      let host = env.apiUrl;
+      try {
+        host = new URL(env.apiUrl).host;
+      } catch {
+        // keep
+      }
+      dsLine = `通（${host}）`;
+    } catch (error) {
+      dsLine = `失败：${error.message}`;
+    }
+  }
+
+  return [
+    "【说明】飞书 Dolphin bot 不走 Cursor MCP",
+    "",
+    "本 bot 查 DS：内嵌 Ds32Client → classic REST",
+    `DS 连通：${dsLine}`,
+    `项目：${config.dsProjectCode || env.projectCode || "(unset)"}`,
+    `只读：${config.dsReadonly ? "是" : "否（可 /rerun）"}`,
+    `告警轮询：${config.alertWatch?.enabled ? "开" : "关"}`,
+    "",
+    "Cursor IDE 的 ds-offline MCP：只给 IDE Agent 用",
+    `仓库 mcp/ds-server.mjs：${mcpFile ? "有" : "无"}`,
+    "配置：~/.cursor/mcp.json → ds-offline",
+    "",
+    "所以在飞书问「MCP 连上了吗」会得到「本会话无 MCP」——那是 Agent 误判，不是 bot 坏了。",
+    "飞书请用：/failed /diagnose /status",
+    "验 IDE MCP：Cursor 对话里调 ds_status",
+  ].join("\n");
 }
 
 function getDsClient(config) {
@@ -216,16 +426,64 @@ async function runCommand(config, command, message) {
       `ds_api: ${env.apiUrl || "(none)"}\n` +
       `alert_watch: ${watch?.enabled ? "on" : "off"}` +
       (watch?.enabled
-        ? ` every ${watch.intervalSeconds}s lookback ${watch.lookbackMinutes}m`
-        : "")
+        ? ` every ${watch.effectiveIntervalSeconds ?? watch.intervalSeconds}s lookback ${watch.lookbackMinutes}m`
+        : "") +
+      `\nalert_mode: ${describeAlertMode(config)}` +
+      `\nds_push: ${config.dsAlertWebhook?.enabled ? `on :${config.dsAlertWebhook.port}${config.dsAlertWebhook.path}` : "off"}` +
+      `\ncard_callback: ${config.feishuCardCallback?.enabled ? `on :${config.feishuCardCallback.port}${config.feishuCardCallback.path}` : "off"}` +
+      `\nmcp: 飞书bot不走Cursor MCP；详询 /mcp`
     );
   }
-  if (name === "help") return HELP_TEXT;
+  if (name === "help") {
+    return {
+      card: helpCard({ dsReadonly: config.dsReadonly }),
+      text: HELP_TEXT,
+    };
+  }
+  if (name === "mcp") return formatMcpArchitectureStatus(config);
+  if (name === "board" || name === "countries" || name === "country-board") {
+    const ds = getDsClient(config);
+    const board = await listCountryDailyBoard(ds, {});
+    return `project ${ds.projectCode}\n${formatCountryDailyBoard(board)}`;
+  }
+  if (name === "progress" || name === "status-country") {
+    // /progress              → all RUNNING with stage dig
+    // /progress id|vn|th…    → that country only
+    const raw = String(command[1] || "").trim().toLowerCase();
+    const country =
+      resolveCountryCode(raw) ||
+      (raw && /^[a-z]{2}$/.test(raw) ? raw : null) ||
+      null;
+    const ds = getDsClient(config);
+    const result = await listRunningProgress(ds, {
+      country,
+      pageSize: 20,
+    });
+    return `project ${ds.projectCode}\n${formatProgressReport(result)}`;
+  }
   if (name === "failed") {
     const n = Math.min(Math.max(Number(command[1] || 8) || 8, 1), 20);
     const ds = getDsClient(config);
     const page = await ds.listProcessInstances({ stateType: "FAILURE", pageSize: n });
-    return formatFailedList(page);
+    const top = page?.totalList?.[0];
+    if (top?.id && message?.chatId) lastFailureByChat.set(message.chatId, Number(top.id));
+    const text = formatFailedList(page);
+    const env = loadDsEnv();
+    return {
+      card: failedListCard({
+        rows: page?.totalList || [],
+        total: page?.total,
+        dsReadonly: config.dsReadonly,
+        uiUrlBuilder: (row) =>
+          buildProcessInstanceUiUrl({
+            apiUrl: env.apiUrl,
+            projectCode: config.dsProjectCode || env.projectCode,
+            processInstanceId: row.id,
+            processDefinitionCode: row.processDefinitionCode,
+          }),
+      }),
+      text,
+    };
   }
   if (name === "tasks") {
     const id = Number(command[1]);
@@ -239,16 +497,6 @@ async function runCommand(config, command, message) {
     // /slow id <processInstanceId> [stage分] [job分]
     // /slow project <projectCode> [n] [stage分] [job分]
     const args = command.slice(1);
-    try {
-      const wh = args[0] === "wh" || args[0] === "warehouse" || args[0] === "layers";
-      const eta = wh || args.includes("id") || /country/i.test(args.join(" ")) ? 90 : 60;
-      await reply(
-        message.messageId,
-        ackInProgress(wh ? "扫描数仓层慢 stage/job" : "扫描慢 stage/job", eta),
-      );
-    } catch {
-      // ignore ack failure
-    }
     let projectCode = null;
     let pageSize = 40;
     let stageMin = 15;
@@ -307,19 +555,33 @@ async function runCommand(config, command, message) {
       nestDepth,
     });
     const body = formatSlowStageJobs(result);
-    return `project ${ds.projectCode}\n${body}`;
+    const env = loadDsEnv();
+    return {
+      card: slowJobsCard({
+        hits: result?.hits || [],
+        stageMinSec: stageMin * 60,
+        jobMinSec: jobMin * 60,
+        scannedInstances: result?.scannedInstances,
+        country,
+        stageNameRe: stageNameRe ? String(stageNameRe) : null,
+        dsReadonly: config.dsReadonly,
+        uiUrlBuilder: (hit) =>
+          buildProcessInstanceUiUrl({
+            apiUrl: env.apiUrl,
+            projectCode: ds.projectCode,
+            processInstanceId: hit.workflowId,
+          }),
+      }),
+      text: `project ${ds.projectCode}\n${body}`,
+    };
   }
   if (name === "log") {
     const id = Number(command[1]);
     if (!id) return "Usage: /log <taskInstanceId>";
+    if (message?.chatId) lastTaskByChat.set(message.chatId, id);
     return handleLog(config, id);
   }
   if (name === "diagnose") {
-    try {
-      await reply(message.messageId, ackInProgress("诊断失败原因", 30));
-    } catch {
-      // ignore
-    }
     const id = command[1] ? Number(command[1]) : null;
     if (command[1] && !id) return "Usage: /diagnose [processInstanceId]";
     return handleDiagnose(config, id, message);
@@ -327,32 +589,177 @@ async function runCommand(config, command, message) {
   if (name === "rerun" || name === "rerun-all") {
     if (config.dsReadonly) {
       return (
-        "当前为只读模式（ds_readonly=true）：禁止重跑 / 恢复 / 停止等写操作。\n" +
-        "只能查看：/failed /diagnose /tasks /log /slow"
+        "当前为只读模式（ds_readonly=true）：禁止重跑 / 恢复 / 强制成功等写操作。\n" +
+        "需要时在 config.json 设 ds_readonly=false 并重启 bot。"
       );
     }
-    const id = Number(command[1]);
-    if (!id) return `Usage: /${name} <processInstanceId>`;
+    let id = Number(command[1]);
+    if (!id) id = Number(lastFailureByChat.get(message.chatId) || 0);
+    if (!id) {
+      const ds = getDsClient(config);
+      const page = await ds.listProcessInstances({ stateType: "FAILURE", pageSize: 1 });
+      id = Number(page?.totalList?.[0]?.id || 0);
+    }
+    if (!id) {
+      return (
+        `Usage: /${name} <processInstanceId>\n` +
+        `或先 /failed、/diagnose，再发「重跑」/「确认」。`
+      );
+    }
+    lastFailureByChat.set(message.chatId, id);
     const executeType =
       name === "rerun-all" ? "REPEAT_RUNNING" : "START_FAILURE_TASK_PROCESS";
-    pendingConfirms.set(message.chatId, {
+    const label =
+      executeType === "REPEAT_RUNNING"
+        ? "整实例重跑 REPEAT_RUNNING"
+        : "从失败处恢复 START_FAILURE_TASK_PROCESS（只重跑失败任务）";
+    const pending = pendingConfirms.set(message.chatId, {
       kind: "execute",
       processInstanceId: id,
       executeType,
-      expiresAt: Date.now() + CONFIRM_TTL_MS,
+      openId: message.senderId,
+      summary: `实例 #${id} → ${label}`,
     });
-    const label =
-      executeType === "REPEAT_RUNNING" ? "整实例重跑 REPEAT_RUNNING" : "从失败处恢复 START_FAILURE_TASK_PROCESS";
-    return (
-      `将要对实例 #${id} 执行：${label}\n` +
+    const env = loadDsEnv();
+    const uiUrl = buildProcessInstanceUiUrl({
+      apiUrl: env.apiUrl,
+      projectCode: config.dsProjectCode || env.projectCode,
+      processInstanceId: id,
+    });
+    const text =
+      `将要对实例 #${id} 执行重跑（可选从失败处 / 整实例）。\n` +
       `仅限当前配置的 project。\n` +
-      `5 分钟内回复 YES 确认，回复 NO 取消。`
-    );
+      `5 分钟内点确认卡选项或回复 YES / 确认；取消回复 NO / 取消。`;
+    return {
+      card: confirmCard({
+        title: "确认重跑？",
+        summary: `实例 #${id}`,
+        risk: "会改生产实例状态；不改工作流定义。整实例重跑影响更大。",
+        nonce: pending.nonce,
+        kind: pending.kind,
+        processInstanceId: id,
+        executeType,
+        uiUrl,
+        showRerunOptions: true,
+      }),
+      text,
+    };
   }
-  if (name === "yes" || name === "YES") {
+  if (name === "force-success" || name === "fs") {
+    if (config.dsReadonly) {
+      return (
+        "当前为只读模式（ds_readonly=true）：禁止强制成功等写操作。\n" +
+        "需要时在 config.json 设 ds_readonly=false 并重启 bot。"
+      );
+    }
+    const ds = getDsClient(config);
+    let taskId = Number(command[1]);
+    if (!taskId) taskId = Number(lastTaskByChat.get(message.chatId) || 0);
+
+    // No task id → list failed tasks on last/known workflow so user can pick
+    if (!taskId) {
+      let wfId = Number(lastFailureByChat.get(message.chatId) || 0);
+      if (!wfId) {
+        const page = await ds.listProcessInstances({ stateType: "FAILURE", pageSize: 1 });
+        wfId = Number(page?.totalList?.[0]?.id || 0);
+      }
+      if (!wfId) {
+        return (
+          "请先指定任务实例 id，或先 /failed、/diagnose 定位。\n" +
+          "用法：强制成功 任务 #<taskId>\n" +
+          "查某实例失败节点：/tasks <实例id>"
+        );
+      }
+      const inst = await ds.getProcessInstance(wfId);
+      let page = await ds.listTaskInstances({
+        processInstanceId: wfId,
+        stateType: "FAILURE",
+        pageSize: 50,
+      });
+      let failed = page?.totalList || [];
+      if (!failed.length) {
+        page = await ds.listTaskInstances({ processInstanceId: wfId, pageSize: 100 });
+        failed = (page?.totalList || []).filter((t) =>
+          /FAILURE|KILL/i.test(String(t.state || "")),
+        );
+      }
+      lastFailureByChat.set(message.chatId, wfId);
+      const text = formatFailedTasksPickList(wfId, failed, {
+        inst,
+        instName: inst?.name || "",
+      });
+      const env = loadDsEnv();
+      return {
+        card: forceSuccessPickCard({
+          processInstanceId: wfId,
+          instName: inst?.name || "",
+          tasks: failed,
+          uiUrl: buildProcessInstanceUiUrl({
+            apiUrl: env.apiUrl,
+            projectCode: config.dsProjectCode || env.projectCode,
+            processInstanceId: wfId,
+            processDefinitionCode: inst?.processDefinitionCode,
+          }),
+        }),
+        text,
+      };
+    }
+
+    const task = await ds.resolveTaskInstance(taskId, {
+      processInstanceId: lastFailureByChat.get(message.chatId) || null,
+    });
+    let inst = null;
+    if (task?.processInstanceId) {
+      try {
+        inst = await ds.getProcessInstance(task.processInstanceId);
+        lastFailureByChat.set(message.chatId, Number(task.processInstanceId));
+      } catch {
+        // ignore
+      }
+    }
+    lastTaskByChat.set(message.chatId, taskId);
+    const label = formatTaskIdentity(task || { id: taskId, name: "?" }, { inst });
+    const pending = pendingConfirms.set(message.chatId, {
+      kind: "force-success",
+      taskInstanceId: taskId,
+      processInstanceId: task?.processInstanceId
+        ? Number(task.processInstanceId)
+        : undefined,
+      openId: message.senderId,
+      summary: `强制成功 #${taskId} ${label}`,
+    });
+    const env = loadDsEnv();
+    const uiUrl = pending.processInstanceId
+      ? buildProcessInstanceUiUrl({
+          apiUrl: env.apiUrl,
+          projectCode: config.dsProjectCode || env.projectCode,
+          processInstanceId: pending.processInstanceId,
+          processDefinitionCode: inst?.processDefinitionCode,
+        })
+      : "";
+    const text =
+      `将要强制成功：\n` +
+      `#${taskId}  ${label}\n\n` +
+      `风险：跳过真实执行；下游可能还需「重跑 <实例id>」。\n` +
+      `点确认卡或 YES / 确认 · NO / 取消`;
+    return {
+      card: confirmCard({
+        title: "确认强制成功？",
+        summary: pending.summary,
+        risk: "跳过真实执行；下游可能还需重跑实例。",
+        nonce: pending.nonce,
+        kind: pending.kind,
+        taskInstanceId: taskId,
+        processInstanceId: pending.processInstanceId,
+        uiUrl,
+      }),
+      text,
+    };
+  }
+  if (name === "yes" || name === "YES" || name === "确认") {
     return handleConfirm(config, message, true);
   }
-  if (name === "no" || name === "NO") {
+  if (name === "no" || name === "NO" || name === "取消") {
     return handleConfirm(config, message, false);
   }
   if (name === "alert") {
@@ -391,6 +798,7 @@ async function handleDiagnose(config, processInstanceId, message) {
     instId = rows[0].id;
   }
 
+  if (message?.chatId) lastFailureByChat.set(message.chatId, Number(instId));
   const inst = await ds.getProcessInstance(instId);
   let page = await ds.listTaskInstances({
     processInstanceId: instId,
@@ -408,6 +816,7 @@ async function handleDiagnose(config, processInstanceId, message) {
   // Prefer the task that ran longest / last failed
   failed.sort((a, b) => String(b.endTime || "").localeCompare(String(a.endTime || "")));
   const task = failed[0];
+  if (message?.chatId && task?.id) lastTaskByChat.set(message.chatId, Number(task.id));
   const logText = await ds.getTaskLogChunks(task.id);
   const highlight = extractLogHighlights(logText, { maxLines: 20 });
   const classification = classifyFailure({
@@ -415,51 +824,148 @@ async function handleDiagnose(config, processInstanceId, message) {
     logText,
     purged: highlight.purged,
   });
+  const playbook = buildActionPlaybook({
+    category: classification.category,
+    log: logText,
+    sqlFile: classification.sqlFile,
+    signal: { cause: classification.cause, evidence: classification.evidence },
+    task,
+    nearbyFailureCount: failed.length,
+    workflowState: inst?.state,
+    processInstanceId: instId,
+    dsReadonly: config.dsReadonly,
+  });
+  if (playbook.mechanism) classification.mechanism = playbook.mechanism;
+  if (playbook.verdict) classification.verdict = playbook.verdict;
+  if (playbook.cause) classification.cause = playbook.cause;
+  if (playbook.actions?.length) classification.fixes = playbook.actions;
+  classification.where = playbook.mechanism || classification.where;
 
-  let report = formatPracticalDiagnosis({
+  let repoAnalysis = null;
+  if (config.sqlRepoPath && classification.sqlFile) {
+    try {
+      repoAnalysis = await enrichFailureContext({
+        repoRoot: config.sqlRepoPath,
+        sqlFile: classification.sqlFile,
+        logText,
+        category: classification.category,
+        varsMap: classification.varsMap || {},
+        hiveProbe: config.hiveProbe
+          ? {
+              ...config.hiveProbe,
+              // diagnose path: honor onDiagnose (default true)
+              onAlert: config.hiveProbe.onDiagnose !== false,
+            }
+          : null,
+        enablePrLookup: config.enablePrLookup !== false,
+      });
+    } catch {
+      try {
+        repoAnalysis = analyzeSqlAgainstFailure({
+          repoRoot: config.sqlRepoPath,
+          sqlFile: classification.sqlFile,
+          logText,
+          category: classification.category,
+          varsMap: classification.varsMap || {},
+        });
+      } catch {
+        repoAnalysis = null;
+      }
+    }
+  }
+
+  let evidenceLines = [];
+  if (highlight?.purged) {
+    evidenceLines = [highlight.summary, classification.rawScript].filter(Boolean);
+  } else if (classification.evidence?.length) {
+    evidenceLines = classification.evidence.slice(0, 4);
+  } else if (highlight?.lines?.length) {
+    evidenceLines = highlight.lines.slice(0, 8);
+  }
+
+  const env = loadDsEnv();
+  const uiUrl = buildProcessInstanceUiUrl({
+    apiUrl: env.apiUrl,
+    projectCode: config.dsProjectCode || env.projectCode,
+    processInstanceId: instId,
+    processDefinitionCode: inst?.processDefinitionCode,
+  });
+
+  const textReport = formatPracticalDiagnosis({
     inst: { ...inst, id: instId },
     task,
     highlight,
     classification,
   });
-
-  if (failed.length > 1) {
-    report += `\n\n同实例另有 ${failed.length - 1} 个失败任务：${failed
-      .slice(1, 4)
-      .map((t) => `#${t.id} ${t.name}`)
-      .join("；")}`;
+  let text = textReport;
+  if (repoAnalysis?.useful && repoAnalysis.lines?.length) {
+    text += `\n\n【代码/Git/验分区】\n${repoAnalysis.lines.map((l) => `- ${l}`).join("\n")}`;
   }
 
-  // Only call LLM when we actually have log body — otherwise rule card is more honest.
-  if (!highlight.purged && highlight.lines.length) {
-    try {
-      const card = await handleAlert(
-        config,
-        `DolphinScheduler 失败诊断\nprocessInstanceId=${instId}\ntaskId=${task.id}\n${highlight.lines.join("\n")}`,
-        message,
-      );
-      if (card) report += `\n\n—— 补充处置卡 ——\n${card}`;
-    } catch (error) {
-      report += `\n\n（LLM 处置卡跳过：${error.message}）`;
-    }
-  }
-
-  return report;
+  return {
+    card: diagnoseCard({
+      category: classification.category,
+      verdict: classification.verdict,
+      mechanism: classification.mechanism || classification.where,
+      processInstanceId: instId,
+      instName: inst?.name,
+      instState: inst?.state,
+      taskId: task.id,
+      taskName: task.name,
+      taskMeta: `${task.taskType || "?"}，重试 ${task.retryTimes || 0}/${task.maxRetryTimes || 0}，耗时 ${task.duration || "?"}`,
+      sqlFile: classification.sqlFile,
+      evidenceLines,
+      fixes: classification.fixes || [],
+      repoLines: repoAnalysis?.useful ? repoAnalysis.lines || [] : [],
+      extraFailed: failed.slice(1, 6).map((t) => ({ id: t.id, name: t.name })),
+      uiUrl,
+      dsReadonly: config.dsReadonly,
+    }),
+    text,
+  };
 }
 
 async function handleConfirm(config, message, accepted) {
-  const pending = pendingConfirms.get(message.chatId);
-  if (!pending) return "没有待确认操作。";
-  if (Date.now() > pending.expiresAt) {
-    pendingConfirms.delete(message.chatId);
-    return "确认已过期。";
+  const pending = pendingConfirms.getByChat(message.chatId);
+  if (!pending) return { text: "没有待确认操作。" };
+  pendingConfirms.delByChat(message.chatId);
+  if (!accepted) {
+    return {
+      card: cancelledCard(),
+      text: "已取消。",
+    };
   }
-  pendingConfirms.delete(message.chatId);
-  if (!accepted) return "已取消。";
   if (config.dsReadonly) {
-    return "当前为只读模式：已拒绝执行写操作（重跑/恢复等）。";
+    return {
+      text: "当前为只读模式：已拒绝执行写操作（重跑/恢复/强制成功等）。",
+    };
   }
+  const resultText = await executePendingWrite(config, pending);
+  const env = loadDsEnv();
+  const uiUrl =
+    pending.processInstanceId != null
+      ? buildProcessInstanceUiUrl({
+          apiUrl: env.apiUrl,
+          projectCode: config.dsProjectCode || env.projectCode,
+          processInstanceId: pending.processInstanceId,
+        })
+      : "";
+  return {
+    card: doneCard({ body: resultText, uiUrl, processInstanceId: pending.processInstanceId }),
+    text: resultText,
+  };
+}
+
+async function executePendingWrite(config, pending) {
   const ds = getDsClient(config);
+  if (pending.kind === "force-success") {
+    const taskId = Number(pending.taskInstanceId);
+    await ds.forceTaskSuccess(taskId);
+    return (
+      `已强制成功：任务 #${taskId} → FORCED_SUCCESS\n` +
+      `若工作流仍红/下游未继续，可再点告警卡「重跑」或回「重跑 <实例id>」。`
+    );
+  }
   await ds.execute(pending.processInstanceId, pending.executeType);
   return (
     `已提交：实例 #${pending.processInstanceId} → ${pending.executeType}\n` +
@@ -468,12 +974,70 @@ async function handleConfirm(config, message, accepted) {
 }
 
 async function handleAlert(config, alertText, message) {
+  let evidence = null;
+  try {
+    const ds = getDsClient(config);
+    evidence = await gatherAlertEvidence(ds, { text: alertText });
+  } catch (error) {
+    evidence = {
+      useful: false,
+      block: `取证异常：${error.message}`,
+      processInstanceId: null,
+      taskId: null,
+      classification: null,
+    };
+  }
+
+  if (message?.chatId && evidence?.processInstanceId) {
+    lastFailureByChat.set(message.chatId, Number(evidence.processInstanceId));
+  }
+  if (config.alertFeedback?.enabled && message?.chatId) {
+    rememberAlertForFeedback(config.alertFeedback.statePath, message.chatId, {
+      taskId: evidence?.taskId ?? null,
+      processInstanceId: evidence?.processInstanceId ?? null,
+      category: evidence?.classification?.category ?? null,
+      source: "alert",
+    });
+  }
+
+  const enrichedText = evidence?.block
+    ? `${alertText}\n\n---\n【桥接取证】\n${evidence.block}`
+    : alertText;
+
   const webhookUrl = process.env.CURSOR_WEBHOOK_ALERT_URL;
   const webhookKey = process.env.CURSOR_WEBHOOK_ALERT_KEY;
+  let cardText;
+  let interactive = null;
   if (webhookUrl && webhookKey) {
-    return runAlertWebhook(webhookUrl, webhookKey, alertText, message);
+    cardText = await runAlertWebhook(webhookUrl, webhookKey, enrichedText, message);
+  } else if (shouldUseAlertTemplate(evidence)) {
+    const env = loadDsEnv();
+    const fields = {
+      task: evidence.task || { id: evidence.taskId, processInstanceId: evidence.processInstanceId },
+      inst: evidence.inst || { id: evidence.processInstanceId },
+      classification: evidence.classification,
+      highlight: evidence.highlight,
+      projectCode: config.dsProjectCode || env.projectCode,
+      apiUrl: env.apiUrl,
+      dsReadonly: config.dsReadonly,
+    };
+    cardText = formatAlertReport(fields);
+    interactive = formatAlertCard(fields);
+    console.error(
+      `[alert] template card category=${evidence.classification?.category || "?"} task=#${evidence.taskId}`,
+    );
+  } else {
+    console.error("[alert] weak evidence → local Agent card");
+    cardText = await runAlertLocal(config, alertText, evidence?.block || "");
   }
-  return runAlertLocal(config, alertText);
+  const footer = config.alertFeedback?.enabled ? `\n\n${FEEDBACK_HINT}` : "";
+  if (interactive) {
+    return { card: interactive, text: cardText };
+  }
+  if (shouldUseAlertTemplate(evidence) && !webhookUrl) {
+    return cardText;
+  }
+  return `${cardText}${footer}`;
 }
 
 async function runAlertWebhook(url, key, alertText, message) {
@@ -489,6 +1053,7 @@ async function runAlertWebhook(url, key, alertText, message) {
       chat_id: message.chatId,
       message_id: message.messageId,
       sender: message.senderId,
+      evidence_first: true,
     }),
   });
   const raw = await response.text();
@@ -522,14 +1087,12 @@ async function runAlertWebhook(url, key, alertText, message) {
   return `Webhook 已接受，未解析到处置卡文本。响应: ${raw.slice(0, 800)}`;
 }
 
-async function runAlertLocal(config, alertText) {
+async function runAlertLocal(config, alertText, evidenceBlock = "") {
   if (!fs.existsSync(config.alertPromptPath)) {
     throw new Error(`Alert prompt missing: ${config.alertPromptPath}`);
   }
   const system = fs.readFileSync(config.alertPromptPath, "utf8");
-  const prompt =
-    `${system}\n\n---\n\n## 本条告警原文\n\n\`\`\`text\n${alertText}\n\`\`\`\n\n` +
-    "按系统指令输出极简处置卡 5 段。禁止自动重跑或改配置。";
+  const prompt = buildEvidenceAwareAlertPrompt(system, alertText, evidenceBlock);
   return runCursor(config.alertCwd, config.model, prompt);
 }
 
@@ -547,18 +1110,29 @@ async function handleAdaptiveDs(config, message) {
     path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
   let plan = heuristicDsPlan(message.text, { defaultProjectCode: projectCode });
-  // Refine with short planner when heuristic is generic slow / ambiguous
-  try {
-    const plannerRaw = await runCursor(
-      cwd,
-      config.model,
-      buildPlannerPrompt(message.text, historyBlock, projectCode),
-      { timeoutMs: 45_000 },
-    );
-    const parsed = parsePlannerJson(plannerRaw);
-    if (parsed?.tool) plan = { ...plan, ...parsed };
-  } catch (error) {
-    console.error(`[adaptive-plan] fallback heuristic: ${error.message}`);
+  // Only call LLM planner when heuristic is ambiguous (generic slow / chat-ish).
+  if (!heuristicPlanIsConcrete(plan)) {
+    try {
+      const plannerRaw = await runCursor(
+        cwd,
+        config.model,
+        buildPlannerPrompt(message.text, historyBlock, projectCode),
+        { timeoutMs: 45_000 },
+      );
+      const parsed = parsePlannerJson(plannerRaw);
+      if (parsed?.tool) {
+        plan = { ...plan, ...parsed };
+        // Keep structurally extracted country if planner omitted it.
+        if (!plan.country && resolveCountryCode(message.text)) {
+          plan.country = resolveCountryCode(message.text);
+        }
+        delete plan._soft;
+      }
+    } catch (error) {
+      console.error(`[adaptive-plan] fallback heuristic: ${error.message}`);
+    }
+  } else {
+    console.error(`[adaptive] skip planner (concrete ${plan.tool})`);
   }
 
   if (!plan || plan.tool === "chat") {
@@ -569,21 +1143,8 @@ async function handleAdaptiveDs(config, message) {
   const executed = await executeDsPlan(config, plan);
   if (executed.kind === "chat" || !executed.text) return null;
 
-  // Optional short rewrite for readability (skip if result already structured)
-  let finalText = executed.text;
-  try {
-    if (executed.text.length < 3500) {
-      const summary = await runCursor(
-        cwd,
-        config.model,
-        `把下面 DS 只读排查结果整理成飞书可读的中文答复（保留关键 id/耗时/脚本名，别编造数字）。\n用户原话：${message.text}\n\n---\n${executed.text}`,
-        { timeoutMs: 60_000 },
-      );
-      if (summary && summary.length > 40) finalText = summary;
-    }
-  } catch (error) {
-    console.error(`[adaptive-summary] skip: ${error.message}`);
-  }
+  // Structured DS tools already Feishu-ready — skip Agent rewrite.
+  const finalText = executed.text;
 
   pushChat(message.chatId, "user", message.text);
   pushChat(message.chatId, "assistant", finalText);
@@ -606,21 +1167,32 @@ async function handleChat(config, message) {
   const prompt = `你是通过飞书私聊接入的 Cursor Agent（体验尽量接近 IDE 里对话）。
 用中文简洁回答。可以查代码、解释报错、给修复步骤。
 
-用户若在追问「怎么修复」且上文已有诊断卡：不要再复读同一张卡，而是基于上文给出更具体的修复顺序、要核对的表/分区/参数。只读模式下不要建议立即 /rerun，只说明「人工在 UI 操作」的条件。
+【飞书排版硬约束】
+- 禁止 Markdown 表格（不要用 | 列 |）；改用短行或「· 项 — 值」
+- 少用粗体堆砌；回复宜短
+
+【架构勿混淆】
+- 飞书 bot 查 DolphinScheduler：内嵌 Ds32Client，不经过 Cursor MCP
+- Cursor IDE 的 ds-offline MCP 只服务 IDE Agent；飞书会话里 MCP 工具列表为空是正常的，不要据此说「未连上 / 配置失败 / 没有 DS 查询工具」
+- 用户问任务/工作流/调度状态：应引导发「检查任务状态」「最近失败」「在跑什么」或 /failed /status，不要假装缺工具
+- 用户问 mcp/MCP 状态：直接说明上述分工，并建议发 /mcp 或 /status，不要猜 Reload
+
+用户若在追问「怎么修复」且上文已有诊断卡：不要再复读同一张卡，而是基于上文给出更具体的修复顺序、要核对的表/分区/参数。
+若适合重跑：引导用户点告警/诊断卡「重跑」或发「重跑 <实例id>」，bot 会弹确认卡；不要假装已经提交重跑。
 若日志已清理、缺少 Exception 原文：明确说还缺什么证据，并给出在 UI 复制日志或复跑 SQL 的具体动作。
 
 DolphinScheduler（offline，经典 REST；dsctl /v2 暂不可用）：
 - 环境文件：~/.config/dsctl/offline.env（DS_API_URL / DS_API_TOKEN / DS_PROJECT_CODE）
 - 默认项目：kalo_data_online:daily，code=${projectCode}
-- 只读模式：${config.dsReadonly ? "开（禁止重跑/停止/改定义/execute）" : "关"}
-- 本仓库客户端：src/ds32_client.mjs（只读排查）
-- 快捷命令：/diagnose /failed /slow /tasks /log（无 /rerun）
+- 写操作：${config.dsReadonly ? "关（ds_readonly，禁止重跑）" : "开（可重跑/强制成功，确认卡或 YES；仍禁改工作流定义）"}
+- 本仓库客户端：src/ds32_client.mjs
+- 快捷命令：/diagnose /failed /slow /tasks /log /mcp /rerun /rerun-all /force-success
 
 约束：
-- 默认只读排查；不要 commit/push/删数据
-- 禁止调用 DS execute / rerun / stop / force-success / 改工作流定义
+- 不要 commit/push/删数据
+- 不要直接调用 DS API；让用户走确认卡 / YES
+- 禁止建议改工作流定义
 - 不输出 token、密码、完整 JDBC 连接串
-- 外发飞书前确认；不确定就问用户
 - 飞书回复宜短；长内容给要点 + 下一步
 
 ${historyBlock ? `## 近期对话\n${historyBlock}\n` : ""}
@@ -747,9 +1319,35 @@ async function reply(messageId, text) {
   await runProcess("lark-cli", args);
 }
 
-/** Proactive push (alert watch). Prefer chatId for p2p bots. */
-async function sendText({ chatId, userId, text }) {
-  const args = ["im", "+messages-send", "--as", "bot", "--text", text];
+async function replyCard(messageId, card) {
+  const args = [
+    "im",
+    "+messages-reply",
+    "--message-id",
+    messageId,
+    "--msg-type",
+    "interactive",
+    "--content",
+    JSON.stringify(card),
+    "--as",
+    "bot",
+  ];
+  const profile = process.env.LARK_PROFILE || process.env.FEISHU_PROFILE;
+  if (profile) args.unshift("--profile", profile);
+  await runProcess("lark-cli", args);
+}
+
+/** Proactive push (alert watch). Prefer chatId for p2p bots. Supports interactive card. */
+async function sendText({ chatId, userId, text, card }) {
+  if (card) {
+    try {
+      await sendCard({ chatId, userId, card });
+      return;
+    } catch (error) {
+      console.error(`[sendCard] fallback to text: ${error.message}`);
+    }
+  }
+  const args = ["im", "+messages-send", "--as", "bot", "--text", text || "(empty)"];
   if (chatId) args.push("--chat-id", chatId);
   else if (userId) args.push("--user-id", userId);
   else throw new Error("sendText requires chatId or userId");
@@ -758,39 +1356,143 @@ async function sendText({ chatId, userId, text }) {
   await runProcess("lark-cli", args);
 }
 
+async function sendCard({ chatId, userId, card }) {
+  const args = [
+    "im",
+    "+messages-send",
+    "--as",
+    "bot",
+    "--msg-type",
+    "interactive",
+    "--content",
+    JSON.stringify(card),
+  ];
+  if (chatId) args.push("--chat-id", chatId);
+  else if (userId) args.push("--user-id", userId);
+  else throw new Error("sendCard requires chatId or userId");
+  const profile = process.env.LARK_PROFILE || process.env.FEISHU_PROFILE;
+  if (profile) args.unshift("--profile", profile);
+  await runProcess("lark-cli", args);
+}
+
+async function deliverReply(messageId, response, config) {
+  if (response && typeof response === "object" && response.card) {
+    try {
+      await replyCard(messageId, response.card);
+      return;
+    } catch (error) {
+      console.error(`[replyCard] fallback to text: ${error.message}`);
+      const fallback = response.text != null ? response.text : JSON.stringify(response.card);
+      await reply(messageId, trimReply(String(fallback), config.maxReplyChars));
+      return;
+    }
+  }
+  const text =
+    response && typeof response === "object" && response.text != null
+      ? response.text
+      : response;
+  await reply(messageId, trimReply(String(text ?? ""), config.maxReplyChars));
+}
+
+function replyToHistoryText(response) {
+  if (response && typeof response === "object") {
+    return String(response.text || "").slice(0, 4000);
+  }
+  return String(response || "").slice(0, 4000);
+}
+
 async function runProcess(command, args) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
+    let stdout = "";
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
       process.stderr.write(chunk);
     });
     child.stdout.on("data", (chunk) => {
-      // Keep reply JSON off the bridge process stdout to avoid log noise;
-      // only surface on stderr when debugging.
+      stdout += chunk;
       if (process.env.LARK_REPLY_DEBUG) process.stderr.write(chunk);
     });
     child.on("exit", (code) => {
-      if (code === 0) resolve();
+      if (code === 0) resolve(stdout);
       else reject(new Error(`${command} exited with code ${code}: ${stderr}`));
     });
   });
 }
 
 function trimReply(text, maxChars) {
-  const clean = String(text).trim() || "(empty response)";
+  const clean = sanitizeFeishuReply(String(text).trim() || "(empty response)");
   if (clean.length <= maxChars) return clean;
   return `${clean.slice(0, maxChars - 80).trimEnd()}\n\n[truncated locally; see computer logs for full output]`;
 }
 
-/** Immediate Feishu ack: 收到，正在…，预计需要… */
-function ackInProgress(action, etaSeconds) {
-  const eta =
-    etaSeconds < 60
-      ? `约 ${Math.max(5, Math.round(etaSeconds))} 秒`
-      : `约 ${Math.max(1, Math.ceil(etaSeconds / 60))} 分钟`;
-  return `收到，正在${action}，预计需要${eta}…`;
+/** Immediate ack: react OnIt on the user message. Returns reaction_id when available. */
+async function ackReaction(messageId, emojiType = "OnIt") {
+  if (!messageId) return null;
+  try {
+    const args = [
+      "im",
+      "reactions",
+      "create",
+      "--params",
+      JSON.stringify({ message_id: messageId }),
+      "--data",
+      JSON.stringify({ reaction_type: { emoji_type: emojiType } }),
+      "--as",
+      "bot",
+      "--format",
+      "json",
+    ];
+    const profile = process.env.LARK_PROFILE || process.env.FEISHU_PROFILE;
+    if (profile) args.unshift("--profile", profile);
+    const stdout = await runProcess("lark-cli", args);
+    const parsed = safeJson(stdout);
+    return (
+      parsed?.data?.reaction_id ||
+      parsed?.reaction_id ||
+      parsed?.data?.reactionId ||
+      null
+    );
+  } catch (error) {
+    console.error(`[ackReaction] ${error.message}`);
+    return null;
+  }
+}
+
+async function clearReaction(messageId, reactionId) {
+  if (!messageId || !reactionId) return;
+  try {
+    const args = [
+      "im",
+      "reactions",
+      "delete",
+      "--params",
+      JSON.stringify({ message_id: messageId, reaction_id: reactionId }),
+      "--as",
+      "bot",
+    ];
+    const profile = process.env.LARK_PROFILE || process.env.FEISHU_PROFILE;
+    if (profile) args.unshift("--profile", profile);
+    await runProcess("lark-cli", args);
+  } catch (error) {
+    console.error(`[clearReaction] ${error.message}`);
+  }
+}
+
+/** Replace OnIt with CheckMark / CrossMark when work finishes. */
+async function finishAck(messageId, reactionId, ok) {
+  if (!messageId) return;
+  await clearReaction(messageId, reactionId);
+  await ackReaction(messageId, ok ? "CheckMark" : "CrossMark");
+}
+
+function safeJson(text) {
+  try {
+    return JSON.parse(String(text || "").trim());
+  } catch {
+    return null;
+  }
 }
 
 function firstString(...values) {
@@ -825,11 +1527,51 @@ async function handleMessage(config, message) {
     });
   }
 
-  const trimmed = message.text.trim();
-  // Plain YES/NO for pending rerun confirmation (no leading slash required).
-  if (/^(YES|NO)$/i.test(trimmed) && pendingConfirms.has(message.chatId)) {
-    const response = await handleConfirm(config, message, /^YES$/i.test(trimmed));
-    await reply(message.messageId, trimReply(response, config.maxReplyChars));
+  // Groups often send 「@bot /cmd …」; strip mentions before routing.
+  const trimmed = stripBotMention(message.text);
+  message = { ...message, text: trimmed };
+
+  if (looksLikeMcpQuestion(trimmed)) {
+    const response = await formatMcpArchitectureStatus(config);
+    await deliverReply(message.messageId, response, config);
+    return;
+  }
+
+  if (/^(help|\/help|帮助|你好|hello)$/i.test(trimmed)) {
+    await deliverReply(
+      message.messageId,
+      { card: welcomeCard({ dsReadonly: config.dsReadonly }), text: HELP_TEXT },
+      config,
+    );
+    return;
+  }
+
+  if (looksLikeBotStatus(trimmed)) {
+    const response = await runCommand(config, ["/status"], message);
+    await deliverReply(message.messageId, response, config);
+    return;
+  }
+
+  if (config.alertFeedback?.enabled) {
+    const fb = parseFeedback(trimmed);
+    if (fb) {
+      const result = recordFeedback(config.alertFeedback.statePath, {
+        chatId: message.chatId,
+        kind: fb.kind,
+      });
+      await deliverReply(message.messageId, result.message, config);
+      return;
+    }
+  }
+
+  // Plain YES/NO / 确认/取消 for pending rerun (no leading slash required).
+  if (
+    /^(YES|NO|确认|取消|是的?|否)$/i.test(trimmed) &&
+    pendingConfirms.has(message.chatId)
+  ) {
+    const accepted = /^(YES|确认|是的?)$/i.test(trimmed);
+    const response = await handleConfirm(config, message, accepted);
+    await deliverReply(message.messageId, response, config);
     return;
   }
 
@@ -839,28 +1581,36 @@ async function handleMessage(config, message) {
   }
 
   let response;
+  let ackId = null;
+  let workOk = true;
   try {
     if (command) {
+      const needsAck = ["/diagnose", "/slow", "/progress", "/board"].includes(command[0]);
+      if (needsAck) {
+        try {
+          ackId = await ackReaction(message.messageId);
+        } catch {
+          // ignore
+        }
+      }
       response = await runCommand(config, command, message);
       // Keep shortcut results in history so follow-ups like「怎么修复」can chat over them.
       if (
         response &&
-        ["/diagnose", "/failed", "/log", "/tasks", "/slow"].includes(command[0])
+        ["/diagnose", "/failed", "/log", "/tasks", "/slow", "/progress", "/board", "/rerun", "/rerun-all", "/force-success", "/fs"].includes(
+          command[0],
+        )
       ) {
         pushChat(message.chatId, "user", message.text);
-        pushChat(message.chatId, "assistant", response);
+        pushChat(message.chatId, "assistant", replyToHistoryText(response));
       }
     } else if ((isP2p || alertChat) && looksLikeAlert(message.text)) {
       response = await handleAlert(config, message.text, message);
       pushChat(message.chatId, "user", message.text.slice(0, 1500));
-      pushChat(message.chatId, "assistant", response);
+      pushChat(message.chatId, "assistant", replyToHistoryText(response));
     } else if ((isP2p || alertChat) && looksLikeDsOps(message.text)) {
       try {
-        const planHint = /印尼|数仓|wh|stage|慢|耗时/i.test(message.text) ? 120 : 90;
-        await reply(
-          message.messageId,
-          ackInProgress("按你的条件查 DS（只读）", planHint),
-        );
+        ackId = await ackReaction(message.messageId);
       } catch {
         // ignore
       }
@@ -869,9 +1619,8 @@ async function handleMessage(config, message) {
         response = await handleChat(config, message);
       }
     } else if (isP2p || alertChat) {
-      // Default: Cursor-like conversation via local Agent.
       try {
-        await reply(message.messageId, ackInProgress("思考并组织回答", 45));
+        ackId = await ackReaction(message.messageId);
       } catch {
         // ignore ack failure
       }
@@ -880,15 +1629,239 @@ async function handleMessage(config, message) {
       return;
     }
   } catch (error) {
+    workOk = false;
     response = `Error: ${error.message}`;
   }
-  await reply(message.messageId, trimReply(response, config.maxReplyChars));
+  try {
+    await deliverReply(message.messageId, response, config);
+  } catch (error) {
+    workOk = false;
+    console.error(`[deliverReply] ${error.message}`);
+    try {
+      await reply(message.messageId, `Error: ${error.message}`);
+    } catch {
+      // ignore
+    }
+  } finally {
+    if (ackId) {
+      const ok =
+        workOk && !String(replyToHistoryText(response) || "").startsWith("Error:");
+      await finishAck(message.messageId, ackId, ok);
+    }
+  }
+}
+
+async function handleCardAction(action) {
+  const config = runtimeConfig;
+  if (!config) {
+    return { toast: { type: "error", content: "bot 未就绪" } };
+  }
+  if (
+    config.allowedUsers.size > 0 &&
+    action.openId &&
+    !config.allowedUsers.has(action.openId)
+  ) {
+    return { toast: { type: "error", content: "无权限" } };
+  }
+
+  const chatId = action.chatId;
+  const v = action.value || {};
+  const name = action.action;
+
+  try {
+    if (name === "feedback") {
+      if (!config.alertFeedback?.enabled) {
+        return { toast: { type: "info", content: "反馈未开启" } };
+      }
+      const id = chatId || action.openId;
+      const result = recordFeedback(config.alertFeedback.statePath, {
+        chatId: id,
+        kind: v.kind || "useful",
+      });
+      return { toast: { type: "success", content: clipToast(result.message, 60) } };
+    }
+
+    if (name === "diagnose") {
+      const id = Number(v.processInstanceId);
+      if (!id) return { toast: { type: "error", content: "缺少实例 id" } };
+      const fakeMsg = {
+        chatId: chatId || `cb:${action.openId || "anon"}`,
+        senderId: action.openId,
+        messageId: action.messageId,
+      };
+      const result = await handleDiagnose(config, id, fakeMsg);
+      if (chatId && result?.card) {
+        await sendCard({ chatId, card: result.card });
+      } else if (action.openId && result?.card) {
+        await sendCard({ userId: action.openId, card: result.card });
+      }
+      return { toast: { type: "success", content: `诊断 #${id} 已发送` } };
+    }
+
+    if (name === "log") {
+      const taskId = Number(v.taskId);
+      if (!taskId) return { toast: { type: "error", content: "缺少任务 id" } };
+      const text = await handleLog(config, taskId);
+      if (chatId) await sendText({ chatId, text });
+      else if (action.openId) await sendText({ userId: action.openId, text });
+      return { toast: { type: "success", content: `日志 #${taskId}` } };
+    }
+
+    if (name === "rerun_request") {
+      if (config.dsReadonly) {
+        return { toast: { type: "error", content: "只读模式，禁止重跑" } };
+      }
+      const id = Number(v.processInstanceId);
+      if (!id) return { toast: { type: "error", content: "缺少实例 id" } };
+      const executeType = v.executeType || "START_FAILURE_TASK_PROCESS";
+      const key = chatId || `user:${action.openId}`;
+      if (chatId) lastFailureByChat.set(chatId, id);
+      const pending = pendingConfirms.set(key, {
+        kind: "execute",
+        processInstanceId: id,
+        executeType,
+        openId: action.openId,
+        summary: `实例 #${id}`,
+      });
+      const env = loadDsEnv();
+      const uiUrl = buildProcessInstanceUiUrl({
+        apiUrl: env.apiUrl,
+        projectCode: config.dsProjectCode || env.projectCode,
+        processInstanceId: id,
+      });
+      const card = confirmCard({
+        title: "确认重跑？",
+        summary: pending.summary,
+        risk: "会改生产实例状态；不改工作流定义。整实例重跑影响更大。",
+        nonce: pending.nonce,
+        kind: pending.kind,
+        processInstanceId: id,
+        executeType,
+        uiUrl,
+        showRerunOptions: true,
+      });
+      if (chatId) await sendCard({ chatId, card });
+      else if (action.openId) await sendCard({ userId: action.openId, card });
+      return { toast: { type: "info", content: "请选择重跑方式" } };
+    }
+
+    if (name === "force_success_request") {
+      if (config.dsReadonly) {
+        return { toast: { type: "error", content: "只读模式，禁止强制成功" } };
+      }
+      const taskId = Number(v.taskId);
+      if (!taskId) return { toast: { type: "error", content: "缺少任务 id" } };
+      const processInstanceId = v.processInstanceId
+        ? Number(v.processInstanceId)
+        : undefined;
+      const key = chatId || `user:${action.openId}`;
+      if (chatId && processInstanceId) lastFailureByChat.set(chatId, processInstanceId);
+      if (chatId) lastTaskByChat.set(chatId, taskId);
+      const pending = pendingConfirms.set(key, {
+        kind: "force-success",
+        taskInstanceId: taskId,
+        processInstanceId,
+        openId: action.openId,
+        summary: `强制成功任务 #${taskId}`,
+      });
+      const env = loadDsEnv();
+      const uiUrl = processInstanceId
+        ? buildProcessInstanceUiUrl({
+            apiUrl: env.apiUrl,
+            projectCode: config.dsProjectCode || env.projectCode,
+            processInstanceId,
+          })
+        : "";
+      const card = confirmCard({
+        title: "确认强制成功？",
+        summary: pending.summary,
+        risk: "跳过真实执行；下游可能还需重跑实例。",
+        nonce: pending.nonce,
+        kind: pending.kind,
+        taskInstanceId: taskId,
+        processInstanceId,
+        uiUrl,
+      });
+      if (chatId) await sendCard({ chatId, card });
+      else if (action.openId) await sendCard({ userId: action.openId, card });
+      return { toast: { type: "info", content: "请确认强制成功" } };
+    }
+
+    if (name === "confirm_yes" || name === "confirm_no") {
+      const nonce = v.nonce;
+      const pending = nonce
+        ? pendingConfirms.getByNonce(nonce)
+        : chatId
+          ? pendingConfirms.getByChat(chatId)
+          : null;
+      if (!pending) {
+        return {
+          toast: { type: "info", content: "确认已过期或不存在" },
+          card: cancelledCard({ reason: "确认已过期或不存在。" }),
+        };
+      }
+      if (pending.openId && action.openId && pending.openId !== action.openId) {
+        return { toast: { type: "error", content: "仅发起人可确认" } };
+      }
+      pendingConfirms.delByChat(pending.chatId);
+      if (name === "confirm_no") {
+        return {
+          toast: { type: "info", content: "已取消" },
+          card: cancelledCard(),
+        };
+      }
+      if (config.dsReadonly) {
+        return {
+          toast: { type: "error", content: "只读模式已拒绝" },
+          card: cancelledCard({ reason: "只读模式：已拒绝写操作。" }),
+        };
+      }
+      // Option buttons may override executeType / kind
+      if (v.executeType) pending.executeType = v.executeType;
+      if (v.kind) pending.kind = v.kind;
+      if (v.taskInstanceId) pending.taskInstanceId = Number(v.taskInstanceId);
+      if (v.processInstanceId) pending.processInstanceId = Number(v.processInstanceId);
+      if (pending.kind === "execute" && pending.executeType) {
+        pending.summary = `实例 #${pending.processInstanceId} → ${pending.executeType}`;
+      }
+      const resultText = await executePendingWrite(config, pending);
+      const env = loadDsEnv();
+      const uiUrl =
+        pending.processInstanceId != null
+          ? buildProcessInstanceUiUrl({
+              apiUrl: env.apiUrl,
+              projectCode: config.dsProjectCode || env.projectCode,
+              processInstanceId: pending.processInstanceId,
+            })
+          : "";
+      return {
+        toast: { type: "success", content: "已提交" },
+        card: disabledConfirmCard({
+          summary: pending.summary,
+          resultText,
+          ok: true,
+          uiUrl,
+        }),
+      };
+    }
+
+    return { toast: { type: "info", content: `未知操作: ${name}` } };
+  } catch (error) {
+    console.error(`[card-action] ${name}: ${error.message}`);
+    return { toast: { type: "error", content: clipToast(error.message, 60) } };
+  }
+}
+
+function clipToast(s, n) {
+  const t = String(s || "").replace(/\n/g, " ");
+  return t.length <= n ? t : `${t.slice(0, n - 1)}…`;
 }
 
 async function main() {
   const configFlagIndex = process.argv.indexOf("--config");
   const configPath = configFlagIndex >= 0 ? process.argv[configFlagIndex + 1] : "config.json";
   const config = loadConfig(configPath);
+  runtimeConfig = config;
 
   const child = startEventConsumer();
   await waitForReady(child);
@@ -900,18 +1873,107 @@ async function main() {
       config.allowedUsers.size ? [...config.allowedUsers].join(", ") : "(any)"
     }; Alert chats: ${[...config.alertChatIds].join(", ") || "(none)"}; ` +
       `backend: ${process.env.CURSOR_WEBHOOK_ALERT_URL ? "webhook" : "local-agent"}; ` +
-      `alert_watch: ${config.alertWatch.enabled ? "on" : "off"}`,
+      `alert_mode: ${describeAlertMode(config)}`,
   );
+
+  // Resolve / persist webhook token before starting ingress
+  if (config.dsAlertWebhook?.enabled) {
+    config.dsAlertWebhook.token = resolveWebhookToken(
+      config,
+      path.dirname(config.configPath),
+    );
+  }
 
   failureWatcher = startFailureWatcher({
     getDs: () => getDsClient(config),
     config,
     sendText,
     log: (line) => console.error(line),
+    onAlertSent: ({ chatId, userId, alert }) => {
+      if (alert?.taskId != null && config.alertWatch?.statePath) {
+        markTaskNotified(config.alertWatch.statePath, alert.taskId);
+      }
+      if (!config.alertFeedback?.enabled) return;
+      const id = chatId || userId;
+      if (!id) return;
+      rememberAlertForFeedback(config.alertFeedback.statePath, id, {
+        taskId: alert.taskId,
+        processInstanceId: alert.processInstanceId,
+        category: alert.category || null,
+        source: "watch",
+      });
+    },
   });
+
+  let cardCallback = null;
+  if (config.feishuCardCallback?.enabled) {
+    cardCallback = startCardCallbackServer({
+      port: config.feishuCardCallback.port,
+      path: config.feishuCardCallback.path,
+      bind: config.feishuCardCallback.bind || "127.0.0.1",
+      verificationToken: config.feishuCardCallback.verificationToken,
+      encryptKey: config.feishuCardCallback.encryptKey,
+      onAction: handleCardAction,
+      log: (line) => console.error(line),
+    });
+    console.error(
+      `card_callback: http://${config.feishuCardCallback.bind || "127.0.0.1"}:${config.feishuCardCallback.port}${config.feishuCardCallback.path}` +
+        "（飞书后台「卡片回传交互」填公网 URL；本机需隧道）",
+    );
+  }
+
+  let dsIngress = null;
+  if (config.dsAlertWebhook?.enabled) {
+    dsIngress = startDsAlertIngress({
+      port: config.dsAlertWebhook.port,
+      path: config.dsAlertWebhook.path,
+      bind: config.dsAlertWebhook.bind || "127.0.0.1",
+      token: config.dsAlertWebhook.token,
+      dedupePath: config.alertWatch.dedupePath,
+      log: (line) => console.error(line),
+      onAlert: async (evt) => {
+        const ds = getDsClient(config);
+        const alert = await materializeTaskAlert(ds, evt, {
+          fetchLog: config.alertWatch.fetchLog !== false,
+          sqlRepoPath: config.sqlRepoPath,
+          dsReadonly: config.dsReadonly,
+          hiveProbe: config.hiveProbe
+            ? { ...config.hiveProbe, onAlert: config.hiveProbe.onAlert === true }
+            : null,
+          enablePrLookup: config.enablePrLookup !== false,
+        });
+        if (!alert?.text && !alert?.card) return { skipped: true, reason: "no_card" };
+        markTaskNotified(config.alertWatch.statePath, alert.taskId);
+        const sendResult = await failureWatcher?.notifyAlert?.(alert);
+        return { pushed: true, ...sendResult, taskId: alert.taskId };
+      },
+    });
+    console.error(
+      `ds_alert_webhook: http://${config.dsAlertWebhook.bind || "127.0.0.1"}:${config.dsAlertWebhook.port}${config.dsAlertWebhook.path}` +
+        (config.dsAlertWebhook.preferPush
+          ? ` (push primary; poll fallback ${config.alertWatch.effectiveIntervalSeconds}s)`
+          : "") +
+        (config.dsAlertWebhook.token ? "; token=set" : "; token=MISSING"),
+    );
+  } else {
+    console.error(
+      "ds_alert_webhook: off (poll-only). Set ds_alert_webhook.enabled=true for push-primary.",
+    );
+  }
+
   const stopWatcher = () => {
     try {
       failureWatcher?.stop?.();
+    } catch {
+      // ignore
+    }
+    try {
+      dsIngress?.stop?.();
+    } catch {
+      // ignore
+    }
+    try {
+      cardCallback?.stop?.();
     } catch {
       // ignore
     }

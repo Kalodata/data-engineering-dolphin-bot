@@ -3,10 +3,15 @@ import test from "node:test";
 
 import {
   looksLikeAlert,
+  looksLikeBotStatus,
+  looksLikeMcpQuestion,
   parseCommand,
   parseContent,
   parseMessage,
+  sanitizeFeishuReply,
+  stripBotMention,
 } from "../src/main.mjs";
+import { interpretNaturalLanguage } from "../src/ds32_client.mjs";
 
 test("parse Feishu text content", () => {
   assert.equal(parseContent('{"text":"/status"}'), "/status");
@@ -14,6 +19,11 @@ test("parse Feishu text content", () => {
 
 test("ignore regular chat text", () => {
   assert.equal(parseCommand("hello"), null);
+});
+
+test("strip group @bot mention before slash command", () => {
+  assert.equal(stripBotMention("@dolphin-bot  /progress id"), "/progress id");
+  assert.deepEqual(parseCommand("@dolphin-bot  /progress id"), ["/progress", "id"]);
 });
 
 test("parse quoted command arguments", () => {
@@ -49,4 +59,40 @@ test("detect DS-like alert paste", () => {
     ),
     true,
   );
+});
+
+test("looksLikeMcpQuestion", () => {
+  assert.equal(looksLikeMcpQuestion("mcp 状态"), true);
+  assert.equal(looksLikeMcpQuestion("/mcp"), true);
+  assert.equal(looksLikeMcpQuestion("最近失败"), false);
+});
+
+test("looksLikeBotStatus", () => {
+  assert.equal(looksLikeBotStatus("bot还在运行吗"), true);
+  assert.equal(looksLikeBotStatus("在线吗"), true);
+  assert.equal(looksLikeBotStatus("/status"), true);
+  assert.equal(looksLikeBotStatus("mcp 状态"), false);
+  assert.equal(looksLikeBotStatus("最近失败有哪些"), false);
+});
+
+test("interpretNaturalLanguage maps mcp 状态", () => {
+  assert.deepEqual(interpretNaturalLanguage("mcp 状态"), ["/mcp"]);
+});
+
+test("sanitizeFeishuReply flattens markdown tables", () => {
+  const raw = [
+    "**仍未连上。**",
+    "",
+    "| 项 | 状态 |",
+    "|---|---|",
+    "| `mcp.json` | 已配 |",
+    "| 本轮 MCP | **无** |",
+    "",
+    "下一步：Reload",
+  ].join("\n");
+  const out = sanitizeFeishuReply(raw);
+  assert.equal(out.includes("|---|"), false);
+  assert.match(out, /· 项 — 状态/);
+  assert.match(out, /mcp\.json.*已配/);
+  assert.match(out, /下一步：Reload/);
 });

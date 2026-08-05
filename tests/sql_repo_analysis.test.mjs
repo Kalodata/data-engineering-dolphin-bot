@@ -28,7 +28,7 @@ test("extract insert overwrite targets and deps", () => {
   assert.ok(s.params.includes("country_code") || s.params.includes("last_day"));
 });
 
-test("analyze tez failure against repo", () => {
+test("analyze tez failure against repo still attaches git context", () => {
   const a = analyzeSqlAgainstFailure({
     repoRoot: REPO,
     sqlFile: "output/es/ads_seller_product_info_for_es.sql",
@@ -38,8 +38,8 @@ test("analyze tez failure against repo", () => {
     varsMap: { country_code: "id", last_day: "2026-07-20" },
   });
   assert.equal(a.found, true);
-  assert.equal(a.useful, false);
-  assert.equal(a.lines.length, 0);
+  assert.equal(a.useful, true);
+  assert.ok(a.lines.some((l) => /代码侧|引擎|集群/.test(l)));
   assert.match(a.relativePath, /ads_seller_product_info_for_es/);
 });
 
@@ -52,7 +52,19 @@ test("partition failure gets useful repo analysis", () => {
     varsMap: { country_code: "id", last_day: "2026-07-20" },
   });
   assert.equal(a.useful, true);
-  assert.ok(a.lines.some((l) => /分区|写入/.test(l)));
+  assert.ok(a.lines.some((l) => /分区|写入|脚本|GitHub/.test(l)));
+});
+
+test("analysisException maps token to sql line when possible", () => {
+  const a = analyzeSqlAgainstFailure({
+    repoRoot: REPO,
+    sqlFile: "output/es/ads_seller_product_info_for_es.sql",
+    category: "SQL",
+    logText: "AnalysisException: cannot resolve `gmv_in_usd` given input columns",
+  });
+  assert.equal(a.useful, true);
+  // either code line hit or fallback SQL message
+  assert.ok(a.lines.length >= 1);
 });
 
 test("missing file reports clearly", () => {

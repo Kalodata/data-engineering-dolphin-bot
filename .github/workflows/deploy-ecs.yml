@@ -1,0 +1,73 @@
+# Optional GitHub Actions — push main → ECR + ECS update (ops must have created Service once).
+# Secrets: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or OIDC role).
+name: deploy-ecs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Dockerfile"
+      - "package.json"
+      - "package-lock.json"
+      - "deploy/ecs/**"
+      - "scripts/ecs/**"
+      - "config.ecs.example.json"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ap-southeast-1
+      AWS_ACCOUNT_ID: "136376784788"
+      ECS_CLUSTER: dolphin-bot
+      ECS_SERVICE: dolphin-bot
+      ECR_REPO: dolphin-bot
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMG="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+          docker build -t "$IMG:$IMAGE_TAG" -t "$IMG:latest" .
+          docker push "$IMG:$IMAGE_TAG"
+          docker push "$IMG:latest"
+          echo "IMAGE=$IMG:$IMAGE_TAG" >> "$GITHUB_ENV"
+
+      - name: Register task definition and update service
+        run: |
+          set -euo pipefail
+          TD=$(mktemp)
+          jq --arg img "$IMAGE" \
+            '.containerDefinitions[0].image=$img' \
+            deploy/ecs/task-definition.json > "$TD"
+          ARN=$(aws ecs register-task-definition \
+            --cli-input-json "file://$TD" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$ARN" \
+            --desired-count 1 \
+            --force-new-deployment
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
+          echo "deployed $ARN"

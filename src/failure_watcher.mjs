@@ -5,15 +5,22 @@ import {
   classifyFailure,
   extractLogHighlights,
   buildProcessInstanceUiUrl,
+  buildActionPlaybook,
 } from "./ds32_client.mjs";
+import { alertDedupeKey, claimAlert } from "./alert_dedupe.mjs";
+import { FEEDBACK_HINT } from "./alert_feedback.mjs";
+import { enrichFailureContext } from "./deep_enrich.mjs";
 import { analyzeSqlAgainstFailure } from "./sql_repo_analysis.mjs";
+import { buildAlertCardFromReportFields } from "./feishu_cards.mjs";
 
 /** Noise tasks that fire often but are not real workflow alerts. */
 const NOISE_NAME_RE = /^(ROUTER|CHECK VALID)$/i;
 const NOISE_TYPE_RE = /^(CONDITIONS|SWITCH|DEPENDENT)$/i;
+/** Parent wrappers: logs are empty / “子流程在跑”, root cause is always a leaf child. */
+const WRAPPER_TYPE_RE = /^(SUB_PROCESS)$/i;
 
 /**
- * Real execution failures worth notifying (JDBC/SQL/etc.), not router/check noise.
+ * Real execution failures worth notifying (JDBC/SQL/QUALITY leaf), not router/parent noise.
  */
 export function isMeaningfulFailure(task) {
   if (!task || String(task.state || "").toUpperCase() !== "FAILURE") return false;
@@ -21,11 +28,12 @@ export function isMeaningfulFailure(task) {
   const type = String(task.taskType || "").toUpperCase();
   if (NOISE_NAME_RE.test(name)) return false;
   if (NOISE_TYPE_RE.test(type)) return false;
+  if (WRAPPER_TYPE_RE.test(type)) return false;
   if (/CHECK\s*VALID|ROUTER/i.test(name)) return false;
   // Prefer known work types / names; still allow other non-noise leaves.
   if (
     /^(SQL|SPARK|FLINK|DATAX|HTTP|SEATUNNEL|MR|HIVE|SQOOP)$/i.test(type) ||
-    /JDBC|SQL|\.sql/i.test(name) ||
+    /JDBC|SQL|\.sql|QUALITY/i.test(name) ||
     /^(SHELL|PYTHON)$/i.test(type)
   ) {
     return true;
@@ -73,6 +81,15 @@ export function saveNotifyState(statePath, state) {
   fs.writeFileSync(statePath, JSON.stringify(slim, null, 2));
 }
 
+/** Mark task notified so poll fallback will not re-push. */
+export function markTaskNotified(statePath, taskId, now = Date.now()) {
+  if (!statePath || taskId == null) return;
+  const state = loadNotifyState(statePath);
+  state.notified[String(taskId)] = now;
+  if (!state.seeded) state.seeded = true;
+  saveNotifyState(statePath, state);
+}
+
 export function formatAlertReport({
   task,
   inst,
@@ -81,6 +98,7 @@ export function formatAlertReport({
   projectCode,
   apiUrl,
   repoAnalysis,
+  dsReadonly = false,
 }) {
   const lines = [];
   lines.push("【工作流告警】");
@@ -90,7 +108,13 @@ export function formatAlertReport({
     classification?.where ||
     "任务失败（原因未解析到）";
   lines.push(`原因：${cause}`);
+  if (classification?.verdict) lines.push(classification.verdict);
   lines.push(`类别：${classification?.category || "?"}`);
+
+  const mechanism = classification?.mechanism || classification?.where;
+  if (mechanism && !sameAlertText(mechanism, cause)) {
+    lines.push(`成因：${clipAlert(mechanism, 160)}`);
+  }
 
   const instId = inst?.id ?? task.processInstanceId;
   const uiUrl = buildProcessInstanceUiUrl({
@@ -115,22 +139,20 @@ export function formatAlertReport({
   const when = task.endTime || task.startTime;
   if (when) lines.push(`时间：${when}`);
 
-  const evidence =
-    classification?.evidence?.length
-      ? classification.evidence
-      : highlight?.evidence?.length
-        ? highlight.evidence
-        : [];
-  if (evidence.length) {
-    lines.push("关键：");
-    for (const e of evidence.slice(0, 1)) lines.push(`· ${e}`);
-  } else if (highlight?.purged) {
-    lines.push(`关键：${highlight.summary}`);
+  const rawEvidence =
+    classification?.evidence?.[0] ||
+    highlight?.evidence?.[0] ||
+    (highlight?.purged ? highlight.summary : null);
+  const err = rawEvidence ? String(rawEvidence).trim() : "";
+  if (err && !sameAlertText(err, cause)) {
+    lines.push(`报错：${clipAlert(err, 100)}`);
   }
 
   if (repoAnalysis?.useful && repoAnalysis?.lines?.length) {
-    lines.push("仓库分析：");
-    for (const l of repoAnalysis.lines.slice(0, 5)) lines.push(`· ${l}`);
+    lines.push("代码/Git：");
+    for (const l of repoAnalysis.lines.slice(0, 4)) {
+      lines.push(`· ${clipAlert(l, 140)}`);
+    }
   }
 
   const fixes = (classification?.fixes || [])
@@ -138,19 +160,46 @@ export function formatAlertReport({
     .filter(Boolean)
     .slice(0, 3);
   if (fixes.length) {
-    lines.push("处理意见：");
-    fixes.forEach((f, i) => lines.push(`${i + 1}. ${f}`));
+    lines.push("现在做：");
+    fixes.forEach((f, i) => lines.push(`${i + 1}. ${clipAlert(f, 120)}`));
+  } else if (!dsReadonly && instId) {
+    lines.push("现在做：");
+    lines.push(`1. 飞书回「重跑 ${instId}」→ YES（或点告警卡「重跑」）`);
   }
 
   lines.push("");
-  lines.push(`深挖：/diagnose ${instId}  或  /log ${task.id}`);
+  lines.push(`深挖：点告警卡「诊断」或 /diagnose ${instId}  /log ${task.id}`);
+  lines.push(FEEDBACK_HINT);
   return lines.join("\n");
+}
+
+/** Interactive Feishu card for the same alert (Nova-style). */
+export function formatAlertCard(fields = {}) {
+  return buildAlertCardFromReportFields(fields);
 }
 
 function shortName(name) {
   const s = String(name || "").trim();
   if (!s) return "";
   return s.length > 48 ? `${s.slice(0, 47)}…` : s;
+}
+
+function clipAlert(s, maxLen = 100) {
+  const t = String(s || "").trim();
+  if (!t) return "";
+  return t.length > maxLen ? `${t.slice(0, maxLen - 1)}…` : t;
+}
+
+function sameAlertText(a, b) {
+  const norm = (x) =>
+    String(x || "")
+      .toLowerCase()
+      .replace(/[^\w\u4e00-\u9fff]+/g, "")
+      .slice(0, 60);
+  const na = norm(a);
+  const nb = norm(b);
+  if (!na || !nb) return false;
+  return na === nb || na.includes(nb) || nb.includes(na);
 }
 
 /**
@@ -188,8 +237,129 @@ export async function listMeaningfulFailures(ds, options = {}) {
 }
 
 /**
+ * Decide whether a FAILURE should notify, wait for DS auto-retry, or be skipped as self-healed.
+ *
+ * - skip: workflow already SUCCESS, or same task later SUCCESS (retry healed) → never push
+ * - hold: retries remain and failure is still young → wait next poll, do not mark notified
+ * - notify: settled failure that still needs attention
+ */
+/**
+ * Quality failures rarely self-heal via DS retry; connection/engine jitter often does.
+ * Name-based before log fetch; optional category override after classify.
+ */
+export function resolveHealHoldMinutes({
+  task,
+  category = "",
+  defaultMinutes = 15,
+  qualityMinutes = 0,
+  transientMinutes = 5,
+} = {}) {
+  const name = String(task?.name || "");
+  const cat = String(category || "");
+  if (/QUALITY|数据质量|\bDQ\b/i.test(name) || cat === "数据质量") {
+    return Math.max(0, Number(qualityMinutes));
+  }
+  if (
+    cat === "连接/会话" ||
+    cat === "引擎/集群" ||
+    /TTransport|连接|会话/i.test(name)
+  ) {
+    return Math.min(Number(defaultMinutes) || 15, Number(transientMinutes) || 5);
+  }
+  return Number(defaultMinutes) || 15;
+}
+
+export function evaluateSelfHeal({
+  task,
+  inst,
+  siblings = [],
+  now = Date.now(),
+  holdMinutes = 15,
+  category = "",
+} = {}) {
+  const instState = String(inst?.state || "").toUpperCase();
+  if (instState === "SUCCESS") {
+    return { action: "skip", reason: "workflow_success" };
+  }
+
+  const effectiveHold = resolveHealHoldMinutes({
+    task,
+    category,
+    defaultMinutes: holdMinutes,
+  });
+
+  const name = String(task?.name || "");
+  const failEnd = parseEndTimeMs(task) ?? 0;
+  const sameName = (siblings || []).filter((t) => String(t?.name || "") === name);
+  const healed = sameName.find((t) => {
+    if (String(t.id) === String(task.id)) return false;
+    if (String(t.state || "").toUpperCase() !== "SUCCESS") return false;
+    const end = parseEndTimeMs(t) ?? 0;
+    return (
+      end >= failEnd || Number(t.retryTimes || 0) > Number(task.retryTimes || 0) || Number(t.id) > Number(task.id)
+    );
+  });
+  if (healed) {
+    return { action: "skip", reason: "retry_success", healedTaskId: healed.id };
+  }
+
+  const retryRunning = sameName.find((t) => {
+    if (String(t.id) === String(task.id)) return false;
+    return /RUNNING|SUBMITTED_SUCCESS|ACCEPT|DELAY_EXECUTION/i.test(String(t.state || ""));
+  });
+  if (retryRunning) {
+    return {
+      action: "hold",
+      reason: "retry_running",
+      runningTaskId: retryRunning.id,
+    };
+  }
+
+  const maxRetry = Number(task?.maxRetryTimes || 0);
+  const retryTimes = Number(task?.retryTimes || 0);
+  const ageMin = (now - (parseEndTimeMs(task) ?? now)) / 60_000;
+  const terminalBad = ["FAILURE", "STOP", "KILL"].includes(instState);
+  const stillOpen = !terminalBad && instState !== "SUCCESS";
+
+  if (
+    effectiveHold > 0 &&
+    maxRetry > 0 &&
+    retryTimes < maxRetry &&
+    ageMin < effectiveHold &&
+    stillOpen
+  ) {
+    return {
+      action: "hold",
+      reason: "awaiting_retry",
+      ageMin: Math.round(ageMin * 10) / 10,
+      retryTimes,
+      maxRetry,
+      holdMinutes: effectiveHold,
+    };
+  }
+
+  return { action: "notify", reason: "not_healed", holdMinutes: effectiveHold };
+}
+
+/** Count meaningful failures near this task end time (same incident window). */
+export function countNearbyFailures(task, pool = [], windowMinutes = 30) {
+  const t0 = parseEndTimeMs(task);
+  if (t0 == null) return 1;
+  const win = windowMinutes * 60_000;
+  let n = 0;
+  for (const t of pool) {
+    if (!isMeaningfulFailure(t)) continue;
+    const t1 = parseEndTimeMs(t);
+    if (t1 == null) continue;
+    if (Math.abs(t1 - t0) <= win) n += 1;
+  }
+  return Math.max(n, 1);
+}
+
+/**
  * One poll tick: discover new meaningful failures and build reports.
  * First successful poll only seeds state (no spam of historical failures).
+ * Self-healed (DS auto-retry SUCCESS) failures are recorded but not pushed.
  */
 export async function collectNewFailureAlerts(ds, options = {}) {
   const {
@@ -201,9 +371,14 @@ export async function collectNewFailureAlerts(ds, options = {}) {
     fetchLog = true,
     now = Date.now(),
     sqlRepoPath = null,
+    healHoldMinutes = 15,
+    dedupePath = null,
   } = options;
 
   const state = loadNotifyState(statePath);
+  const unifiedDedupePath =
+    dedupePath ||
+    path.join(path.dirname(statePath || "."), "alert-dedupe.json");
   const { rows, candidates } = await listMeaningfulFailures(ds, {
     pageSize,
     maxPages,
@@ -228,12 +403,20 @@ export async function collectNewFailureAlerts(ds, options = {}) {
       alerts: [],
       scanned: rows.length,
       candidates: candidates.length,
+      skippedHealed: 0,
+      held: 0,
     };
   }
 
   const fresh = candidates.filter((t) => !state.notified[String(t.id)]);
   const alerts = [];
-  for (const task of fresh.slice(0, maxPerTick)) {
+  let skippedHealed = 0;
+  let held = 0;
+  let dirty = false;
+
+  for (const task of fresh) {
+    if (alerts.length >= maxPerTick) break;
+
     let inst = null;
     try {
       if (task.processInstanceId) {
@@ -241,6 +424,50 @@ export async function collectNewFailureAlerts(ds, options = {}) {
       }
     } catch {
       inst = { id: task.processInstanceId, name: "", state: "?" };
+    }
+
+    let siblings = [];
+    try {
+      if (task.processInstanceId) {
+        const page = await ds.listTaskInstances({
+          processInstanceId: task.processInstanceId,
+          pageSize: 200,
+        });
+        siblings = page?.totalList || [];
+      }
+    } catch {
+      siblings = [];
+    }
+
+    const decision = evaluateSelfHeal({
+      task,
+      inst,
+      siblings,
+      now,
+      holdMinutes: healHoldMinutes,
+    });
+
+    if (decision.action === "hold") {
+      held += 1;
+      continue;
+    }
+    if (decision.action === "skip") {
+      state.notified[String(task.id)] = now;
+      skippedHealed += 1;
+      dirty = true;
+      continue;
+    }
+
+    const dedupeKey = alertDedupeKey({
+      taskId: task.id,
+      processInstanceId: task.processInstanceId,
+      state: "FAILURE",
+    });
+    const claim = claimAlert(unifiedDedupePath, dedupeKey, { now });
+    if (!claim.claimed) {
+      state.notified[String(task.id)] = now;
+      dirty = true;
+      continue;
     }
 
     let logText = "";
@@ -263,21 +490,61 @@ export async function collectNewFailureAlerts(ds, options = {}) {
       logText,
       purged: highlight.purged,
     });
+    const nearbyFailureCount = countNearbyFailures(task, candidates, 30);
+    const retryRunning = (siblings || []).some(
+      (t) =>
+        String(t.id) !== String(task.id) &&
+        String(t.name || "") === String(task.name || "") &&
+        /RUNNING|SUBMITTED_SUCCESS|ACCEPT|DELAY_EXECUTION/i.test(String(t.state || "")),
+    );
+    const playbook = buildActionPlaybook({
+      category: classification.category,
+      log: logText,
+      sqlFile: classification.sqlFile,
+      signal: {
+        cause: classification.cause,
+        evidence: classification.evidence,
+      },
+      task,
+      nearbyFailureCount,
+      retryRunning,
+      workflowState: inst?.state,
+      processInstanceId: task.processInstanceId,
+      dsReadonly: Boolean(options.dsReadonly),
+    });
+    if (playbook.mechanism) classification.mechanism = playbook.mechanism;
+    if (playbook.verdict) classification.verdict = playbook.verdict;
+    if (playbook.cause) classification.cause = playbook.cause;
+    if (playbook.actions?.length) classification.fixes = playbook.actions;
+    classification.where = playbook.mechanism || classification.where;
+
     let repoAnalysis = null;
     if (sqlRepoPath && classification.sqlFile) {
       try {
-        repoAnalysis = analyzeSqlAgainstFailure({
+        repoAnalysis = await enrichFailureContext({
           repoRoot: sqlRepoPath,
           sqlFile: classification.sqlFile,
           logText,
           category: classification.category,
           varsMap: classification.varsMap || {},
+          hiveProbe: options.hiveProbe || null,
+          enablePrLookup: options.enablePrLookup !== false,
         });
       } catch {
-        repoAnalysis = null;
+        try {
+          repoAnalysis = analyzeSqlAgainstFailure({
+            repoRoot: sqlRepoPath,
+            sqlFile: classification.sqlFile,
+            logText,
+            category: classification.category,
+            varsMap: classification.varsMap || {},
+          });
+        } catch {
+          repoAnalysis = null;
+        }
       }
     }
-    const text = formatAlertReport({
+    const reportFields = {
       task,
       inst,
       classification,
@@ -285,19 +552,155 @@ export async function collectNewFailureAlerts(ds, options = {}) {
       projectCode: ds.projectCode,
       apiUrl: ds.apiUrl,
       repoAnalysis,
+      dsReadonly: Boolean(options.dsReadonly),
+    };
+    const text = formatAlertReport(reportFields);
+    const card = formatAlertCard(reportFields);
+    alerts.push({
+      taskId: task.id,
+      processInstanceId: task.processInstanceId,
+      text,
+      card,
+      category: classification.category,
     });
-    alerts.push({ taskId: task.id, processInstanceId: task.processInstanceId, text });
     state.notified[String(task.id)] = now;
+    dirty = true;
   }
 
-  if (alerts.length) saveNotifyState(statePath, state);
+  if (dirty) saveNotifyState(statePath, state);
   return {
     seeded: false,
     alerts,
     scanned: rows.length,
     candidates: candidates.length,
-    pending: Math.max(0, fresh.length - alerts.length),
+    pending: Math.max(0, fresh.length - alerts.length - skippedHealed - held),
+    skippedHealed,
+    held,
   };
+}
+
+/**
+ * Build one alert card for a pushed task (DS webhook). Caller owns notify + dedupe claim.
+ */
+export async function materializeTaskAlert(ds, event = {}, options = {}) {
+  const taskId = Number(event.taskId);
+  const processInstanceId = event.processInstanceId
+    ? Number(event.processInstanceId)
+    : null;
+  if (!Number.isFinite(taskId)) return null;
+
+  let inst = null;
+  let task = null;
+  let siblings = [];
+  try {
+    if (processInstanceId) {
+      inst = await ds.getProcessInstance(processInstanceId);
+      const page = await ds.listTaskInstances({
+        processInstanceId,
+        pageSize: 200,
+      });
+      siblings = page?.totalList || [];
+      task = siblings.find((t) => Number(t.id) === taskId) || null;
+    }
+  } catch {
+    // continue with sparse task
+  }
+  if (!task) {
+    task = {
+      id: taskId,
+      processInstanceId,
+      name: event.name || "?",
+      state: "FAILURE",
+      endTime: event.endTime || null,
+    };
+  }
+
+  let logText = "";
+  let highlight = { purged: false, lines: [], summary: "" };
+  if (options.fetchLog !== false) {
+    try {
+      logText = await ds.getTaskLogChunks(taskId);
+      highlight = extractLogHighlights(logText, { maxLines: 12 });
+    } catch (error) {
+      highlight = {
+        purged: true,
+        lines: [],
+        summary: `拉日志失败：${error.message}`,
+      };
+    }
+  }
+
+  const classification = classifyFailure({
+    task,
+    logText,
+    purged: highlight.purged,
+  });
+  const playbook = buildActionPlaybook({
+    category: classification.category,
+    log: logText,
+    sqlFile: classification.sqlFile,
+    signal: { cause: classification.cause, evidence: classification.evidence },
+    task,
+    nearbyFailureCount: 1,
+    workflowState: inst?.state,
+    processInstanceId: processInstanceId || task.processInstanceId,
+    dsReadonly: Boolean(options.dsReadonly),
+  });
+  if (playbook.mechanism) classification.mechanism = playbook.mechanism;
+  if (playbook.verdict) classification.verdict = playbook.verdict;
+  if (playbook.cause) classification.cause = playbook.cause;
+  if (playbook.actions?.length) classification.fixes = playbook.actions;
+  classification.where = playbook.mechanism || classification.where;
+
+  let repoAnalysis = null;
+  if (options.sqlRepoPath && classification.sqlFile) {
+    try {
+      repoAnalysis = await enrichFailureContext({
+        repoRoot: options.sqlRepoPath,
+        sqlFile: classification.sqlFile,
+        logText,
+        category: classification.category,
+        varsMap: classification.varsMap || {},
+        hiveProbe: options.hiveProbe || null,
+        enablePrLookup: options.enablePrLookup !== false,
+      });
+    } catch {
+      repoAnalysis = null;
+    }
+  }
+
+  const reportFields = {
+    task,
+    inst,
+    classification,
+    highlight,
+    projectCode: ds.projectCode,
+    apiUrl: ds.apiUrl,
+    repoAnalysis,
+    dsReadonly: Boolean(options.dsReadonly),
+  };
+  const text = formatAlertReport(reportFields);
+  const card = formatAlertCard(reportFields);
+  return {
+    taskId,
+    processInstanceId: processInstanceId || task.processInstanceId,
+    text,
+    card,
+    category: classification.category,
+  };
+}
+
+async function deliverAlert(sendText, { chatId, userId, alert }) {
+  if (alert?.card && typeof sendText === "function") {
+    // Prefer interactive card when sendText supports { card } (main.mjs sendAlert).
+    try {
+      await sendText({ chatId, userId, text: alert.text, card: alert.card });
+      return;
+    } catch {
+      // fall through to text
+    }
+  }
+  await sendText({ chatId, userId, text: alert.text });
 }
 
 export function startFailureWatcher({
@@ -305,6 +708,7 @@ export function startFailureWatcher({
   config,
   sendText,
   log = console.error,
+  onAlertSent = null,
 }) {
   const watch = config.alertWatch;
   if (!watch?.enabled) {
@@ -312,7 +716,9 @@ export function startFailureWatcher({
     return { stop: () => {}, registerRecipient: () => {} };
   }
 
-  const intervalMs = Math.max(30, Number(watch.intervalSeconds || 90)) * 1000;
+  const intervalMs =
+    Math.max(30, Number(watch.effectiveIntervalSeconds ?? watch.intervalSeconds ?? 90)) *
+    1000;
   let stopped = false;
   let running = false;
 
@@ -383,6 +789,13 @@ export function startFailureWatcher({
         statePath: watch.statePath,
         fetchLog: watch.fetchLog !== false,
         sqlRepoPath: config.sqlRepoPath || null,
+        healHoldMinutes: watch.healHoldMinutes ?? 15,
+        dedupePath: watch.dedupePath,
+        dsReadonly: config.dsReadonly !== false,
+        hiveProbe: config.hiveProbe
+          ? { ...config.hiveProbe, onAlert: config.hiveProbe.onAlert === true }
+          : null,
+        enablePrLookup: config.enablePrLookup !== false,
       });
       if (result.seeded) {
         log(
@@ -390,10 +803,16 @@ export function startFailureWatcher({
         );
         return;
       }
+      if (result.skippedHealed || result.held) {
+        log(
+          `[alert-watch] self-heal filter: skipped=${result.skippedHealed || 0} held=${result.held || 0}`,
+        );
+      }
       for (const alert of result.alerts) {
         for (const chatId of chats) {
           try {
-            await sendText({ chatId, text: alert.text });
+            await deliverAlert(sendText, { chatId, alert });
+            onAlertSent?.({ chatId, userId: null, alert });
             log(
               `[alert-watch] notified chat ${chatId} task#${alert.taskId} wf#${alert.processInstanceId}`,
             );
@@ -405,7 +824,8 @@ export function startFailureWatcher({
         if (!chats.size) {
           for (const userId of users) {
             try {
-              await sendText({ userId, text: alert.text });
+              await deliverAlert(sendText, { userId, alert });
+              onAlertSent?.({ chatId: null, userId, alert });
               log(
                 `[alert-watch] notified user ${userId} task#${alert.taskId} wf#${alert.processInstanceId}`,
               );
@@ -442,5 +862,23 @@ export function startFailureWatcher({
       clearInterval(timer);
     },
     registerRecipient,
+    async notifyAlert(alert) {
+      if (!alert?.text && !alert?.card) return { sent: 0 };
+      const { users, chats } = loadRecipients();
+      let sent = 0;
+      for (const chatId of chats) {
+        await deliverAlert(sendText, { chatId, alert });
+        onAlertSent?.({ chatId, userId: null, alert });
+        sent += 1;
+      }
+      if (!chats.size) {
+        for (const userId of users) {
+          await deliverAlert(sendText, { userId, alert });
+          onAlertSent?.({ chatId: null, userId, alert });
+          sent += 1;
+        }
+      }
+      return { sent };
+    },
   };
 }

@@ -10,10 +10,15 @@
   },
   "scripts": {
     "start": "node src/main.mjs",
-    "test": "node --test tests/*.test.mjs"
+    "start:mac": "bash scripts/start-mac.sh",
+    "test": "node --test tests/*.test.mjs",
+    "mcp:ds": "node mcp/ds-server.mjs",
+    "deploy:ecs": "bash scripts/ecs/deploy.sh"
   },
   "dependencies": {
-    "@cursor/sdk": "latest"
+    "@cursor/sdk": "latest",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
   },
   "engines": {
     "node": ">=20"

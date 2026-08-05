@@ -1,16 +1,16 @@
 {
-  "allowed_users": ["ou_xxx"],
+  "allowed_users": [],
   "allowed_chats": [],
   "alert_chat_ids": [],
-  "ds_project_code": "YOUR_DS_PROJECT_CODE",
+  "ds_project_code": "9892432515424",
   "ds_readonly": true,
-  "sql_repo_path": "/path/to/your-pipeline-sql-repo",
-  "enable_pr_lookup": true,
+  "sql_repo_path": "",
+  "enable_pr_lookup": false,
   "hive_probe": {
-    "enabled": true,
+    "enabled": false,
     "on_alert": false,
-    "on_diagnose": true,
-    "jdbc_url": "jdbc:hive2://localhost:10001",
+    "on_diagnose": false,
+    "jdbc_url": "",
     "timeout_ms": 90000
   },
   "alert_watch": {
@@ -24,7 +24,7 @@
     "fetch_log": true,
     "auto_register": true,
     "notify_chat_ids": [],
-    "notify_user_ids": ["ou_xxx"],
+    "notify_user_ids": [],
     "dedupe_path": ".data/alert-dedupe.json"
   },
   "alert_feedback": {
@@ -35,22 +35,21 @@
     "enabled": false,
     "prefer_push": true,
     "port": 18766,
-    "bind": "127.0.0.1",
+    "bind": "0.0.0.0",
     "path": "/ds-alert",
     "token": ""
   },
   "feishu_card_callback": {
     "enabled": true,
     "port": 18767,
-    "bind": "127.0.0.1",
+    "bind": "0.0.0.0",
     "path": "/feishu/card",
     "verification_token": "",
     "encrypt_key": ""
   },
   "projects": {
-    "remote": "/path/to/dolphin-feishu-bot"
+    "remote": "/app"
   },
   "model": "auto",
-  "max_reply_chars": 6000,
-  "alert_prompt_path": "/Users/you/.cursor/agents/alert/PROMPT.md"
+  "max_reply_chars": 6000
 }

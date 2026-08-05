@@ -1,0 +1,17 @@
+node_modules
+.data
+.env
+config.json
+.git
+.venv
+tmp-*
+*.log
+hs_err_*.log
+scripts/hive-ro/*.class
+docs
+tests
+mcp
+**/.DS_Store
+agent-transcripts
+*.md
+!README.md

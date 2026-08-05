@@ -1,0 +1,73 @@
+{
+  "family": "dolphin-bot",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "executionRoleArn": "arn:aws:iam::136376784788:role/dolphin-bot-ecs-execution-role",
+  "taskRoleArn": "arn:aws:iam::136376784788:role/dolphin-bot-ecs-task-role",
+  "containerDefinitions": [
+    {
+      "name": "dolphin-bot",
+      "image": "136376784788.dkr.ecr.ap-southeast-1.amazonaws.com/dolphin-bot:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 18767,
+          "hostPort": 18767,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "LARK_PROFILE", "value": "kalodata-alert" },
+        { "name": "DS_API_URL", "value": "https://ds-offline.kalowave.com/dolphinscheduler" },
+        { "name": "DS_PROJECT_CODE", "value": "9892432515424" },
+        { "name": "NODE_ENV", "value": "production" }
+      ],
+      "secrets": [
+        {
+          "name": "LARK_APP_ID",
+          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/lark-app-id"
+        },
+        {
+          "name": "LARK_APP_SECRET",
+          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/lark-app-secret"
+        },
+        {
+          "name": "DS_API_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/ds-api-token"
+        },
+        {
+          "name": "CURSOR_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/cursor-api-key"
+        },
+        {
+          "name": "FEISHU_VERIFICATION_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/feishu-verification-token"
+        }
+      ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:18767/health >/dev/null || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/dolphin-bot",
+          "awslogs-region": "ap-southeast-1",
+          "awslogs-stream-prefix": "bot"
+        }
+      }
+    }
+  ]
+}

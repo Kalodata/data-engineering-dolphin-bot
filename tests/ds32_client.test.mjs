@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildActionPlaybook,
   classifyFailure,
   extractAlertEvidence,
   extractLogHighlights,
@@ -33,9 +34,19 @@ test("extractAlertEvidence drops Map progress and keeps JDBC error", () => {
 `;
   const s = extractAlertEvidence(log);
   assert.match(s.cause, /Tez|引擎/);
-  assert.equal(s.evidence.length <= 2, true);
-  assert.ok(s.evidence.some((e) => /Error while processing|return code 2/i.test(e)));
-  assert.ok(!s.evidence.some((e) => /Map 1:/i.test(e)));
+  assert.equal(s.evidence.length, 1);
+  assert.ok(s.evidence[0].length <= 100);
+  assert.ok(/return code 2|Execution Error|TezTask/i.test(s.evidence[0]));
+  assert.ok(!/Map 1:/i.test(s.evidence[0]));
+});
+
+test("compactErrorLine keeps only exception key", async () => {
+  const { compactErrorLine } = await import("../src/ds32_client.mjs");
+  const long =
+    "Error: Error while processing statement: FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.tez.TezTask. Uncaught exception NodeId.getHost() is null (state=08S01,code=2)";
+  const c = compactErrorLine(long, 100);
+  assert.ok(c.length <= 100);
+  assert.match(c, /return code 2|Execution Error/i);
 });
 
 test("classifyFailure prefers Tez log over template partition keywords", () => {
@@ -108,13 +119,92 @@ test("formatPracticalDiagnosis has three sections", () => {
     classification: {
       category: "SQL/JDBC",
       where: "脚本挂了",
-      fixes: ["查分区"],
+      mechanism: "脚本挂了",
+      verdict: "判定：需按报错处理后再跑",
+      fixes: ["飞书回「重跑 1」→ YES"],
       sqlFile: "a.sql",
       vars: [],
     },
   });
   assert.match(text, /问题出在哪/);
-  assert.match(text, /怎么解决/);
+  assert.match(text, /现在怎么做/);
+  assert.match(text, /重跑 1/);
+});
+
+test("buildActionPlaybook gives concrete rerun for MetadataFetchFailed", () => {
+  const p = buildActionPlaybook({
+    category: "引擎/集群",
+    log: "MetadataFetchFailedException: Missing an output location for shuffle 12",
+    sqlFile: "ads/x.sql",
+    processInstanceId: 1957808,
+    nearbyFailureCount: 3,
+    dsReadonly: false,
+  });
+  assert.match(p.mechanism, /shuffle|MetadataFetchFailed/i);
+  assert.match(p.verdict, /抖动/);
+  assert.ok(p.actions.some((a) => /重跑 1957808/.test(a)));
+  assert.ok(p.actions.some((a) => /不要改|集群面/.test(a)));
+});
+
+test("quality failure is classified with expected/actual", () => {
+  const log =
+    'Checking val\'s value, expected:[-50,150], actual:291.292838081579, matched:false\n' +
+    'Error executing quality check for kalo_data_online.dws_product_sale_allocation\n' +
+    '"level" : "ERROR",';
+  const s = extractAlertEvidence(log);
+  assert.match(s.cause, /质量校验|291/);
+  assert.doesNotMatch(s.cause || "", /"level"/);
+  const c = classifyFailure({
+    task: { name: "QUALITY TASK", taskType: "SHELL", processInstanceId: 1 },
+    logText: log,
+  });
+  assert.equal(c.category, "数据质量");
+  assert.match(c.verdict || "", /质量/);
+  assert.ok(c.fixes.some((f) => /阈值|修数|指标/.test(f)));
+});
+
+test("Livy UploadProductPic dead is not JDBC", () => {
+  const log = `
+	Livy URL: http://172.31.67.156:8998
+	主类: com.kalo.data.picsearch.UploadProductPicJob
+	[08:43:21] 提交任务...
+	✅ Batch ID: 4488
+	[08:43:21] 状态: starting
+	[08:43:31] 状态: dead
+	❌ 任务执行失败
+	失败信息: {
+	  "driverLogUrl": null,
+	  "sparkUiUrl": null
+	}
+	📝 查看日志:
+	http://172.31.67.156:8998/batches/4488/log
+	exitStatusCode:1
+`;
+  const s = extractAlertEvidence(log);
+  assert.match(s.cause || "", /Livy|dead/);
+  assert.ok(s.livy?.batchId === "4488");
+  assert.match(s.evidence[0] || "", /batch=4488|dead/);
+  const c = classifyFailure({
+    task: {
+      id: 9613557,
+      name: "上传图片到OSS",
+      taskType: "SHELL",
+      processInstanceId: 1997867,
+      retryTimes: 1,
+      maxRetryTimes: 1,
+    },
+    logText: log,
+  });
+  assert.equal(c.category, "Livy/Spark提交");
+  assert.match(c.verdict || "", /Livy/);
+  assert.ok(c.fixes.some((f) => /batches\/4488\/log|Livy/.test(f)));
+  assert.ok(c.fixes.some((f) => /YARN|队列|盲重跑|不要当|勿当/.test(f)));
+});
+
+test("interpretNaturalLanguage board and progress shortcuts", () => {
+  assert.deepEqual(interpretNaturalLanguage("各国天级进度"), ["/board"]);
+  assert.deepEqual(interpretNaturalLanguage("id分区进度"), ["/progress", "id"]);
+  assert.deepEqual(interpretNaturalLanguage("越南跑到哪了"), ["/progress", "vn"]);
 });
 
 test("interpretNaturalLanguage diagnose vs chat follow-up", () => {
@@ -122,6 +212,16 @@ test("interpretNaturalLanguage diagnose vs chat follow-up", () => {
   assert.deepEqual(interpretNaturalLanguage("诊断 1877773"), [
     "/diagnose",
     "1877773",
+  ]);
+  assert.deepEqual(interpretNaturalLanguage("重跑 1939974"), ["/rerun", "1939974"]);
+  assert.deepEqual(interpretNaturalLanguage("帮我重跑"), ["/rerun"]);
+  assert.deepEqual(interpretNaturalLanguage("强制成功 任务 #9441911"), [
+    "/force-success",
+    "9441911",
+  ]);
+  assert.deepEqual(interpretNaturalLanguage("force-success 9441911"), [
+    "/force-success",
+    "9441911",
   ]);
   assert.equal(interpretNaturalLanguage("怎么修复这个问题"), null);
   assert.equal(interpretNaturalLanguage("如何解决"), null);

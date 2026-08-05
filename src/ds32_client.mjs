@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { resolveCountryCode } from "./country_code.mjs";
 
 const DEFAULT_ENV_FILE = path.join(os.homedir(), ".config/dsctl/offline.env");
 
@@ -120,6 +121,47 @@ export class Ds32Client {
     return this.request("GET", `/projects/${projectCode}/task-instances`, {
       params: { processInstanceId, stateType, pageNo, pageSize },
     });
+  }
+
+  /**
+   * Resolve one task instance for display / force-success.
+   * Prefer GET by id; fallback list within processInstanceId when provided.
+   */
+  async resolveTaskInstance(taskInstanceId, { processInstanceId = null, projectCode = this.projectCode } = {}) {
+    const id = Number(taskInstanceId);
+    if (!id) return null;
+    try {
+      const data = await this.request("GET", `/projects/${projectCode}/task-instances/${id}`);
+      if (data && (data.id != null || data.name)) return data;
+    } catch {
+      // classic API may not expose GET-by-id
+    }
+    if (processInstanceId) {
+      const page = await this.listTaskInstances({
+        projectCode,
+        processInstanceId: Number(processInstanceId),
+        pageSize: 200,
+      });
+      return (page?.totalList || []).find((t) => Number(t.id) === id) || null;
+    }
+    // Last resort: recent FAILURE pages (bounded)
+    for (const stateType of ["FAILURE", "KILL", undefined]) {
+      const procs = await this.listProcessInstances({
+        projectCode,
+        stateType,
+        pageSize: 15,
+      });
+      for (const inst of procs?.totalList || []) {
+        const page = await this.listTaskInstances({
+          projectCode,
+          processInstanceId: inst.id,
+          pageSize: 100,
+        });
+        const hit = (page?.totalList || []).find((t) => Number(t.id) === id);
+        if (hit) return { ...hit, processInstanceName: hit.processInstanceName || inst.name };
+      }
+    }
+    return null;
   }
 
   /**
@@ -343,6 +385,20 @@ export class Ds32Client {
   async repeatRunning(processInstanceId, projectCode = this.projectCode) {
     return this.execute(processInstanceId, "REPEAT_RUNNING", projectCode);
   }
+
+  /**
+   * Mark a failed/killed task as FORCED_SUCCESS.
+   * POST /projects/{code}/task-instances/{id}/force-success
+   */
+  async forceTaskSuccess(taskInstanceId, projectCode = this.projectCode) {
+    if (!projectCode) throw new Error("projectCode required");
+    const id = Number(taskInstanceId);
+    if (!id) throw new Error("taskInstanceId required");
+    return this.request(
+      "POST",
+      `/projects/${projectCode}/task-instances/${id}/force-success`,
+    );
+  }
 }
 
 export function buildProcessInstanceUiUrl({
@@ -395,6 +451,10 @@ export function extractLogHighlights(logText, { maxLines = 25 } = {}) {
     /No rows selected \(\d+/i,
     /AnalysisException/i,
     /OutOfMemory/i,
+    /状态:\s*dead/i,
+    /任务执行失败/,
+    /Livy|batches\/\d+/i,
+    /exitStatusCode:\s*[1-9]/i,
   ];
   const hits = [];
   const allLines = text.split(/\r?\n/);
@@ -429,9 +489,9 @@ const LOG_NOISE_RE =
   /^\s*(INFO\s*:)?\s*(Map\s+\d+:|Reducer\s+\d+:|Concurrency mode|Completed executing|Starting Job|Kill Command|number of splits|Hadoop job information|Stage-|Total MapReduce|Launching Job)/i;
 
 /**
- * Pick 1–2 lines that actually explain the failure (for Feishu alert cards).
+ * Pick a short, human key error for Feishu alert cards (1 line).
  */
-export function extractAlertEvidence(logText, { maxEvidence = 2, maxLen = 220 } = {}) {
+export function extractAlertEvidence(logText, { maxEvidence = 1, maxLen = 100 } = {}) {
   const all = String(logText || "")
     .split(/\r?\n/)
     .map((l) => l.replace(/\t+/g, " ").replace(/\s+/g, " ").trim())
@@ -440,24 +500,41 @@ export function extractAlertEvidence(logText, { maxEvidence = 2, maxLen = 220 } 
   const ranked = [];
   for (const line of all) {
     let score = 0;
-    if (/Error while processing statement/i.test(line)) score = 100;
+    // Data quality checker (kalo quality) — prefer over JSON "level":"ERROR" noise
+    if (/expected:\s*\[[^\]]+\].*actual:\s*[\d.]+.*matched:\s*false/i.test(line)) score = 110;
+    else if (/Checking val's value.*matched:\s*false/i.test(line)) score = 108;
+    else if (/RuntimeException:.*Test [Cc]ase:/i.test(line)) score = 106;
+    else if (/Error executing quality check/i.test(line)) score = 104;
+    else if (/Error while processing statement/i.test(line)) score = 100;
+    else if (/MetadataFetchFailedException|FetchFailedException/i.test(line)) score = 98;
+    else if (/Job aborted due to stage failure|failed the maximum allowable number of times/i.test(line))
+      score = 97;
     else if (/FAILED:\s*Execution Error/i.test(line)) score = 95;
     else if (/^Error:\s*.*TTransportException/i.test(line)) score = 94;
     else if (/TTransportException/i.test(line)) score = 88;
     else if (/AnalysisException|SemanticException|ParseException|InvalidInputException/i.test(line))
       score = 90;
     else if (/OutOfMemoryError|Java heap space|Container killed by YARN/i.test(line)) score = 85;
+    else if (/Caused by:/i.test(line) && /SparkException|shuffle|stage failure/i.test(line)) score = 96;
     else if (/Caused by:/i.test(line)) score = 80;
-    else if (/return code\s+\d+/i.test(line)) score = 75;
-    else if (/ERROR\s*:/i.test(line) && /FAILED|Exception|Error/i.test(line)) score = 70;
+    else if (/状态:\s*dead/i.test(line)) score = 112;
+    else if (/❌\s*任务执行失败/.test(line)) score = 110;
+    else if (/batches\/\d+\/log|Livy 详情|Batch ID:\s*\d+/i.test(line)) score = 95;
+    else if (/UploadProductPic|Upload.*PicJob|pic\.search|主类:\s*\S+/i.test(line)) score = 88;
+    else if (/return code\s+\d+|exitStatusCode:\s*[1-9]|processExitValue:\s*[1-9]/i.test(line))
+      score = 75;
+    else if (/ERROR\s*:/i.test(line) && /FAILED|Exception|Error|quality/i.test(line)) score = 70;
     else if (/\bERROR\b/.test(line) && !/Status:\s*Failed/i.test(line)) score = 40;
     else continue;
     if (/Status:\s*Failed\s*$/i.test(line)) continue;
-    if (/TaskLogLogger|FINALIZE_SESSION|^\[INFO\]/i.test(line)) score -= 25;
-    // Prefer human-facing JDBC wrapper over raw Tez internals when both present.
+    if (/No rows selected/i.test(line)) continue;
+    // JSON log fragments are useless as "原因"
+    if (/^\s*"level"\s*:\s*"ERROR"/i.test(line) || /"level"\s*:\s*"ERROR"/i.test(line)) continue;
+    if (/^\s*"driverLogUrl"\s*:|^\s*"sparkUiUrl"\s*:/i.test(line)) continue;
+    if (/TaskLogLogger|FINALIZE_SESSION|^\[INFO\]/i.test(line) && !/Error:|Exception|expected:|quality|状态:\s*dead|任务执行失败/i.test(line))
+      score -= 25;
     if (/Error while processing statement/i.test(line)) score += 10;
     if (/NodeId\.getHost|TA_OUTPUT_FAILED/i.test(line)) score -= 15;
-    // SQL comments mentioning OOM are not real failures
     if (/避免.*OOM|prevent.*OOM|减少后续/i.test(line)) continue;
     ranked.push({ score, line });
   }
@@ -466,40 +543,186 @@ export function extractAlertEvidence(logText, { maxEvidence = 2, maxLen = 220 } 
   const evidence = [];
   const seen = new Set();
   for (const { line } of ranked) {
-    const key = line
-      .replace(/^(Error:\s*|ERROR\s*:\s*)/i, "")
-      .replace(/attempt_[0-9_]+/gi, "attempt")
-      .slice(0, 100)
-      .toLowerCase();
-    if ([...seen].some((s) => key.includes(s) || s.includes(key) || similarityToken(s) === similarityToken(key)))
-      continue;
+    const compact = compactErrorLine(line, maxLen);
+    if (!compact) continue;
+    const key = compact.toLowerCase().slice(0, 80);
+    if ([...seen].some((s) => key.includes(s) || s.includes(key))) continue;
     seen.add(key);
-    evidence.push(line.length > maxLen ? `${line.slice(0, maxLen - 1)}…` : line);
+    evidence.push(compact);
     if (evidence.length >= maxEvidence) break;
   }
 
   let cause = null;
-  const top = evidence[0] || "";
-  if (/TTransportException|Socket closed/i.test(top)) {
-    cause = "HiveServer Thrift 连接中断（TTransportException）";
-  } else if (/NodeId\.getHost|TA_OUTPUT_FAILED|TezTask/i.test(top)) {
-    cause = "Hive Tez 引擎执行失败（YARN/Tez TaskAttempt 异常），不是分区参数写错";
-  } else if (/InvalidInputException|Partition.+not found|cannot find partition/i.test(top)) {
-    cause = "读表/分区失败：路径或分区不存在";
-  } else if (/Permission denied|AccessDenied/i.test(top)) {
+  const blob = `${evidence[0] || ""}\n${ranked[0]?.line || ""}\n${logText || ""}`;
+  const livy = parseLivyFailure(logText || blob);
+  const quality = parseQualityFailure(logText || blob);
+  if (livy) {
+    cause = livy.cause;
+    if (livy.evidenceLine && !evidence.includes(livy.evidenceLine)) {
+      evidence.unshift(livy.evidenceLine);
+      if (evidence.length > maxEvidence) evidence.length = maxEvidence;
+    }
+  } else if (quality) {
+    cause = quality.cause;
+    if (quality.evidenceLine && !evidence.includes(quality.evidenceLine)) {
+      evidence.unshift(quality.evidenceLine);
+      if (evidence.length > maxEvidence) evidence.length = maxEvidence;
+    }
+  } else if (/TTransportException|Socket closed/i.test(blob)) {
+    cause = "HS2/Thrift 连接中断";
+  } else if (/MetadataFetchFailedException|Missing an output location for shuffle/i.test(blob)) {
+    cause = "Spark shuffle 丢分区（MetadataFetchFailed）";
+  } else if (/Job aborted due to stage failure|failed the maximum allowable number of times/i.test(blob)) {
+    cause = "Spark stage 多次失败后中止";
+  } else if (/NodeId\.getHost|TA_OUTPUT_FAILED|TezTask/i.test(blob)) {
+    cause = "Hive Tez/YARN TaskAttempt 异常";
+  } else if (/InvalidInputException|Partition.+not found|cannot find partition/i.test(blob)) {
+    cause = "分区/路径不存在";
+  } else if (/Permission denied|AccessDenied/i.test(blob)) {
     cause = "权限不足";
-  } else if (/OutOfMemoryError|Java heap space|exit code 137/i.test(top)) {
+  } else if (/OutOfMemoryError|Java heap space|exit code 137/i.test(blob)) {
     cause = "内存不足 / OOM";
-  } else if (/AnalysisException|SemanticException|ParseException/i.test(top)) {
+  } else if (/AnalysisException|SemanticException|ParseException/i.test(blob)) {
     cause = "SQL 语义/解析错误";
-  } else if (/return code\s+(\d+)/i.test(top)) {
-    const code = top.match(/return code\s+(\d+)/i)?.[1];
-    cause = `SQL/引擎返回码 ${code}`;
-  } else if (top) {
-    cause = top.length > 120 ? `${top.slice(0, 119)}…` : top;
+  } else if (/return code\s+(\d+)/i.test(blob)) {
+    cause = `引擎返回码 ${blob.match(/return code\s+(\d+)/i)[1]}`;
+  } else if (evidence[0]) {
+    cause = evidence[0];
   }
 
-  return { cause, evidence };
+  return { cause, evidence, quality, livy };
+}
+
+/**
+ * SHELL → Livy 提交 Spark 批任务失败（图像搜索上传 OSS 等）。
+ * DS 任务日志往往只有 starting→dead + driverLogUrl:null，真正堆栈在 Livy batch log。
+ */
+export function parseLivyFailure(logText) {
+  const log = String(logText || "");
+  if (!/Livy|batches\/\d+|UploadProductPic|Upload.*PicJob|pic\.search|状态:\s*dead/i.test(log)) {
+    return null;
+  }
+  if (
+    !/状态:\s*dead|任务执行失败|exitStatusCode:\s*[1-9]|processExitValue:\s*[1-9]/i.test(log) &&
+    !/batches\/\d+/i.test(log)
+  ) {
+    return null;
+  }
+
+  const batchM = log.match(/Batch ID:\s*(\d+)/i) || log.match(/batches\/(\d+)/i);
+  const batchId = batchM ? batchM[1] : null;
+  const livyLogM = log.match(/https?:\/\/[^\s]+\/batches\/\d+\/log/i);
+  const livyLogUrl = livyLogM ? livyLogM[0] : null;
+  const jobM = log.match(/(UploadProductPicJob[-\w]*|Upload\w*PicJob[-\w]*)/i);
+  const jobName = jobM ? jobM[1] : null;
+  const mainM = log.match(/主类:\s*(\S+)/);
+  const mainClass = mainM ? mainM[1] : null;
+  const nullDriver = /"driverLogUrl"\s*:\s*null/i.test(log);
+  const quickDead =
+    /状态:\s*starting[\s\S]{0,400}?状态:\s*dead/i.test(log) ||
+    (/状态:\s*dead/i.test(log) && /提交任务|Batch ID/i.test(log));
+
+  let cause = "Livy Spark 批任务失败";
+  if (quickDead && nullDriver) {
+    cause = "Livy batch 秒级 dead（driver 未起来，driverLogUrl=null）";
+  } else if (quickDead) {
+    cause = "Livy batch 状态 dead（提交后很快挂）";
+  } else if (/状态:\s*dead/i.test(log)) {
+    cause = "Livy batch 状态 dead";
+  }
+
+  const bits = [cause];
+  if (batchId) bits.push(`batch=${batchId}`);
+  if (jobName) bits.push(jobName);
+  const evidenceLine = bits.join(" · ");
+
+  return {
+    cause,
+    evidenceLine,
+    batchId,
+    livyLogUrl,
+    jobName,
+    mainClass,
+    nullDriver,
+    quickDead,
+  };
+}
+
+/** Parse kalo quality checker: expected:[a,b], actual:N, matched:false */
+export function parseQualityFailure(logText) {
+  const log = String(logText || "");
+  if (!/quality check|Test [Cc]ase:|Checking val's value|data-quality/i.test(log)) {
+    // still allow bare expected/actual pattern
+    if (!/expected:\s*\[.*\].*actual:/i.test(log)) return null;
+  }
+  const m = log.match(
+    /expected:\s*(\[[^\]]+\])\s*,\s*actual:\s*([-\d.eE]+)\s*,\s*matched:\s*false/i,
+  );
+  if (!m) return null;
+  const expected = m[1];
+  const actual = m[2];
+  let field = null;
+  const caseM = log.match(/Test [Cc]ase:\s*([^\n]{0,80}?)(?:\s+for\s+|\s*$)/);
+  if (caseM) field = caseM[1].replace(/\s+/g, " ").trim().slice(0, 60);
+  const tableM = log.match(/quality check for\s+([a-z0-9_.]+)/i);
+  const table = tableM ? tableM[1] : null;
+  const cause = field
+    ? `质量校验未过：${field} 期望${expected} 实际${actual}`
+    : `质量校验未过：期望${expected} 实际${actual}`;
+  return {
+    expected,
+    actual,
+    field,
+    table,
+    cause,
+    evidenceLine: `expected:${expected}, actual:${actual}, matched:false`,
+  };
+}
+
+/** Strip DS/beeline wrappers; keep exception name + short message. */
+export function compactErrorLine(line, maxLen = 100) {
+  let s = String(line || "")
+    .replace(/\t+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!s) return "";
+  s = s
+    .replace(
+      /^\[INFO\]\s+\d{4}-\d{2}-\d{2}[^]]*\]\s+TaskLogLogger-[^:]+:\[\d+\]\s*-\s*(?:->\s*)?/i,
+      "",
+    )
+    .replace(/^Error:\s*/i, "")
+    .replace(/^ERROR\s*:\s*/i, "")
+    .replace(/^Caused by:\s*/i, "")
+    .trim();
+
+  // Prefer "ExceptionType: short reason"
+  const shuffle = s.match(
+    /MetadataFetchFailedException:\s*([^.\n]+)/i,
+  );
+  if (shuffle) return clip(`MetadataFetchFailedException: ${shuffle[1].trim()}`, maxLen);
+
+  const stage = s.match(
+    /Job aborted due to stage failure:\s*([^.\n]+(?:\.[^.\n]{0,40})?)/i,
+  );
+  if (stage) return clip(`Spark stage failure: ${stage[1].trim()}`, maxLen);
+
+  const named = s.match(
+    /\b([A-Za-z][\w.$]*(?:Exception|Error))\s*:\s*(.+)$/i,
+  );
+  if (named) {
+    const msg = named[2].replace(/\s+at\s+org\..*$/i, "").trim();
+    return clip(`${named[1].split(".").pop()}: ${msg}`, maxLen);
+  }
+
+  if (/^at\s+org\./i.test(s) || /^at\s+java\./i.test(s)) return "";
+  return clip(s, maxLen);
+}
+
+function clip(s, maxLen) {
+  const t = String(s || "").trim();
+  if (!t) return "";
+  return t.length > maxLen ? `${t.slice(0, maxLen - 1)}…` : t;
 }
 
 function similarityToken(s) {
@@ -565,12 +788,41 @@ export function classifyFailure({ task, logText = "", purged = false } = {}) {
   const { rawScript, sqlFile, vars, varsMap } = parseTaskScript(task || {});
   const log = String(logText || "");
   const signal = extractAlertEvidence(log);
+  const livy = signal.livy || parseLivyFailure(log);
   const fixes = [];
   let where = "任务执行失败（详见证据）";
   let category = "未知";
 
   // 1) Log-first (avoid false "分区" from template params in rawScript).
-  if (/TTransportException|Socket closed|Could not open client transport|Connection refused/i.test(log)) {
+  if (livy) {
+    const L = livy;
+    category = "Livy/Spark提交";
+    where =
+      L.cause ||
+      "SHELL 经 Livy 提交 Spark 批任务失败（不是 JDBC/SQL）。DS 日志常只有 dead，真因在 Livy batch log。";
+    if (L.livyLogUrl) {
+      fixes.push(`打开 Livy batch 日志看 driver/应用真因：${L.livyLogUrl}`);
+    } else if (L.batchId) {
+      fixes.push(`到 Livy UI 打开 batches/${L.batchId}/log，看 dead 前 Exception`);
+    } else {
+      fixes.push("到任务日志里的「查看日志」Livy URL，看 batch dead 前的 Exception");
+    }
+    fixes.push(
+      L.nullDriver || L.quickDead
+        ? "driverLogUrl=null / 秒级 dead → 优先查 EMR/YARN 资源、Livy 队列、主类能否拉起，不要当 SQL 分区问题"
+        : "对照 Livy 堆栈：OOM/权限/依赖缺失/OSS 凭证分别处理",
+    );
+    fixes.push("同窗多条「上传图片到OSS」失败 → 按 Livy/集群面处理，勿逐条改业务参数");
+  } else if (signal.quality || /expected:\s*\[[^\]]+\].*actual:.*matched:\s*false/i.test(log)) {
+    const q = signal.quality || parseQualityFailure(log);
+    category = "数据质量";
+    where =
+      q?.cause ||
+      "质量校验未通过（指标超出设定区间），不是 JDBC/SQL 语法失败";
+    fixes.push("先查对应表分区指标是否业务异常（重复、回刷、口径变更）");
+    fixes.push("数据确实错 → 修数/重跑上游；波动合理 → 与业务对齐后调质量阈值");
+    fixes.push("不要把父 stage/SUB_PROCESS 红当成独立根因");
+  } else if (/TTransportException|Socket closed|Could not open client transport|Connection refused/i.test(log)) {
     category = "连接/会话";
     where =
       signal.cause ||
@@ -578,6 +830,18 @@ export function classifyFailure({ task, logText = "", purged = false } = {}) {
     fixes.push("看同时间段是否批量 JDBC 失败（HS2/集群问题）");
     fixes.push(sqlFile ? `用同参数单跑 ${sqlFile} 验证是否稳定复现` : "到 UI 看完整 beeline 报错前后文");
     fixes.push("勿先当 OOM 加大内存；先确认连接是否稳定");
+  } else if (
+    /MetadataFetchFailedException|FetchFailedException|Job aborted due to stage failure|has failed the maximum allowable number of times/i.test(
+      log,
+    )
+  ) {
+    category = "引擎/集群";
+    where =
+      signal.cause ||
+      "Spark shuffle/stage 失败（常见：executor 丢失、shuffle 数据缺失），偏集群抖动，可重试";
+    fixes.push("先看同时间段是否多任务同类 shuffle/stage 失败");
+    fixes.push("可短时重试该任务；反复出现再查 YARN/Spark 与磁盘");
+    fixes.push(sqlFile ? `脚本 ${sqlFile} 本身多半无语法问题，优先当引擎问题` : "对照 UI 日志里的 MetadataFetchFailed / stage failure");
   } else if (/NodeId\.getHost|TA_OUTPUT_FAILED|TezTask|org\.apache\.tez/i.test(log)) {
     category = "引擎/集群";
     where =
@@ -635,23 +899,208 @@ export function classifyFailure({ task, logText = "", purged = false } = {}) {
   }
 
   if (purged) {
-    fixes.unshift("当前 API 拉不到日志正文（已清理）。优先从 UI 复制日志，或等下次失败后立刻诊断");
+    fixes.unshift(
+      "日志正文已清：若下面动作不够，到 DS UI 复制完整 Exception 再私聊贴给我精修",
+    );
   }
   if ((task?.retryTimes || 0) >= (task?.maxRetryTimes || 0) && (task?.maxRetryTimes || 0) > 0) {
-    fixes.push(`已重试 ${task.retryTimes}/${task.maxRetryTimes} 次仍失败，盲重跑前先修根因`);
+    fixes.push(
+      `DS 已自动重试 ${task.retryTimes}/${task.maxRetryTimes} 仍失败；再重跑前先确认是否仍是同类引擎错`,
+    );
   }
+
+  const playbook = buildActionPlaybook({
+    category,
+    log,
+    sqlFile,
+    signal,
+    task,
+  });
 
   return {
     category,
-    where,
-    fixes,
+    where: playbook.mechanism || where,
+    mechanism: playbook.mechanism,
+    fixes: playbook.actions.length ? playbook.actions : fixes,
     sqlFile,
     rawScript: rawScript.slice(0, 300),
     vars,
     varsMap,
-    cause: signal.cause,
+    cause: signal.cause || playbook.cause || null,
     evidence: signal.evidence,
+    verdict: playbook.verdict,
+    quality: signal.quality || null,
+    livy: signal.livy || livy || null,
   };
+}
+
+/**
+ * Concrete「怎么导致的 / 现在怎么做」— avoid "请再去排查" style.
+ */
+export function buildActionPlaybook({
+  category,
+  log = "",
+  sqlFile = null,
+  signal = {},
+  task = null,
+  nearbyFailureCount = 0,
+  retryRunning = false,
+  workflowState = "",
+  processInstanceId = null,
+  dsReadonly = false,
+} = {}) {
+  const instId = processInstanceId || task?.processInstanceId || null;
+  const script = sqlFile ? String(sqlFile) : null;
+  const wf = String(workflowState || "").toUpperCase();
+  const rerunHint = dsReadonly
+    ? "到 DS UI 对该实例「恢复失败节点」"
+    : instId
+      ? `飞书回「重跑 ${instId}」→ 再回 YES（从失败处恢复）`
+      : "飞书回「重跑 <实例id>」→ YES";
+
+  let mechanism = "";
+  let cause = signal.cause || null;
+  let verdict = "";
+  const actions = [];
+
+  if (category === "数据质量" || signal.quality || /expected:\s*\[[^\]]+\].*actual:.*matched:\s*false/i.test(log)) {
+    const q = signal.quality || parseQualityFailure(log) || {};
+    mechanism = q.table
+      ? `质量门禁未过：表 ${q.table} 上指标超出设定区间（期望${q.expected}，实际${q.actual}）。JDBC/脚本可能已跑成功，是校验任务拦下的。`
+      : `质量门禁未过：指标超出设定区间（${q.cause || "见报错 expected/actual"}）。不是 SQL 语法错误。`;
+    cause = q.cause || cause || "质量校验未通过";
+    verdict = "判定：数据质量阈值未过";
+    actions.push(
+      q.table
+        ? `查 ${q.table} 失败日分区指标是否异常（重复入库/回刷/业务暴增）`
+        : "查质量任务对应表分区，确认指标是否业务异常",
+    );
+    actions.push("数据错 → 修数后再跑质量；波动合理 → 业务确认后调阈值，再重跑 QUALITY");
+    actions.push(`恢复：${rerunHint}（针对 QUALITY/叶子任务，不必对父 STAGE 连点）`);
+  } else if (category === "Livy/Spark提交" || signal.livy || (/状态:\s*dead/i.test(log) && /Livy|batches\//i.test(log))) {
+    const L = signal.livy || parseLivyFailure(log) || {};
+    mechanism = L.nullDriver || L.quickDead
+      ? "SHELL 脚本经 Livy 提交 Spark 批任务后秒级 dead，driver 未起来（driverLogUrl/sparkUiUrl 均为 null）。不是 JDBC/SQL，真因在 Livy/YARN 侧。"
+      : "SHELL → Livy Spark 批任务失败；DS 任务日志只有摘要，堆栈在 Livy batch log。";
+    cause = L.cause || cause || "Livy Spark 批任务失败";
+    verdict = "判定：先查 Livy batch 日志，再决定是否重跑";
+    if (L.livyLogUrl) {
+      actions.push(`打开 ${L.livyLogUrl} 看 dead 前 Exception（OOM/权限/依赖/OSS）`);
+    } else if (L.batchId) {
+      actions.push(`Livy batches/${L.batchId}/log 看应用真因`);
+    } else {
+      actions.push("从 DS 任务日志复制 Livy「查看日志」URL，打开看 dead 前堆栈");
+    }
+    actions.push(
+      L.nullDriver || L.quickDead
+        ? "秒级 dead + 无 driver 日志 → 查 EMR/YARN 资源与 Livy 队列，勿当分区/SQL 问题"
+        : "按 Livy 堆栈修：资源/权限/依赖/OSS 凭证",
+    );
+    if (nearbyFailureCount >= 2) {
+      actions.push(`同窗另有 ${nearbyFailureCount} 个同类失败 → 按集群/Livy 面处理后再批量 ${rerunHint}`);
+    } else {
+      actions.push(`根因处理后 ${rerunHint}；未看 Livy 日志前不要盲重跑`);
+    }
+  } else if (
+    category === "引擎/集群" ||
+    /MetadataFetchFailed|FetchFailedException|stage failure|TezTask|NodeId\.getHost/i.test(log)
+  ) {
+    if (/MetadataFetchFailed|Missing an output location for shuffle|broadcasted map statuses/i.test(log)) {
+      mechanism =
+        "Spark 在 shuffle 阶段读不到某分区输出（MetadataFetchFailed）。常见：executor 丢失/节点抖动导致 shuffle 文件缺失——不是 SQL 语法或分区参数写错。";
+      cause = cause || "Spark shuffle 丢分区（MetadataFetchFailed）";
+      verdict = "判定：集群/引擎抖动（瞬时）";
+    } else if (/TezTask|NodeId\.getHost|TA_OUTPUT_FAILED/i.test(log)) {
+      mechanism =
+        "Hive Tez/YARN TaskAttempt 异常（节点或 attempt 丢失）。偏执行引擎侧，不是业务 SQL 写错。";
+      cause = cause || "Hive Tez/YARN TaskAttempt 异常";
+      verdict = "判定：集群/引擎抖动（瞬时）";
+    } else {
+      mechanism = "Spark/Hive 引擎执行阶段失败（stage/attempt），优先当集群抖动。";
+      verdict = "判定：引擎/集群";
+    }
+    if (
+      retryRunning ||
+      (/RUNNING/.test(wf) &&
+        Number(task?.maxRetryTimes || 0) > Number(task?.retryTimes || 0))
+    ) {
+      actions.push("DS 仍在自动重试或实例还在跑 → 先等这一轮；变绿则不用管");
+    }
+    actions.push(`若最终仍红 → ${rerunHint}`);
+    if (nearbyFailureCount >= 2) {
+      actions.push(
+        `同约 30 分钟内至少 ${nearbyFailureCount} 个任务失败 → 按集群面处理，不要改 ${script || "业务 SQL"}`,
+      );
+    } else {
+      actions.push(
+        script
+          ? `不要改 ${script}；单次失败优先重跑，短时反复再找平台看 YARN/磁盘`
+          : "单次失败优先重跑；短时反复再找平台看 YARN/磁盘",
+      );
+    }
+  } else if (category === "连接/会话") {
+    mechanism =
+      "HiveServer/Thrift 会话中断（连接被踢、HS2 重启或网络抖动），语句可能执行到一半掉线。";
+    verdict = "判定：连接/会话中断";
+    actions.push(`直接 ${rerunHint}`);
+    if (nearbyFailureCount >= 2) {
+      actions.push(`同窗 ${nearbyFailureCount} 个失败 → 等 HS2/网络稳定后再批量恢复，别改 SQL`);
+    }
+  } else if (category === "分区/路径") {
+    const day = extractVarHint(task, "partition_day");
+    const country = extractVarHint(task, "country") || extractVarHint(task, "country_code");
+    mechanism = "读表时分区或路径不存在（参数指到空分区，或上游未产出）。";
+    verdict = "判定：分区/路径缺失（需补数或改参数）";
+    actions.push(
+      `核对参数${country ? ` country=${country}` : ""}${day ? ` partition_day=${day}` : ""} 是否已有分区`,
+    );
+    actions.push("上游未就绪则等上游 SUCCESS；参数错了则改 DS 参数");
+    actions.push(`补齐后再 ${rerunHint}`);
+  } else if (category === "权限") {
+    mechanism = "执行账号对 HDFS/S3/表无权限。";
+    verdict = "判定：权限不足（重跑无效）";
+    actions.push("找平台/数据源管理员开权限；修好前不要反复重跑");
+  } else if (category === "资源") {
+    mechanism = "容器内存不足或被 YARN 杀掉（OOM / exit 137）。";
+    verdict = "判定：资源不足";
+    actions.push("加大 executor/driver 内存，或拆小扫描范围后再重跑");
+    actions.push(`资源调完后 ${rerunHint}`);
+  } else if (category === "SQL") {
+    mechanism = "SQL 语义/解析错误（字段、表名、语法）。";
+    verdict = "判定：SQL 需改代码";
+    actions.push(script ? `改仓库 ${script} 对照报错后发布` : "按 AnalysisException 改 SQL 后发布");
+    actions.push(`上线后再 ${rerunHint}`);
+  } else if (category === "SQL/JDBC" || category === "超时" || category === "执行失败") {
+    mechanism = signal.cause
+      ? `任务执行失败：${signal.cause}`
+      : script
+        ? `JDBC 脚本 ${script} 执行失败（见报错行）`
+        : "JDBC/任务执行失败";
+    verdict = "判定：需按报错处理后再跑";
+    if (script) actions.push(`用失败时刻参数确认 ${script} 依赖是否就绪`);
+    actions.push(`处理完后 ${rerunHint}`);
+  } else {
+    mechanism = signal.cause || "未能从日志归到明确类型";
+    verdict = "判定：信息不足";
+    actions.push(`先 ${rerunHint}；若再挂把完整 Exception 贴给我`);
+  }
+
+  return {
+    mechanism,
+    cause,
+    verdict,
+    actions: actions.slice(0, 4),
+  };
+}
+
+function extractVarHint(task, prop) {
+  try {
+    const { varsMap } = parseTaskScript(task || {});
+    const v = varsMap?.[prop];
+    return v ? String(v) : "";
+  } catch {
+    return "";
+  }
 }
 
 export function formatPracticalDiagnosis({
@@ -663,7 +1112,8 @@ export function formatPracticalDiagnosis({
   const lines = [];
   lines.push("【问题出在哪】");
   lines.push(`- 类别：${classification.category}`);
-  lines.push(`- 结论：${classification.where}`);
+  if (classification.verdict) lines.push(`- ${classification.verdict}`);
+  lines.push(`- 成因：${classification.mechanism || classification.where}`);
   lines.push(
     `- 实例：#${inst.id} ${inst.name || ""}（${inst.state}） ${inst.startTime || ""} → ${inst.endTime || ""}`,
   );
@@ -678,18 +1128,20 @@ export function formatPracticalDiagnosis({
   if (highlight?.purged) {
     lines.push(`- ${highlight.summary}`);
     if (classification.rawScript) lines.push(`- 任务命令：${classification.rawScript}`);
+  } else if (classification.evidence?.length) {
+    for (const line of classification.evidence.slice(0, 2)) lines.push(`- ${line}`);
   } else if (highlight?.lines?.length) {
-    for (const line of highlight.lines.slice(0, 15)) lines.push(`- ${line}`);
+    for (const line of highlight.lines.slice(0, 8)) lines.push(`- ${line}`);
   } else {
     lines.push("- 无日志摘录");
   }
 
   lines.push("");
-  lines.push("【怎么解决】");
-  classification.fixes.forEach((f, i) => lines.push(`${i + 1}. ${f}`));
+  lines.push("【现在怎么做】");
+  (classification.fixes || []).forEach((f, i) => lines.push(`${i + 1}. ${f}`));
   lines.push("");
-  lines.push(`修完后如需重跑（需确认）：/rerun ${inst.id}`);
-  lines.push("或贴 UI 日志原文，我按原文精修处置步骤。");
+  lines.push(`快捷：/rerun ${inst.id}   或   /log ${task.id}`);
+  lines.push(`强制成功：强制成功 任务 #${task.id}   ← ${formatTaskLabel(task, { inst })}`);
   return lines.join("\n");
 }
 
@@ -848,6 +1300,442 @@ export function formatFailedList(page) {
   return lines.join("\n");
 }
 
+export function formatRunningList(page, { enrich = [] } = {}) {
+  const rows = page?.totalList || [];
+  if (!rows.length) return "当前没有 RUNNING 实例。";
+  const byId = new Map((enrich || []).map((e) => [Number(e.id), e]));
+  const lines = [
+    `正在跑的实例（共约 ${page.total ?? rows.length}，显示 ${rows.length} 条）：`,
+    "",
+  ];
+  for (const row of rows) {
+    const extra = byId.get(Number(row.id));
+    const country = extra?.country || "?";
+    const day = extra?.dataDate || "";
+    lines.push(
+      `#${row.id}  ${row.state}  开始 ${row.startTime || "-"}` +
+        (country !== "?" || day ? `  [${country}${day ? ` ${day}` : ""}]` : ""),
+    );
+    lines.push(`  ${row.name || "(no name)"}`);
+    if (extra?.currentPath || extra?.runningNodes?.length) {
+      if (extra?.runningNodes?.length) {
+        const stageName =
+          String(extra.currentPath || "")
+            .split(/\s*→\s*/)[0]
+            ?.trim() || "当前";
+        const names = [
+          ...new Set(
+            extra.runningNodes
+              .slice(0, 4)
+              .map((n) => formatRunningNodeLabel(n).replace(/#\d+$/, "")),
+          ),
+        ].join("、");
+        lines.push(
+          `  当前：${stageName} → ${names}${extra.runningNodes.length > 4 ? "…" : ""}`,
+        );
+      } else if (extra?.currentPath) {
+        lines.push(`  当前：${extra.currentPath}`);
+      }
+    }
+    if (extra?.stageStart) {
+      lines.push(`  stage 起：${extra.stageStart}`);
+    }
+    if (extra?.runningNodes?.length) {
+      lines.push(`  节点：`);
+      for (const n of extra.runningNodes.slice(0, 8)) {
+        const when = n.startTime || "-";
+        const dur = n.duration ? ` (${n.duration})` : "";
+        const label = formatRunningNodeLabel(n);
+        lines.push(`  · ${label}  起 ${when}${dur}`);
+      }
+      if (extra.runningNodes.length > 8) {
+        lines.push(`  · …共 ${extra.runningNodes.length} 个在跑节点`);
+      }
+    }
+    if (extra?.doneStages?.length) {
+      lines.push(`  已完成：${extra.doneStages.join(" → ")}`);
+    }
+  }
+  lines.push("", "看任务：/tasks <实例id>   诊断：/diagnose <实例id>");
+  return lines.join("\n");
+}
+
+/**
+ * Prefer parent job name when leaf is generic「JDBC TASK」.
+ */
+export function formatRunningNodeLabel(node) {
+  const name = String(node?.name || "?").trim();
+  const id = node?.id != null ? `#${node.id}` : "";
+  const parts = String(node?.path || "")
+    .split(/\s*→\s*/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const generic = /^(JDBC|SHELL|SQL|PYTHON)\s*TASK$/i.test(name);
+  if (generic && parts.length >= 2) {
+    // path: STAGE → mid → leafName → JDBC TASK  OR  STAGE → mid → JDBC
+    const mid = parts[parts.length - 2];
+    if (mid && !/^(JDBC|SHELL|SQL|PYTHON)\s*TASK$/i.test(mid) && !/-STAGE$/i.test(mid)) {
+      return `${mid}${id}`;
+    }
+    if (parts.length >= 3) {
+      const mid2 = parts[parts.length - 3];
+      if (mid2 && !/-STAGE$/i.test(mid2)) return `${mid2} → ${mid}${id}`;
+    }
+  }
+  return `${name}${id}`;
+}
+
+/**
+ * Dig SUB_PROCESS chain; return currently RUNNING leaf (or mid) nodes with startTime.
+ */
+async function collectRunningNodes(ds, task, pathPrefix = [], depth = 0) {
+  const name = String(task?.name || "?").trim() || "?";
+  const path = [...pathPrefix, name];
+  const self = {
+    id: task.id,
+    name,
+    startTime: task.startTime || "",
+    duration: task.duration || "",
+    taskType: task.taskType || "",
+    path: path.join(" → "),
+  };
+  if (depth >= 3 || !/SUB_PROCESS/i.test(String(task.taskType || ""))) {
+    return [self];
+  }
+  let childId = null;
+  try {
+    childId = await ds.getSubProcessInstanceId(task.id);
+  } catch {
+    childId = null;
+  }
+  if (!childId) {
+    return [{ ...self, name: `${name}（子流调度中）` }];
+  }
+  const childPage = await ds.listTaskInstances({
+    processInstanceId: childId,
+    pageSize: 100,
+  });
+  const childRun = (childPage?.totalList || []).filter((t) =>
+    /RUNNING/i.test(String(t.state || "")),
+  );
+  if (!childRun.length) {
+    return [{ ...self, name: `${name}（子流无 RUNNING 叶子）` }];
+  }
+  const out = [];
+  for (const c of childRun.slice(0, 12)) {
+    out.push(...(await collectRunningNodes(ds, c, path, depth + 1)));
+  }
+  return out;
+}
+
+/**
+ * One-line progress for a running (or just-finished) workflow instance.
+ */
+export async function enrichInstanceProgress(ds, processInstanceId) {
+  const id = Number(processInstanceId);
+  if (!id || !ds) return null;
+  const inst = await ds.getProcessInstance(id);
+  if (!inst) return null;
+  const country = getGlobalParam(inst, "country_code").toLowerCase() || "?";
+  const dataDate =
+    getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || "";
+  const tasksPage = await ds.listTaskInstances({
+    processInstanceId: id,
+    pageSize: 100,
+  });
+  const rows = tasksPage?.totalList || [];
+  const doneRaw = rows
+    .filter((t) => /SUCCESS/i.test(String(t.state || "")) && /SUB_PROCESS/i.test(String(t.taskType || "")))
+    .map((t) => String(t.name || "").trim())
+    .filter(Boolean);
+  const pipelineRank = (name) => {
+    const n = String(name || "");
+    if (/前置/.test(n)) return 10;
+    if (/准备/.test(n)) return 20;
+    if (/DWD/i.test(n)) return 30;
+    if (/DWM/i.test(n)) return 40;
+    if (/DWS/i.test(n)) return 50;
+    if (/ADS/i.test(n)) return 60;
+    if (/导出|export/i.test(n)) return 70;
+    if (/释放/.test(n)) return 80;
+    return 55;
+  };
+  const doneStages = [...doneRaw].sort((a, b) => pipelineRank(a) - pipelineRank(b));
+
+  const running = rows.filter((t) => /RUNNING/i.test(String(t.state || "")));
+  let currentPath = "";
+  let stageStart = "";
+  let runningNodes = [];
+  if (running.length) {
+    const stage = running[0];
+    stageStart = stage.startTime || "";
+    currentPath = String(stage.name || "?");
+    try {
+      runningNodes = await collectRunningNodes(ds, stage, []);
+      // Drop the top stage itself if we dug into children
+      const leaves = runningNodes.filter(
+        (n) => Number(n.id) !== Number(stage.id) || runningNodes.length === 1,
+      );
+      if (leaves.length) runningNodes = leaves;
+      if (runningNodes.length) {
+        const names = [...new Set(runningNodes.slice(0, 4).map((n) => formatRunningNodeLabel(n).replace(/#\d+$/, "")))].join(
+          "、",
+        );
+        currentPath = `${stage.name} → ${names}${runningNodes.length > 4 ? "…" : ""}`;
+      } else if (/SUB_PROCESS/i.test(String(stage.taskType || ""))) {
+        currentPath = `${stage.name}（子流调度中）`;
+      }
+    } catch {
+      runningNodes = [
+        {
+          id: stage.id,
+          name: stage.name,
+          startTime: stage.startTime || "",
+          duration: stage.duration || "",
+          path: stage.name,
+        },
+      ];
+    }
+  } else if (/SUCCESS/i.test(String(inst.state || ""))) {
+    currentPath = "已跑完（SUCCESS）";
+  } else {
+    currentPath = `无 RUNNING 节点（实例 ${inst.state || "?"}）`;
+  }
+
+  return {
+    id,
+    name: inst.name,
+    state: inst.state,
+    startTime: inst.startTime,
+    country,
+    dataDate,
+    currentPath,
+    stageStart,
+    runningNodes,
+    doneStages: doneStages.slice(0, 8),
+  };
+}
+
+/**
+ * List RUNNING workflows, optional country filter, with current stage dig.
+ */
+export async function listRunningProgress(ds, { country = null, pageSize = 15 } = {}) {
+  const page = await ds.listProcessInstances({
+    stateType: "RUNNING_EXECUTION",
+    pageSize: Math.min(Number(pageSize) || 15, 40),
+  });
+  const wanted = country ? String(country).toLowerCase() : null;
+  const enrich = [];
+  for (const row of page?.totalList || []) {
+    const info = await enrichInstanceProgress(ds, row.id);
+    if (!info) continue;
+    if (wanted && info.country !== wanted) continue;
+    enrich.push(info);
+  }
+  return { page, enrich, country: wanted };
+}
+
+export function formatProgressReport({ page, enrich, country }) {
+  if (country && !(enrich || []).length) {
+    return `当前没有 country=${country} 的 RUNNING 实例。`;
+  }
+  const header = country
+    ? `【${country} 分区】正在跑（${(enrich || []).length} 条）：`
+    : null;
+  const body = formatRunningList(
+    country
+      ? { total: enrich.length, totalList: enrich.map((e) => ({
+          id: e.id,
+          state: e.state,
+          startTime: e.startTime,
+          name: e.name,
+        })) }
+      : page,
+    { enrich },
+  );
+  return header ? `${header}\n\n${body}` : body;
+}
+
+/** yyyymmdd in Asia/Shanghai (DS schedule local). */
+export function todayYmdShanghai(now = new Date()) {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  // en-CA → YYYY-MM-DD
+  return fmt.format(now).replace(/-/g, "");
+}
+
+/**
+ * Multi-country daily board for TikTok天级任务-37 (or searchVal).
+ * Answers「哪些国家在跑 / 各国到哪了」— not just RUNNING list.
+ */
+export async function listCountryDailyBoard(
+  ds,
+  {
+    dayToken = null,
+    searchVal = "TikTok天级任务-37",
+    knownCountries = null,
+    maxPages = 3,
+    pageSize = 50,
+  } = {},
+) {
+  const token = String(dayToken || todayYmdShanghai());
+  const pages = [];
+  // Prefer name contains today's stamp (schedule start day)
+  let page = await ds.listProcessInstances({
+    pageNo: 1,
+    pageSize,
+    searchVal: token,
+  });
+  pages.push(...(page?.totalList || []));
+  if (!(page?.totalList || []).length) {
+    for (let pageNo = 1; pageNo <= maxPages; pageNo += 1) {
+      page = await ds.listProcessInstances({
+        pageNo,
+        pageSize,
+        searchVal,
+      });
+      const rows = page?.totalList || [];
+      pages.push(...rows.filter((r) => String(r.name || "").includes(token)));
+      if (!rows.length) break;
+    }
+  }
+
+  /** @type {Map<string, object>} */
+  const latestByCountry = new Map();
+  for (const row of pages) {
+    if (!/天级任务-37/.test(String(row.name || "")) && searchVal) {
+      // keep if search was date-only
+      if (!String(row.name || "").includes("天级")) continue;
+    }
+    const full = await ds.getProcessInstance(row.id);
+    const country = getGlobalParam(full || row, "country_code").toLowerCase() || "?";
+    const dataDate =
+      getGlobalParam(full || row, "data_date") ||
+      getGlobalParam(full || row, "partition_day") ||
+      "";
+    const prev = latestByCountry.get(country);
+    const start = String((full || row).startTime || row.startTime || "");
+    if (prev && String(prev.startTime || "") >= start) continue;
+    let currentPath = null;
+    let stageStart = null;
+    let doneStages = [];
+    let runningNodes = [];
+    const state = String((full || row).state || row.state || "");
+    if (/RUNNING/i.test(state)) {
+      const info = await enrichInstanceProgress(ds, row.id);
+      currentPath = info?.currentPath || null;
+      stageStart = info?.stageStart || null;
+      doneStages = info?.doneStages || [];
+      runningNodes = info?.runningNodes || [];
+    } else if (/SUCCESS/i.test(state)) {
+      currentPath = "已跑完";
+    } else if (/FAIL|KILL|STOP/i.test(state)) {
+      currentPath = state;
+    }
+    latestByCountry.set(country, {
+      id: row.id,
+      name: (full || row).name || row.name,
+      state,
+      startTime: (full || row).startTime || row.startTime,
+      endTime: (full || row).endTime || row.endTime,
+      country,
+      dataDate,
+      currentPath,
+      stageStart,
+      runningNodes,
+      doneStages,
+    });
+  }
+
+  const known = knownCountries || [
+    "id",
+    "vn",
+    "th",
+    "my",
+    "ph",
+    "sg",
+    "mx",
+    "us",
+    "gb",
+    "de",
+    "jp",
+    "kr",
+    "br",
+    "fr",
+    "es",
+    "it",
+  ];
+  const missing = known.filter((c) => !latestByCountry.has(c));
+
+  return {
+    dayToken: token,
+    rows: [...latestByCountry.values()].sort((a, b) =>
+      String(a.country).localeCompare(String(b.country)),
+    ),
+    missing,
+  };
+}
+
+export function formatCountryDailyBoard({ dayToken, rows = [], missing = [] } = {}) {
+  const lines = [`【各国天级】开跑日戳 ${dayToken || "?"}（按 country_code 最新一条）`, ""];
+  const running = rows.filter((r) => /RUNNING/i.test(String(r.state || "")));
+  const success = rows.filter((r) => /SUCCESS/i.test(String(r.state || "")));
+  const other = rows.filter(
+    (r) => !/RUNNING|SUCCESS/i.test(String(r.state || "")),
+  );
+
+  if (running.length) {
+    lines.push(`在跑（${running.length}）：`);
+    for (const r of running) {
+      lines.push(
+        `· ${r.country}  #${r.id}  开始 ${r.startTime || "-"}` +
+          (r.dataDate ? `  day=${r.dataDate}` : ""),
+      );
+      if (r.currentPath) lines.push(`  当前：${r.currentPath}`);
+      if (r.stageStart) lines.push(`  stage 起：${r.stageStart}`);
+      if (r.runningNodes?.length) {
+        for (const n of r.runningNodes.slice(0, 6)) {
+          lines.push(`  · ${formatRunningNodeLabel(n)}  起 ${n.startTime || "-"}`);
+        }
+      }
+      if (r.doneStages?.length) lines.push(`  已完成：${r.doneStages.join(" → ")}`);
+    }
+    lines.push("");
+  } else {
+    lines.push("在跑：无", "");
+  }
+
+  if (success.length) {
+    lines.push(`已完成（${success.length}）：`);
+    lines.push(
+      success
+        .map((r) => `${r.country}(#${r.id}${r.endTime ? ` ${String(r.endTime).slice(11, 16)}` : ""})`)
+        .join(" · "),
+    );
+    lines.push("");
+  }
+
+  if (other.length) {
+    lines.push(`其它状态（${other.length}）：`);
+    for (const r of other) {
+      lines.push(`· ${r.country}  #${r.id}  ${r.state}  开始 ${r.startTime || "-"}`);
+    }
+    lines.push("");
+  }
+
+  if (missing.length) {
+    lines.push(`今日戳未见开跑：${missing.join(" · ")}`);
+    lines.push("");
+  }
+
+  lines.push("单国深挖：说「id分区进度」或 /tasks <实例id>");
+  return lines.join("\n");
+}
+
 export function formatTaskList(processInstanceId, page) {
   const rows = page?.totalList || [];
   if (!rows.length) return `实例 #${processInstanceId} 没有任务。`;
@@ -856,6 +1744,106 @@ export function formatTaskList(processInstanceId, page) {
     lines.push(`#${row.id}  ${row.state}  ${row.taskType || ""}  ${row.name || ""}`);
   }
   lines.push("", "看原因：/diagnose " + processInstanceId);
+  const failed = rows.filter((r) => /FAILURE|KILL/i.test(String(r.state || "")));
+  if (failed.length) {
+    lines.push("强制成功（需 YES）：强制成功 任务 #<id>");
+    for (const f of failed.slice(0, 5)) {
+      lines.push(`  #${f.id}  ${formatTaskLabel(f)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+/** Human-readable one-liner: `{country} {mmdd}天级任务 上 {layer}. {script} {task}` */
+export function formatTaskIdentity(task, { inst = null } = {}) {
+  if (!task) return "（未查到任务详情）";
+  return formatTaskLabel(task, { inst });
+}
+
+/**
+ * Standard label, e.g. `id 0731天级任务 上 dwd_stage. foo.sql JDBC TASK`
+ */
+export function formatTaskLabel(task, { inst = null } = {}) {
+  if (!task) return "?";
+  let varsMap = {};
+  try {
+    varsMap = parseTaskScript(task).varsMap || {};
+  } catch {
+    varsMap = {};
+  }
+  const country =
+    String(varsMap.country_code || varsMap.country || getGlobalParam(inst, "country_code") || "")
+      .trim()
+      .toLowerCase() || "?";
+  const dayRaw =
+    varsMap.partition_day ||
+    varsMap.data_date ||
+    getGlobalParam(inst, "partition_day") ||
+    getGlobalParam(inst, "data_date") ||
+    "";
+  const mmdd = toMmdd(dayRaw) || mmddFromName(task.processInstanceName || inst?.name || "");
+  const scriptRaw = String(varsMap.task_script || varsMap.script || "").trim();
+  const script = scriptFileName(scriptRaw);
+  const layer = inferLayer({ task, scriptRaw, script });
+  const kind = String(task.name || task.taskType || "TASK").trim();
+
+  const left = `${country} ${mmdd || "????"}天级任务 上 ${layer}`;
+  if (script) return `${left}. ${script} ${kind}`;
+  return `${left} ${kind}`;
+}
+
+function toMmdd(day) {
+  const s = String(day || "").trim();
+  const m = s.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[2]}${m[3]}`;
+  const compact = s.match(/^\d{4}(\d{2})(\d{2})$/);
+  if (compact) return `${compact[1]}${compact[2]}`;
+  return "";
+}
+
+function mmddFromName(name) {
+  const m = String(name || "").match(/(\d{4})(\d{2})(\d{2})\d{6,}/);
+  if (m) return `${m[2]}${m[3]}`;
+  const m2 = String(name || "").match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (m2) return `${m2[2]}${m2[3]}`;
+  return "";
+}
+
+function scriptFileName(scriptRaw) {
+  if (!scriptRaw) return "";
+  let s = String(scriptRaw).replace(/\\/g, "/");
+  const base = s.split("/").pop() || s;
+  if (!base) return "";
+  return /\.sql$/i.test(base) ? base : `${base}.sql`;
+}
+
+function inferLayer({ task, scriptRaw, script }) {
+  const path = String(scriptRaw || script || "").toLowerCase();
+  const name = String(task?.name || "").toLowerCase();
+  const stage = name.match(/^(ads|dws|dwm|dwd|ods|dim)-?stage$/i);
+  if (stage) return `${stage[1].toLowerCase()}_stage`;
+  const fromPath = path.match(/\b(ads|dws|dwm|dwd|ods|dim|stg|output)\b/);
+  if (fromPath) {
+    const p = fromPath[1];
+    if (p === "output") return "export";
+    if (p === "stg") return "stg";
+    return `${p}_stage`;
+  }
+  if (/export|clickhouse|上传/i.test(name) || /output\/clickhouse/i.test(path)) return "export";
+  if (/quality|质量/i.test(name)) return "quality";
+  if (/jdbc/i.test(name)) return "jdbc";
+  return name.replace(/\s+/g, "_").slice(0, 24) || "task";
+}
+
+export function formatFailedTasksPickList(processInstanceId, tasks, { inst = null, instName = "" } = {}) {
+  const rows = (tasks || []).filter((t) => /FAILURE|KILL/i.test(String(t.state || "")));
+  const head = `失败任务（实例 #${processInstanceId}${instName ? ` ${instName}` : ""}）：`;
+  if (!rows.length) return `${head}\n（没有 FAILURE/KILL）`;
+  const lines = [head, ""];
+  for (const t of rows) {
+    lines.push(`#${t.id}  ${formatTaskLabel(t, { inst })}`);
+  }
+  lines.push("", "选定后发：强制成功 任务 #<id>   再回 YES");
   return lines.join("\n");
 }
 
@@ -893,22 +1881,36 @@ export function interpretNaturalLanguage(text) {
   if (/失败了吗|挂了吗|有报错吗/i.test(t)) {
     return ["/failed"];
   }
+  if (
+    /(哪些国家|各个国家|各国|所有国家).{0,12}(跑|运行|进度|阶段|任务|天级)|(跑|运行|进度|阶段).{0,12}(哪些国家|各国)|各国天级|国家进度看板/i.test(
+      t,
+    )
+  ) {
+    return ["/board"];
+  }
+  // 「id分区进度」「越南跑到哪了」→ /progress <country>
+  if (
+    /(分区)?进度|跑到哪|到哪一步|在跑啥|运行状态|开始了没|开跑了吗/i.test(t) &&
+    !/慢|耗时|失败|诊断|各国|哪些国家/i.test(t)
+  ) {
+    const country = resolveCountryCode(t);
+    if (country) return ["/progress", country];
+  }
   if (/慢\s*(stage|job)|耗时超过|慢任务|慢节点|哪些\s*job\s*慢|stage.*job.*慢/i.test(t)) {
     return ["/slow"];
   }
-  // Warehouse layers + country → dedicated /slow wh (skip Agent)
+  // Warehouse layers (+ optional country) → /slow wh；禁止「印尼任务」这类无慢意图误进
   if (
-    /(数仓|数仓层|ADS|DWS|DWM|DWD|ODS|DIM).*(层|stage|任务)|只看.*(ADS|DWS|DWM|DWD)|前置检测.*不要|不要.*前置/i.test(
+    /(数仓|数仓层|ADS|DWS|DWM|DWD|ODS|DIM).*(层|stage|任务|慢|耗时)|只看.*(ADS|DWS|DWM|DWD)|前置检测.*不要|不要.*前置/i.test(
       t,
     ) ||
-    /(印尼|印度尼西亚|indonesia|\bcountry[_\s]?code\b|\bid\b).*(层|stage|任务|分区)|(层|stage|任务|分区).*(印尼|印度尼西亚|indonesia)/i.test(
+    /(印尼|印度尼西亚|indonesia).*(慢|耗时|stage|数仓层)|(慢|耗时|stage|数仓层).*(印尼|印度尼西亚|indonesia)/i.test(
       t,
     )
   ) {
     let country = null;
     for (const [alias, code] of Object.entries(COUNTRY_ALIASES)) {
       if (t.toLowerCase().includes(alias.toLowerCase()) || new RegExp(alias, "i").test(t)) {
-        // prefer explicit country words over bare "id"
         if (alias === "id" && !/(印尼|印度尼西亚|indonesia|\bcountry|\bid\b)/i.test(t)) {
           continue;
         }
@@ -922,8 +1924,22 @@ export function interpretNaturalLanguage(text) {
     if (/印尼|印度尼西亚|indonesia/i.test(t)) country = "id";
     return country ? ["/slow", "wh", country] : ["/slow", "wh"];
   }
-  if (/重跑全部|整[个次]重跑|rerun-all/i.test(t) && id) return ["/rerun-all", id];
-  if (/重跑|再跑|rerun/i.test(t) && id) return ["/rerun", id];
+  if (/强制成功|force[- ]?success|强制过|标成成功/i.test(t)) {
+    const taskId =
+      t.match(/(?:任务|task)\s*#?\s*(\d{5,})/i)?.[1] ||
+      t.match(/\b(\d{6,8})\b/)?.[1] ||
+      null;
+    return taskId ? ["/force-success", String(taskId)] : ["/force-success"];
+  }
+  if (/重跑全部|整[个次]重跑|rerun-all/i.test(t)) {
+    return id ? ["/rerun-all", String(id)] : ["/rerun-all"];
+  }
+  if (/重跑|再跑|帮我重跑|重新跑|rerun/i.test(t)) {
+    return id ? ["/rerun", String(id)] : ["/rerun"];
+  }
   if (/^帮助$|^help$|能做什么/i.test(t)) return ["/help"];
+  if (/mcp\s*状态|mcp状态|^\/?mcp$|MCP\s*(连|通)|ds-offline\s*mcp/i.test(t)) {
+    return ["/mcp"];
+  }
   return null;
 }
