@@ -73,10 +73,10 @@ export function startCardCallbackServer({
 
       if (verificationToken) {
         const token = body.token || body.header?.token;
-        if (token && token !== verificationToken) {
-          log("[card-callback] token mismatch");
+        if (!token || token !== verificationToken) {
+          log("[card-callback] token missing or mismatch");
           json(res, 200, {
-            toast: { type: "error", content: "verification_token 不匹配，请检查 config.json" },
+            toast: { type: "error", content: "verification_token 验证失败" },
           });
           return;
         }
