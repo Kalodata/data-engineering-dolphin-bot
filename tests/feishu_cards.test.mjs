@@ -14,6 +14,7 @@ import {
   newNonce,
   failedListCard,
   slowJobsCard,
+  runningCard,
 } from "../src/feishu_cards.mjs";
 import {
   normalizeCardAction,
@@ -77,6 +78,64 @@ test("confirmCard shows rerun options", () => {
   assert.match(blob, /START_FAILURE_TASK_PROCESS/);
   assert.match(blob, /REPEAT_RUNNING/);
   assert.match(blob, /打开实例/);
+});
+
+test("runningCard shows hierarchy and empty state", () => {
+  const empty = runningCard({ enrich: [] });
+  assert.equal(empty.header.template, "green");
+  assert.match(JSON.stringify(empty), /没有 RUNNING/);
+
+  const enrich = [
+    {
+      id: 2004857,
+      country: "mx",
+      dataDate: "2026-08-05",
+      currentPath: "DWD-STAGE → dwd_scraper_creator_videos…",
+      stageStart: "2026-08-06 16:31:01",
+      runningNodes: [
+        { id: 9649420, name: "JDBC TASK", startTime: "2026-08-06 16:31:45", path: "DWD-STAGE → dwd_scraper_creator_videos → JDBC TASK" },
+        { id: 9649508, name: "QUALITY TASK", startTime: "2026-08-06 16:38:28", path: "DWD-STAGE → dwd_scraper_creator_videos → QUALITY TASK" },
+        { id: 9649399, name: "dwd_tiktok_creator_expansion（子流无 RUNNING 叶子）", startTime: "2026-08-06 16:31:41", path: "DWD-STAGE → dwd_tiktok_creator_expansion（子流无 RUNNING 叶子）" },
+      ],
+    },
+    {
+      id: 2003437,
+      country: "gb",
+      dataDate: "2026-08-05",
+      currentPath: "DWS-STAGE → QUALITY TASK",
+      stageStart: "2026-08-06 16:10:37",
+      runningNodes: [
+        { id: 9649506, name: "QUALITY TASK", startTime: "2026-08-06 16:38:23", path: "DWS-STAGE → QUALITY TASK" },
+        { id: 9649507, name: "QUALITY TASK", startTime: "2026-08-06 16:38:25", path: "DWS-STAGE → QUALITY TASK" },
+      ],
+    },
+  ];
+
+  const c = runningCard({ enrich, total: 4, uiUrlBuilder: (inst) => `https://ds.example/${inst.id}` });
+  assert.equal(c.header.template, "green");
+  assert.match(c.header.title.content, /正在运行/);
+
+  const blob = JSON.stringify(c);
+  // Country and date headers
+  assert.match(blob, /MX/);
+  assert.match(blob, /2026-08-05/);
+  assert.match(blob, /GB/);
+  // Dolphin link
+  assert.match(blob, /2004857/);
+  assert.match(blob, /打开 DS/);
+  // Stage level abbreviation
+  assert.match(blob, /DWD/);
+  assert.match(blob, /DWS/);
+  // Parent node appears, leaf is indented with time
+  assert.match(blob, /dwd_scraper_creator_videos/);
+  assert.match(blob, /QUALITY TASK/);
+  assert.match(blob, /16:38/);
+  // Two standalone QUALITY TASKs in GB both appear (not deduped by name)
+  const qtCount = (blob.match(/16:38/g) || []).length;
+  assert.equal(qtCount >= 2, true);
+  // hr divider between instances
+  const hrs = c.elements.filter((el) => el.tag === "hr");
+  assert.equal(hrs.length, 1);
 });
 
 test("failedListCard and slowJobsCard buttons", () => {
