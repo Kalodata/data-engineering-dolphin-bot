@@ -1,10 +1,12 @@
 {
   "allowed_users": [
     "ou_9d3244850b577959b6d4c15a3406d667",
-    "ou_afa3bdf9de342a557969b9e9b6d0d724"
+    "ou_afa3bdf9de342a557969b9e9b6d0d724",
+    "ou_bb5f124ec4d53295c7d97b1f156f8ab7"
   ],
   "notify_user_ids": [
     "ou_9d3244850b577959b6d4c15a3406d667",
-    "ou_afa3bdf9de342a557969b9e9b6d0d724"
+    "ou_afa3bdf9de342a557969b9e9b6d0d724",
+    "ou_bb5f124ec4d53295c7d97b1f156f8ab7"
   ]
 }
