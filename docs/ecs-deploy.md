@@ -90,7 +90,17 @@ curl -i -X POST "https://ds-offline.kalowave.com/dolphin-bot/feishu/card" \
    - `LARK_EVENT_READY_DELAY_MS`（默认 5000）
    - `LARK_EVENT_READY_MAX_DELAY_MS`（默认 30000）
 
-运维侧建议 Service 部署配置：`minimumHealthyPercent=0`、`maximumPercent=100`（先停旧再起新），缩短双实例抢 bus 窗口。
+Service 部署须为「先停旧再起新」（缩短双实例抢 bus 窗口）。CI/`scripts/ecs/deploy.sh` 每次 `update-service` 都会带上：
+
+```bash
+aws ecs update-service \
+  --region ap-southeast-1 \
+  --cluster dolphin-bot \
+  --service dolphin-bot \
+  --deployment-configuration "minimumHealthyPercent=0,maximumPercent=100"
+```
+
+当前线上若仍是 `minimumHealthyPercent=100` / `maximumPercent=200`，跑上面命令一次，或等下次 CI 部署自动改掉。注意：先停后起期间短暂无 running task，ALB 可能 503，卡片回调靠探活恢复；飞书 IM 长连接也会断一下再由新 task 重连。
 
 ## 本机未切流前
 

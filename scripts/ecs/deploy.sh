@@ -61,12 +61,13 @@ ARN=$(aws ecs register-task-definition --cli-input-json "file://${TD_OUT}" --reg
   --query 'taskDefinition.taskDefinitionArn' --output text)
 echo "registered: $ARN"
 
-echo "==> update service ${ECS_CLUSTER}/${ECS_SERVICE} desiredCount=1"
+echo "==> update service ${ECS_CLUSTER}/${ECS_SERVICE} desiredCount=1 (stop-old-first)"
 aws ecs update-service \
   --cluster "$ECS_CLUSTER" \
   --service "$ECS_SERVICE" \
   --task-definition "$ARN" \
   --desired-count 1 \
+  --deployment-configuration "minimumHealthyPercent=0,maximumPercent=100" \
   --force-new-deployment \
   --region "$AWS_REGION" \
   --query 'service.{status:status,desired:desiredCount,running:runningCount,taskDef:taskDefinition}' \

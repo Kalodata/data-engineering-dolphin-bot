@@ -44,9 +44,11 @@ jobs:
         run: |
           set -euo pipefail
           # Service 未创建时会失败——预期：先有镜像，运维建好 Service 后再跑或 re-run。
+          # minimumHealthyPercent=0 + maximumPercent=100：先停旧再起新，避免双 task 抢飞书长连接。
           aws ecs update-service \
             --cluster "$ECS_CLUSTER" \
             --service "$ECS_SERVICE" \
+            --deployment-configuration "minimumHealthyPercent=0,maximumPercent=100" \
             --force-new-deployment \
             --region "$AWS_REGION"
           aws ecs wait services-stable \
