@@ -558,6 +558,85 @@ export function failedListCard({
   });
 }
 
+/** Running instances card: country · date · Dolphin link + stage hierarchy. */
+export function runningCard({ enrich = [], total = null, uiUrlBuilder = null } = {}) {
+  if (!enrich.length) {
+    return card({ title: "⏳ 正在运行", template: "green", elements: [md("当前没有 RUNNING 实例。")] });
+  }
+
+  const els = [md(`正在运行（${total ?? enrich.length} 条）`)];
+
+  for (let i = 0; i < enrich.length; i++) {
+    const inst = enrich[i];
+    const { country, dataDate, currentPath, stageStart, runningNodes = [] } = inst;
+    const uiUrl = typeof uiUrlBuilder === "function" ? uiUrlBuilder(inst) : "";
+    const link = uiUrl ? `  [打开 DS ↗](${uiUrl})` : "";
+
+    const stageFull = String(currentPath || "").split(/\s*→\s*/)[0]?.trim() || "";
+    const stageLevel = stageFull.replace(/-STAGE$/i, "");
+    const stageTime = stageStart ? stageStart.slice(11, 16) : "";
+    const stageLabel = stageLevel || stageFull || "?";
+
+    // Build ordered list of display rows.
+    // Nested path (3+ parts): group leaf under parent row.
+    // Standalone path (2 parts): each node is its own row (use id as unique key).
+    const parentOrder = []; // insertion-order parent keys
+    // Map<key, { parentName, leaves: [{name, startHHMM}], startHHMM (standalone) }>
+    const groups = new Map();
+
+    for (const n of runningNodes.slice(0, 12)) {
+      const pathParts = String(n.path || "")
+        .split(/\s*→\s*/)
+        .map((p) => p.trim())
+        .filter(Boolean);
+      const afterStage = pathParts.slice(1);
+      const startHHMM = n.startTime ? n.startTime.slice(11, 16) : "";
+
+      if (afterStage.length >= 2) {
+        // Nested: strip annotation from parent name for grouping key
+        const rawParent = afterStage[0];
+        const parentKey = rawParent.replace(/（[^）]*）$/, "").trim();
+        const leafName = afterStage[afterStage.length - 1];
+        if (!groups.has(parentKey)) {
+          groups.set(parentKey, { parentName: parentKey, leaves: [], startHHMM: "" });
+          parentOrder.push(parentKey);
+        }
+        groups.get(parentKey).leaves.push({ name: leafName, startHHMM });
+      } else {
+        // Standalone: use id suffix to keep each node separate
+        const selfName = afterStage[0] || n.name || "?";
+        const key = `${selfName}__${n.id ?? i}`;
+        groups.set(key, { parentName: selfName, leaves: [], startHHMM });
+        parentOrder.push(key);
+      }
+    }
+
+    const nodeLines = [];
+    for (const key of parentOrder) {
+      const { parentName, leaves, startHHMM } = groups.get(key);
+      if (leaves.length > 0) {
+        nodeLines.push(parentName);
+        for (const leaf of leaves) {
+          nodeLines.push(`　　${leaf.name}${leaf.startHHMM ? `  ${leaf.startHHMM}` : ""}`);
+        }
+      } else {
+        nodeLines.push(`${parentName}${startHHMM ? `  ${startHHMM}` : ""}`);
+      }
+    }
+
+    const lines = [
+      `**${(country || "?").toUpperCase()} · ${dataDate || "-"}**${link}`,
+      `${stageLabel} 阶段${stageTime ? `（${stageTime} 起）` : ""}`,
+      ...nodeLines,
+    ];
+
+    els.push(md(lines.join("\n")));
+    if (i < enrich.length - 1) els.push(hr());
+  }
+
+  return card({ title: "⏳ 正在运行", template: "green", elements: els });
+}
+
 /** Slow stage/job hits as interactive card. */
 export function slowJobsCard({
   hits = [],

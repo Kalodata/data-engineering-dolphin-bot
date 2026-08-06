@@ -72,6 +72,7 @@ import {
   disabledConfirmCard,
   failedListCard,
   slowJobsCard,
+  runningCard,
 } from "./feishu_cards.mjs";
 import {
   startCardCallbackServer,
@@ -474,7 +475,20 @@ async function runCommand(config, command, message) {
       country,
       pageSize: 20,
     });
-    return `project ${ds.projectCode}\n${formatProgressReport(result)}`;
+    const env = loadDsEnv();
+    return {
+      card: runningCard({
+        enrich: result.enrich,
+        total: result.page?.total,
+        uiUrlBuilder: (inst) =>
+          buildProcessInstanceUiUrl({
+            apiUrl: env?.apiUrl,
+            projectCode: config.dsProjectCode || env?.projectCode,
+            processInstanceId: inst.id,
+          }),
+      }),
+      text: formatProgressReport(result),
+    };
   }
   if (name === "failed") {
     const n = Math.min(Math.max(Number(command[1] || 8) || 8, 1), 20);
