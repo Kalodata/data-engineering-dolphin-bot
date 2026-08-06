@@ -1946,7 +1946,7 @@ async function main() {
     });
     console.error(
       `card_callback: http://${config.feishuCardCallback.bind || "127.0.0.1"}:${config.feishuCardCallback.port}${config.feishuCardCallback.path}` +
-        "（飞书后台「卡片回传交互」填公网 URL；本机需隧道）",
+        "（飞书填公网同 path；ECS 例：https://ds-offline.kalowave.com/dolphin-bot/feishu/card）",
     );
   }
 

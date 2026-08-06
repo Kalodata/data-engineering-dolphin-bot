@@ -3,11 +3,31 @@ import crypto from "node:crypto";
 
 /**
  * Feishu interactive card callback HTTP server.
- * Configure developer console "卡片回传交互" URL → http(s)://host:port/feishu/card
+ * Configure developer console "卡片回传交互" URL → full path, e.g.
+ *   https://ds-offline.kalowave.com/dolphin-bot/feishu/card
+ * (set `path` to `/dolphin-bot/feishu/card` when sharing that host via reverse proxy).
  *
  * Feishu requires HTTP 200 within ~3s. Non-200 → client error 200671.
  * New callback (card.action.trigger) needs card wrapped as { type: "raw", data }.
  */
+
+/** Parent of `/…/feishu/card` — e.g. `/dolphin-bot` for prefixed deploys. */
+export function cardCallbackBasePath(urlPath = "/feishu/card") {
+  const normalized = String(urlPath || "/feishu/card").replace(/\/$/, "") || "/feishu/card";
+  if (normalized === "/feishu/card") return "";
+  if (normalized.endsWith("/feishu/card")) {
+    return normalized.slice(0, -"/feishu/card".length) || "";
+  }
+  const idx = normalized.lastIndexOf("/");
+  return idx > 0 ? normalized.slice(0, idx) : "";
+}
+
+function isHealthGet(pathname, urlPath) {
+  if (pathname === "/" || pathname === "/health" || pathname.startsWith("/health?")) return true;
+  const base = cardCallbackBasePath(urlPath);
+  if (!base) return false;
+  return pathname === `${base}/health` || pathname === `${base}/health/`;
+}
 
 export function startCardCallbackServer({
   port = 18767,
@@ -20,7 +40,8 @@ export function startCardCallbackServer({
 } = {}) {
   const server = http.createServer(async (req, res) => {
     try {
-      if (req.method === "GET" && (req.url?.startsWith("/health") || req.url === "/")) {
+      const url = new URL(req.url || "/", `http://${bind}:${port}`);
+      if (req.method === "GET" && isHealthGet(url.pathname, urlPath)) {
         json(res, 200, {
           ok: true,
           service: "feishu-card-callback",
@@ -29,7 +50,6 @@ export function startCardCallbackServer({
         return;
       }
 
-      const url = new URL(req.url || "/", `http://${bind}:${port}`);
       // Accept both exact path and trailing slash; never 404 to Feishu (→ 200671)
       const pathOk =
         url.pathname === urlPath ||

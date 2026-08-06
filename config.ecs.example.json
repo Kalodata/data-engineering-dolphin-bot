@@ -43,7 +43,7 @@
     "enabled": true,
     "port": 18767,
     "bind": "0.0.0.0",
-    "path": "/feishu/card",
+    "path": "/dolphin-bot/feishu/card",
     "verification_token": "",
     "encrypt_key": ""
   },
