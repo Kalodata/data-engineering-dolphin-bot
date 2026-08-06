@@ -73,6 +73,7 @@ import {
   failedListCard,
   slowJobsCard,
   runningCard,
+  boardCard,
 } from "./feishu_cards.mjs";
 import {
   startCardCallbackServer,
@@ -460,7 +461,10 @@ async function runCommand(config, command, message) {
   if (name === "board" || name === "countries" || name === "country-board") {
     const ds = getDsClient(config);
     const board = await listCountryDailyBoard(ds, {});
-    return `project ${ds.projectCode}\n${formatCountryDailyBoard(board)}`;
+    return {
+      card: boardCard(board),
+      text: formatCountryDailyBoard(board),
+    };
   }
   if (name === "progress" || name === "status-country") {
     // /progress              → all RUNNING with stage dig
