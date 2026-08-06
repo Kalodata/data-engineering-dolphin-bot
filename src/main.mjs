@@ -1308,26 +1308,95 @@ function startEventConsumer() {
   return child;
 }
 
-async function waitForReady(child) {
+function isRemoteBusBusy(stderrText = "") {
+  return /another event bus|online_instance_cnt\s*=\s*[1-9]|only one bus should run/i.test(
+    stderrText,
+  );
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Wait until lark-cli prints ready, or reject on early exit / timeout.
+ * Collects stderr for bus-conflict detection (lark-cli exits when remote bus exists).
+ */
+async function waitForReady(child, { timeoutMs = 30_000 } = {}) {
   return new Promise((resolve, reject) => {
+    let stderrBuf = "";
     const timeout = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error("Timed out waiting for lark-cli event consumer to become ready."));
-    }, 30_000);
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // ignore
+      }
+      const err = new Error("Timed out waiting for lark-cli event consumer to become ready.");
+      err.stderr = stderrBuf;
+      reject(err);
+    }, timeoutMs);
 
     child.stderr.on("data", (chunk) => {
+      stderrBuf += chunk;
       process.stderr.write(chunk);
       if (chunk.includes(`[event] ready event_key=${EVENT_KEY}`)) {
         clearTimeout(timeout);
-        resolve();
+        resolve({ stderr: stderrBuf });
       }
     });
 
     child.on("exit", (code) => {
       clearTimeout(timeout);
-      if (code !== 0) reject(new Error(`lark-cli event consumer exited early with code ${code}`));
+      if (code !== 0) {
+        const err = new Error(`lark-cli event consumer exited early with code ${code}`);
+        err.exitCode = code;
+        err.stderr = stderrBuf;
+        err.busy = isRemoteBusBusy(stderrBuf);
+        reject(err);
+      }
     });
   });
+}
+
+/**
+ * lark-cli refuses a second global WS when online_instance_cnt>0 (CLI guard, not Feishu hard limit).
+ * During ECS rollouts the old task still holds the bus — retry until it drops or attempts exhaust.
+ */
+export async function startEventConsumerUntilReady({
+  maxAttempts = Number(process.env.LARK_EVENT_READY_ATTEMPTS || 60),
+  baseDelayMs = Number(process.env.LARK_EVENT_READY_DELAY_MS || 5000),
+  maxDelayMs = Number(process.env.LARK_EVENT_READY_MAX_DELAY_MS || 30_000),
+  readyTimeoutMs = Number(process.env.LARK_EVENT_READY_TIMEOUT_MS || 30_000),
+  log = console.error,
+  start = startEventConsumer,
+  wait = waitForReady,
+  sleepFn = sleep,
+} = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const child = start();
+    try {
+      await wait(child, { timeoutMs: readyTimeoutMs });
+      if (attempt > 1) log(`[event] ready after ${attempt} attempt(s)`);
+      return child;
+    } catch (error) {
+      lastErr = error;
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // ignore
+      }
+      const busy = error.busy || isRemoteBusBusy(error.stderr || "");
+      const delay = Math.min(baseDelayMs * attempt, maxDelayMs);
+      log(
+        `[event] ready attempt ${attempt}/${maxAttempts} failed: ${error.message}` +
+          (busy ? " (remote event bus still held; waiting for previous instance to release)" : ""),
+      );
+      if (attempt >= maxAttempts) break;
+      await sleepFn(delay);
+    }
+  }
+  throw lastErr || new Error("lark-cli event consumer failed to become ready");
 }
 
 async function reply(messageId, text) {
@@ -1891,9 +1960,6 @@ async function main() {
     path.resolve(path.dirname(config.configPath), ".data/audit.jsonl"),
   );
 
-  const child = startEventConsumer();
-  await waitForReady(child);
-  console.error(`Listening for ${EVENT_KEY}. Press Ctrl+C to stop.`);
   const profile = process.env.LARK_PROFILE || process.env.FEISHU_PROFILE || "(default)";
   console.error(`config: ${config.configPath}`);
   console.error(
@@ -1909,6 +1975,25 @@ async function main() {
     config.dsAlertWebhook.token = resolveWebhookToken(
       config,
       path.dirname(config.configPath),
+    );
+  }
+
+  // HTTP health / card callback FIRST so ALB stays healthy while waiting for Feishu WS.
+  // lark-cli exits if another remote bus is still online (ECS rollout race).
+  let cardCallback = null;
+  if (config.feishuCardCallback?.enabled) {
+    cardCallback = startCardCallbackServer({
+      port: config.feishuCardCallback.port,
+      path: config.feishuCardCallback.path,
+      bind: config.feishuCardCallback.bind || "127.0.0.1",
+      verificationToken: config.feishuCardCallback.verificationToken,
+      encryptKey: config.feishuCardCallback.encryptKey,
+      onAction: handleCardAction,
+      log: (line) => console.error(line),
+    });
+    console.error(
+      `card_callback: http://${config.feishuCardCallback.bind || "127.0.0.1"}:${config.feishuCardCallback.port}${config.feishuCardCallback.path}` +
+        "（飞书填公网同 path；ECS 例：https://ds-offline.kalowave.com/dolphin-bot/feishu/card）",
     );
   }
 
@@ -1932,23 +2017,6 @@ async function main() {
       });
     },
   });
-
-  let cardCallback = null;
-  if (config.feishuCardCallback?.enabled) {
-    cardCallback = startCardCallbackServer({
-      port: config.feishuCardCallback.port,
-      path: config.feishuCardCallback.path,
-      bind: config.feishuCardCallback.bind || "127.0.0.1",
-      verificationToken: config.feishuCardCallback.verificationToken,
-      encryptKey: config.feishuCardCallback.encryptKey,
-      onAction: handleCardAction,
-      log: (line) => console.error(line),
-    });
-    console.error(
-      `card_callback: http://${config.feishuCardCallback.bind || "127.0.0.1"}:${config.feishuCardCallback.port}${config.feishuCardCallback.path}` +
-        "（飞书填公网同 path；ECS 例：https://ds-offline.kalowave.com/dolphin-bot/feishu/card）",
-    );
-  }
 
   let dsIngress = null;
   if (config.dsAlertWebhook?.enabled) {
@@ -1989,7 +2057,15 @@ async function main() {
     );
   }
 
+  let eventChild = null;
+  let shuttingDown = false;
   const stopWatcher = () => {
+    shuttingDown = true;
+    try {
+      eventChild?.kill?.("SIGTERM");
+    } catch {
+      // ignore
+    }
     try {
       failureWatcher?.stop?.();
     } catch {
@@ -2009,47 +2085,60 @@ async function main() {
   process.on("SIGINT", stopWatcher);
   process.on("SIGTERM", stopWatcher);
 
-  const lines = readline.createInterface({ input: child.stdout });
-  // Process one message at a time, but never stall the consumer forever:
-  // each handler is wrapped with an overall deadline so Agent hang can't freeze the bot.
   const HANDLE_DEADLINE_MS = 600_000; // adaptive DS scans can take a few minutes
 
-  for await (const line of lines) {
-    if (!line.trim()) continue;
-    try {
-      const message = parseMessage(JSON.parse(line));
-      if (!message) continue;
-      const started = Date.now();
-      console.error(
-        `[msg] ${message.chatId} ${(message.text || "").slice(0, 80).replace(/\n/g, " ")}`,
-      );
-      await Promise.race([
-        handleMessage(config, message),
-        new Promise((_, reject) =>
-          setTimeout(
-            () =>
-              reject(
-                new Error(
-                  `处理超时（>${Math.round(HANDLE_DEADLINE_MS / 1000)}s），已跳过本条以免卡死`,
+  while (!shuttingDown) {
+    console.error(
+      `[event] acquiring Feishu long connection (lark-cli exits if online_instance_cnt>0)…`,
+    );
+    eventChild = await startEventConsumerUntilReady({
+      log: (line) => console.error(line),
+    });
+    console.error(`Listening for ${EVENT_KEY}. Press Ctrl+C to stop.`);
+    console.error(`[source] feishu-websocket: connected`);
+
+    const lines = readline.createInterface({ input: eventChild.stdout });
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const message = parseMessage(JSON.parse(line));
+        if (!message) continue;
+        const started = Date.now();
+        console.error(
+          `[msg] ${message.chatId} ${(message.text || "").slice(0, 80).replace(/\n/g, " ")}`,
+        );
+        await Promise.race([
+          handleMessage(config, message),
+          new Promise((_, reject) =>
+            setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `处理超时（>${Math.round(HANDLE_DEADLINE_MS / 1000)}s），已跳过本条以免卡死`,
+                  ),
                 ),
-              ),
-            HANDLE_DEADLINE_MS,
+              HANDLE_DEADLINE_MS,
+            ),
           ),
-        ),
-      ]).catch(async (error) => {
-        console.error(`[msg-error] ${error.message} (+${Date.now() - started}ms)`);
-        try {
-          await reply(
-            message.messageId,
-            `Error: ${error.message}\n可重发，或改用 /failed /diagnose /slow（勿长聊拖死）。`,
-          );
-        } catch (replyErr) {
-          console.error(`[reply-error] ${replyErr.message}`);
-        }
-      });
-    } catch (error) {
-      console.error(`Error while handling event: ${error.message}`);
+        ]).catch(async (error) => {
+          console.error(`[msg-error] ${error.message} (+${Date.now() - started}ms)`);
+          try {
+            await reply(
+              message.messageId,
+              `Error: ${error.message}\n可重发，或改用 /failed /diagnose /slow（勿长聊拖死）。`,
+            );
+          } catch (replyErr) {
+            console.error(`[reply-error] ${replyErr.message}`);
+          }
+        });
+      } catch (error) {
+        console.error(`Error while handling event: ${error.message}`);
+      }
     }
+
+    if (shuttingDown) break;
+    console.error("[event] consumer ended; reconnecting after short backoff…");
+    await sleep(3000);
   }
 }
 

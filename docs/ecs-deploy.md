@@ -78,6 +78,20 @@ curl -i -X POST "https://ds-offline.kalowave.com/dolphin-bot/feishu/card" \
 
 网关未配好前，上述公网 curl 会失败；容器内 `curl 127.0.0.1:18767/health` 仍应通。
 
+## 长连接与滚动发布（lark-cli）
+
+`lark-cli event consume` 在检测到 `online_instance_cnt>0` 时会**主动退出**（CLI 保护，不是飞书硬限制最多 1 条；平台侧最多约 50，但 CLI 为防重复消费只允许本进程独占）。
+
+因此 ECS 滚动时若新旧 task 重叠，新实例会起不来。本仓库对策：
+
+1. **先起**卡片 HTTP `/health`（ALB 探活不依赖 WS）
+2. **退避重试** `event consume`，直到旧连接释放（环境变量可选）：
+   - `LARK_EVENT_READY_ATTEMPTS`（默认 60）
+   - `LARK_EVENT_READY_DELAY_MS`（默认 5000）
+   - `LARK_EVENT_READY_MAX_DELAY_MS`（默认 30000）
+
+运维侧建议 Service 部署配置：`minimumHealthyPercent=0`、`maximumPercent=100`（先停旧再起新），缩短双实例抢 bus 窗口。
+
 ## 本机未切流前
 
 Mac 桥 + localhost.run 继续服务卡片；ECS + 上表公网回调就绪后再改飞书 URL。
