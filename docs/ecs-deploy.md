@@ -40,6 +40,44 @@ Workflow：`.github/workflows/deploy-ecs.yml`
 | `dolphin-bot/cursor-api-key` | `CURSOR_API_KEY` |
 | `dolphin-bot/feishu-verification-token` | `FEISHU_VERIFICATION_TOKEN` |
 
+## 卡片回调（方案：共用 ds-offline 域名 + 路径前缀）
+
+不新开域名。网关 / 反代规则：
+
+```text
+host = ds-offline.kalowave.com
+path = /dolphin-bot/*
+  → 转发到 ECS service dolphin-bot:18767
+  （保留 path，不要 strip `/dolphin-bot`）
+```
+
+| 用途 | URL |
+|------|-----|
+| 飞书「卡片回传交互」 | `https://ds-offline.kalowave.com/dolphin-bot/feishu/card` |
+| 外网探活 | `https://ds-offline.kalowave.com/dolphin-bot/health` |
+| Target Group 探活（直连容器） | `http://task:18767/health`（仍可用） |
+
+Bot 配置（`config.ecs.example.json` / 运行中 `config.json`）：
+
+```json
+"feishu_card_callback": {
+  "path": "/dolphin-bot/feishu/card",
+  "port": 18767,
+  "bind": "0.0.0.0"
+}
+```
+
+自测：
+
+```bash
+curl -fsS "https://ds-offline.kalowave.com/dolphin-bot/health"
+curl -i -X POST "https://ds-offline.kalowave.com/dolphin-bot/feishu/card" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"url_verification","challenge":"test-123","token":"<Verification Token>"}'
+```
+
+网关未配好前，上述公网 curl 会失败；容器内 `curl 127.0.0.1:18767/health` 仍应通。
+
 ## 本机未切流前
 
-Mac 桥 + localhost.run 继续服务卡片；ECS+ALB 就绪后再改飞书回调 URL。
+Mac 桥 + localhost.run 继续服务卡片；ECS + 上表公网回调就绪后再改飞书 URL。

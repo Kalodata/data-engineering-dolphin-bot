@@ -204,6 +204,44 @@ test("formatCallbackResponse wraps card for new callback", () => {
   assert.equal(old.card, card);
 });
 
+test("card callback prefixed path + health", async () => {
+  const { stop } = startCardCallbackServer({
+    port: 19879,
+    bind: "127.0.0.1",
+    path: "/dolphin-bot/feishu/card",
+    verificationToken: "tok",
+    onAction: async () => ({ toast: { type: "success", content: "ok" } }),
+    log: () => {},
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  const healthRoot = await getJson("http://127.0.0.1:19879/health");
+  assert.equal(healthRoot.status, 200);
+  assert.equal(healthRoot.body.ok, true);
+
+  const healthPrefixed = await getJson("http://127.0.0.1:19879/dolphin-bot/health");
+  assert.equal(healthPrefixed.status, 200);
+  assert.equal(healthPrefixed.body.path, "/dolphin-bot/feishu/card");
+
+  const challenge = await postJson("http://127.0.0.1:19879/dolphin-bot/feishu/card", {
+    type: "url_verification",
+    challenge: "pref",
+    token: "tok",
+  });
+  assert.equal(challenge.status, 200);
+  assert.equal(challenge.body.challenge, "pref");
+
+  const legacy = await postJson("http://127.0.0.1:19879/feishu/card", {
+    type: "url_verification",
+    challenge: "x",
+    token: "tok",
+  });
+  assert.equal(legacy.status, 200);
+  assert.match(legacy.body.toast?.content || "", /路径不对/);
+
+  await stop();
+});
+
 test("card callback challenge + action", async () => {
   let seen = null;
   const { stop } = startCardCallbackServer({
@@ -251,9 +289,10 @@ test("card callback challenge + action", async () => {
 test("card callback slow action acks within budget", async () => {
   let finished = false;
   const { stop } = startCardCallbackServer({
-    port: 19878,
+    port: 19880,
     bind: "127.0.0.1",
     path: "/feishu/card",
+    verificationToken: "tok",
     onAction: async () => {
       await new Promise((r) => setTimeout(r, 80));
       finished = true;
@@ -264,9 +303,9 @@ test("card callback slow action acks within budget", async () => {
   await new Promise((r) => setTimeout(r, 50));
 
   const t0 = Date.now();
-  const res = await postJson("http://127.0.0.1:19878/feishu/card", {
+  const res = await postJson("http://127.0.0.1:19880/feishu/card", {
     schema: "2.0",
-    header: { event_type: "card.action.trigger" },
+    header: { event_type: "card.action.trigger", token: "tok" },
     event: {
       action: { value: { action: "diagnose", processInstanceId: "1" } },
       operator: { open_id: "ou_1" },
@@ -283,6 +322,36 @@ test("card callback slow action acks within budget", async () => {
 
   await stop();
 });
+
+function getJson(url) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = http.request(
+      {
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname,
+        method: "GET",
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          try {
+            resolve({
+              status: res.statusCode,
+              body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+            });
+          } catch (e) {
+            reject(e);
+          }
+        });
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
 
 function postJson(url, body) {
   return new Promise((resolve, reject) => {
