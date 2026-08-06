@@ -1556,6 +1556,64 @@ export function formatProgressReport({ page, enrich, country }) {
   return header ? `${header}\n\n${body}` : body;
 }
 
+/** IANA timezone per country_code. Each country's daily task starts at local 02:00. */
+export const COUNTRY_TZ = {
+  id: "Asia/Jakarta",
+  vn: "Asia/Ho_Chi_Minh",
+  th: "Asia/Bangkok",
+  my: "Asia/Kuala_Lumpur",
+  ph: "Asia/Manila",
+  sg: "Asia/Singapore",
+  jp: "Asia/Tokyo",
+  us: "America/New_York",
+  mx: "America/Mexico_City",
+  br: "America/Sao_Paulo",
+  gb: "Europe/London",
+  de: "Europe/Berlin",
+  fr: "Europe/Paris",
+  es: "Europe/Madrid",
+  it: "Europe/Rome",
+};
+
+/**
+ * Returns the UTC Date when "today's 02:00 local" occurs in the country's timezone.
+ * "Today" is relative to what the country's clock currently shows.
+ */
+export function getScheduledStartUTC(country, now = new Date()) {
+  const tz = COUNTRY_TZ[country];
+  if (!tz) return null;
+  // Local date in the country (sv-SE gives YYYY-MM-DD)
+  const localDate = new Intl.DateTimeFormat("sv-SE", { timeZone: tz }).format(now);
+  // Treat "YYYY-MM-DD 02:00:00" as UTC — this gives us a naive timestamp
+  const naiveMs = Date.parse(`${localDate}T02:00:00.000Z`);
+  // Format that naive timestamp back in the local timezone to see the actual local time it represents
+  const localAtNaive = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(naiveMs));
+  // Parse the local reading back as UTC to measure the offset error
+  const naiveLocalMs = Date.parse(localAtNaive.replace(" ", "T") + "Z");
+  // Correct the naive timestamp by the offset error to get the actual UTC time for local 02:00
+  return new Date(naiveMs + (naiveMs - naiveLocalMs));
+}
+
+/** Returns current local time as "HH:MM" in the country's timezone. */
+function getLocalHHMM(country, now = new Date()) {
+  const tz = COUNTRY_TZ[country];
+  if (!tz) return "?";
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(now);
+}
+
 /** yyyymmdd in Asia/Shanghai (DS schedule local). */
 export function todayYmdShanghai(now = new Date()) {
   const fmt = new Intl.DateTimeFormat("en-CA", {
@@ -1671,12 +1729,21 @@ export async function listCountryDailyBoard(
   ];
   const missing = known.filter((c) => !latestByCountry.has(c));
 
+  const now = new Date();
+  const overdue = missing
+    .filter((c) => {
+      const scheduled = getScheduledStartUTC(c, now);
+      return scheduled != null && now.getTime() > scheduled.getTime();
+    })
+    .map((c) => ({ country: c, localTime: getLocalHHMM(c, now) }));
+
   return {
     dayToken: token,
     rows: [...latestByCountry.values()].sort((a, b) =>
       String(a.country).localeCompare(String(b.country)),
     ),
     missing,
+    overdue,
   };
 }
 
