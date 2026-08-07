@@ -559,42 +559,52 @@ export function failedListCard({
 }
 
 /** Daily board card: summary counts + per-category country lists + overdue alert. */
-export function boardCard({ dayToken, rows = [], missing = [], overdue = [] } = {}) {
-  const running = rows.filter((r) => /RUNNING/i.test(String(r.state || "")));
-  const success = rows.filter((r) => /SUCCESS/i.test(String(r.state || "")));
-  const failed = rows.filter((r) => /FAIL|KILL|STOP/i.test(String(r.state || "")));
+export function boardCard({ dayToken, groups = [] } = {}) {
+  const hasOverdue = groups.some((g) => g.overdue?.length > 0);
+  const els = [];
 
-  const summaryParts = [
-    `进行中 **${running.length}**`,
-    `已完成 **${success.length}**`,
-    `待开始 **${missing.length}**`,
-  ];
-  if (failed.length) summaryParts.push(`异常 **${failed.length}**`);
-  const els = [md(summaryParts.join("　·　"))];
+  for (let i = 0; i < groups.length; i++) {
+    const { dataDate, rows = [], missing = [], overdue = [] } = groups[i];
+    if (i > 0) els.push(hr());
 
-  if (success.length) {
-    els.push(md(`✅ **已完成（${success.length}）**\n${success.map((r) => r.country.toUpperCase()).join(" · ")}`));
+    const running = rows.filter((r) => /RUNNING/i.test(String(r.state || "")));
+    const success = rows.filter((r) => /SUCCESS/i.test(String(r.state || "")));
+    const failed = rows.filter((r) => /FAIL|KILL|STOP/i.test(String(r.state || "")));
+
+    const summaryParts = [
+      `进行中 **${running.length}**`,
+      `已完成 **${success.length}**`,
+      `待开始 **${missing.length}**`,
+    ];
+    if (failed.length) summaryParts.push(`异常 **${failed.length}**`);
+
+    els.push(md(`**数据日 ${dataDate}**　${summaryParts.join(" · ")}`));
+
+    if (success.length) {
+      els.push(md(`✅ **已完成（${success.length}）**\n${success.map((r) => r.country.toUpperCase()).join(" · ")}`));
+    }
+    if (running.length) {
+      els.push(md(`🔄 **进行中（${running.length}）**\n${running.map((r) => r.country.toUpperCase()).join(" · ")}`));
+    }
+    if (failed.length) {
+      els.push(md(`❌ **异常（${failed.length}）**\n${failed.map((r) => `${r.country.toUpperCase()}（${r.state}）`).join(" · ")}`));
+    }
+    if (missing.length) {
+      els.push(md(`⏳ **待开始（${missing.length}）**\n${missing.map((c) => c.toUpperCase()).join(" · ")}`));
+    }
+    if (overdue.length) {
+      const lines = overdue
+        .map((o) => `${o.country.toUpperCase()}　本地现在 ${o.localTime}，预计 02:00 已过，仍未见开跑`)
+        .join("\n");
+      els.push(md(`⚠️ **超时未开始（${overdue.length}）**\n${lines}`));
+    }
   }
-  if (running.length) {
-    els.push(md(`🔄 **进行中（${running.length}）**\n${running.map((r) => r.country.toUpperCase()).join(" · ")}`));
-  }
-  if (failed.length) {
-    els.push(md(`❌ **异常（${failed.length}）**\n${failed.map((r) => `${r.country.toUpperCase()}（${r.state}）`).join(" · ")}`));
-  }
-  if (missing.length) {
-    els.push(md(`⏳ **待开始（${missing.length}）**\n${missing.map((c) => c.toUpperCase()).join(" · ")}`));
-  }
-  if (overdue.length) {
-    els.push(hr());
-    const lines = overdue
-      .map((o) => `${o.country.toUpperCase()}　本地现在 ${o.localTime}，预计 02:00 已过，仍未见开跑`)
-      .join("\n");
-    els.push(md(`⚠️ **超时未开始（${overdue.length}）**\n${lines}`));
-  }
+
+  if (!els.length) els.push(md("暂无数据"));
 
   return card({
     title: `📊 天级看板 · ${dayToken || "?"}`,
-    template: overdue.length ? "orange" : "blue",
+    template: hasOverdue ? "orange" : "blue",
     elements: els,
   });
 }
