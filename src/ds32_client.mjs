@@ -1662,8 +1662,8 @@ export async function listCountryDailyBoard(
     }
   }
 
-  /** @type {Map<string, object>} */
-  const latestByCountry = new Map();
+  // Map<dataDate, Map<country, instance>>
+  const latestByDateCountry = new Map();
   for (const row of pages) {
     if (!/天级任务-37/.test(String(row.name || "")) && searchVal) {
       // keep if search was date-only
@@ -1674,8 +1674,10 @@ export async function listCountryDailyBoard(
     const dataDate =
       getGlobalParam(full || row, "data_date") ||
       getGlobalParam(full || row, "partition_day") ||
-      "";
-    const prev = latestByCountry.get(country);
+      "unknown";
+    if (!latestByDateCountry.has(dataDate)) latestByDateCountry.set(dataDate, new Map());
+    const byCountry = latestByDateCountry.get(dataDate);
+    const prev = byCountry.get(country);
     const start = String((full || row).startTime || row.startTime || "");
     if (prev && String(prev.startTime || "") >= start) continue;
     let currentPath = null;
@@ -1694,7 +1696,7 @@ export async function listCountryDailyBoard(
     } else if (/FAIL|KILL|STOP/i.test(state)) {
       currentPath = state;
     }
-    latestByCountry.set(country, {
+    byCountry.set(country, {
       id: row.id,
       name: (full || row).name || row.name,
       state,
@@ -1721,84 +1723,59 @@ export async function listCountryDailyBoard(
     "gb",
     "de",
     "jp",
-    "kr",
     "br",
     "fr",
     "es",
     "it",
   ];
-  const missing = known.filter((c) => !latestByCountry.has(c));
 
   const now = new Date();
-  const overdue = missing
-    .filter((c) => {
-      const scheduled = getScheduledStartUTC(c, now);
-      return scheduled != null && now.getTime() > scheduled.getTime();
-    })
-    .map((c) => ({ country: c, localTime: getLocalHHMM(c, now) }));
+  const groups = [...latestByDateCountry.entries()]
+    .sort(([a], [b]) => b.localeCompare(a)) // newest dataDate first
+    .map(([dataDate, byCountry]) => {
+      const rows = [...byCountry.values()].sort((a, b) =>
+        String(a.country).localeCompare(String(b.country)),
+      );
+      const missing = known.filter((c) => !byCountry.has(c));
+      const overdue = missing
+        .filter((c) => {
+          const scheduled = getScheduledStartUTC(c, now);
+          return scheduled != null && now.getTime() > scheduled.getTime();
+        })
+        .map((c) => ({ country: c, localTime: getLocalHHMM(c, now) }));
+      return { dataDate, rows, missing, overdue };
+    });
 
-  return {
-    dayToken: token,
-    rows: [...latestByCountry.values()].sort((a, b) =>
-      String(a.country).localeCompare(String(b.country)),
-    ),
-    missing,
-    overdue,
-  };
+  return { dayToken: token, groups };
 }
 
-export function formatCountryDailyBoard({ dayToken, rows = [], missing = [] } = {}) {
-  const lines = [`【各国天级】开跑日戳 ${dayToken || "?"}（按 country_code 最新一条）`, ""];
-  const running = rows.filter((r) => /RUNNING/i.test(String(r.state || "")));
-  const success = rows.filter((r) => /SUCCESS/i.test(String(r.state || "")));
-  const other = rows.filter(
-    (r) => !/RUNNING|SUCCESS/i.test(String(r.state || "")),
-  );
+export function formatCountryDailyBoard({ dayToken, groups = [] } = {}) {
+  const lines = [`【各国天级】开跑日戳 ${dayToken || "?"}`, ""];
+  for (const { dataDate, rows, missing } of groups) {
+    lines.push(`=== 数据日 ${dataDate} ===`);
+    const running = rows.filter((r) => /RUNNING/i.test(String(r.state || "")));
+    const success = rows.filter((r) => /SUCCESS/i.test(String(r.state || "")));
+    const other = rows.filter((r) => !/RUNNING|SUCCESS/i.test(String(r.state || "")));
 
-  if (running.length) {
-    lines.push(`在跑（${running.length}）：`);
-    for (const r of running) {
-      lines.push(
-        `· ${r.country}  #${r.id}  开始 ${r.startTime || "-"}` +
-          (r.dataDate ? `  day=${r.dataDate}` : ""),
-      );
-      if (r.currentPath) lines.push(`  当前：${r.currentPath}`);
-      if (r.stageStart) lines.push(`  stage 起：${r.stageStart}`);
-      if (r.runningNodes?.length) {
-        for (const n of r.runningNodes.slice(0, 6)) {
-          lines.push(`  · ${formatRunningNodeLabel(n)}  起 ${n.startTime || "-"}`);
-        }
+    if (running.length) {
+      lines.push(`在跑（${running.length}）：`);
+      for (const r of running) {
+        lines.push(`· ${r.country}  #${r.id}  开始 ${r.startTime || "-"}`);
+        if (r.currentPath) lines.push(`  当前：${r.currentPath}`);
       }
-      if (r.doneStages?.length) lines.push(`  已完成：${r.doneStages.join(" → ")}`);
     }
-    lines.push("");
-  } else {
-    lines.push("在跑：无", "");
-  }
-
-  if (success.length) {
-    lines.push(`已完成（${success.length}）：`);
-    lines.push(
-      success
-        .map((r) => `${r.country}(#${r.id}${r.endTime ? ` ${String(r.endTime).slice(11, 16)}` : ""})`)
-        .join(" · "),
-    );
-    lines.push("");
-  }
-
-  if (other.length) {
-    lines.push(`其它状态（${other.length}）：`);
-    for (const r of other) {
-      lines.push(`· ${r.country}  #${r.id}  ${r.state}  开始 ${r.startTime || "-"}`);
+    if (success.length) {
+      lines.push(`已完成（${success.length}）：`);
+      lines.push(success.map((r) => `${r.country}(${String(r.endTime || "").slice(11, 16)})`).join(" · "));
     }
+    if (other.length) {
+      lines.push(`异常（${other.length}）：`);
+      for (const r of other) lines.push(`· ${r.country}  ${r.state}`);
+    }
+    if (missing.length) lines.push(`未开始：${missing.join(" · ")}`);
     lines.push("");
   }
-
-  if (missing.length) {
-    lines.push(`今日戳未见开跑：${missing.join(" · ")}`);
-    lines.push("");
-  }
-
+  if (!groups.length) lines.push("暂无数据");
   lines.push("单国深挖：说「id分区进度」或 /tasks <实例id>");
   return lines.join("\n");
 }
