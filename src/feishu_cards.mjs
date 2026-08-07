@@ -127,7 +127,6 @@ export function alertCard({
   repoLines = [],
   fixes = [],
   dsReadonly = true,
-  includeFeedback = true,
 } = {}) {
   const lines = [];
   if (cause) lines.push(`**原因：** ${clip(cause, 160)}`);
@@ -204,18 +203,8 @@ export function alertCard({
       }),
     );
   }
-  if (includeFeedback) {
-    actions.push(
-      button({ label: "有用", action: "feedback", value: { kind: "useful" } }),
-      button({ label: "误报", action: "feedback", value: { kind: "false_alarm" } }),
-      button({ label: "需升级", action: "feedback", value: { kind: "escalate" } }),
-    );
-  }
-
   body.push(hr());
-  if (actions.length) body.push(actionRow(actions.slice(0, 5)));
-  // Feishu action row soft-limit ~5; put feedback on second row if needed
-  if (actions.length > 5) body.push(actionRow(actions.slice(5)));
+  if (actions.length) body.push(actionRow(actions));
 
   return card({
     title: "🚨 工作流告警",
@@ -863,7 +852,6 @@ export function buildAlertCardFromReportFields(fields = {}) {
     apiUrl,
     repoAnalysis,
     dsReadonly = false,
-    includeFeedback = true,
     uiUrl: uiUrlIn,
   } = fields;
 
@@ -908,6 +896,5 @@ export function buildAlertCardFromReportFields(fields = {}) {
     repoLines: repoAnalysis?.useful ? repoAnalysis.lines || [] : [],
     fixes: classification?.fixes || [],
     dsReadonly: Boolean(dsReadonly),
-    includeFeedback,
   });
 }

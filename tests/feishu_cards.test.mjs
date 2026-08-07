@@ -45,12 +45,13 @@ test("alertCard includes action buttons", () => {
     taskId: 9441911,
     taskName: "jdbc_sql",
     dsReadonly: false,
-    includeFeedback: true,
   });
   const blob = JSON.stringify(c);
   assert.match(blob, /diagnose/);
   assert.match(blob, /rerun_request/);
-  assert.match(blob, /feedback/);
+  assert.match(blob, /看日志|log/);
+  assert.doesNotMatch(blob, /feedback/);
+  assert.doesNotMatch(blob, /有用|误报|需升级/);
   assert.match(blob, /1939974/);
 });
 

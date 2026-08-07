@@ -51,12 +51,6 @@ import {
   gatherAlertEvidence,
   shouldUseAlertTemplate,
 } from "./alert_evidence.mjs";
-import {
-  FEEDBACK_HINT,
-  parseFeedback,
-  recordFeedback,
-  rememberAlertForFeedback,
-} from "./alert_feedback.mjs";
 import { startDsAlertIngress } from "./ds_alert_ingress.mjs";
 import {
   describeAlertMode,
@@ -97,7 +91,7 @@ const HELP_TEXT = `可以像 Cursor 一样直接打字（复杂 DS 排查会自�
 「id分区进度」「各国天级进度」「只看数仓层、印尼、stage>15m 的慢 job」
 
 写操作弹确认卡（点按钮或回 YES）；仍禁止改工作流定义。
-告警卡可点：诊断 / 重跑 / 有用 / 误报。
+告警卡可点：诊断 / 重跑 / 看日志。
 快捷：/progress id  /board  /failed  /diagnose
 高级：/slow /tasks /log /mcp /status /help`;
 
@@ -215,16 +209,6 @@ function loadConfig(configPath) {
         dedupePath: path.resolve(
           path.dirname(resolvedConfigPath),
           w.dedupe_path || ".data/alert-dedupe.json",
-        ),
-      };
-    })(),
-    alertFeedback: (() => {
-      const f = raw.alert_feedback || {};
-      return {
-        enabled: f.enabled !== false,
-        statePath: path.resolve(
-          path.dirname(resolvedConfigPath),
-          f.state_path || ".data/alert-feedback.json",
         ),
       };
     })(),
@@ -1135,14 +1119,6 @@ async function handleAlert(config, alertText, message) {
   if (message?.chatId && evidence?.processInstanceId) {
     lastFailureByChat.set(message.chatId, Number(evidence.processInstanceId));
   }
-  if (config.alertFeedback?.enabled && message?.chatId) {
-    rememberAlertForFeedback(config.alertFeedback.statePath, message.chatId, {
-      taskId: evidence?.taskId ?? null,
-      processInstanceId: evidence?.processInstanceId ?? null,
-      category: evidence?.classification?.category ?? null,
-      source: "alert",
-    });
-  }
 
   const enrichedText = evidence?.block
     ? `${alertText}\n\n---\n【桥接取证】\n${evidence.block}`
@@ -1174,14 +1150,13 @@ async function handleAlert(config, alertText, message) {
     console.error("[alert] weak evidence → local Agent card");
     cardText = await runAlertLocal(config, alertText, evidence?.block || "");
   }
-  const footer = config.alertFeedback?.enabled ? `\n\n${FEEDBACK_HINT}` : "";
   if (interactive) {
     return { card: interactive, text: cardText };
   }
   if (shouldUseAlertTemplate(evidence) && !webhookUrl) {
     return cardText;
   }
-  return `${cardText}${footer}`;
+  return cardText;
 }
 
 async function runAlertWebhook(url, key, alertText, message) {
@@ -1789,18 +1764,6 @@ async function handleMessage(config, message) {
     return;
   }
 
-  if (config.alertFeedback?.enabled) {
-    const fb = parseFeedback(trimmed);
-    if (fb) {
-      const result = recordFeedback(config.alertFeedback.statePath, {
-        chatId: message.chatId,
-        kind: fb.kind,
-      });
-      await deliverReply(message.messageId, result.message, config);
-      return;
-    }
-  }
-
   // Plain YES/NO / 确认/取消 for pending rerun (no leading slash required).
   if (
     /^(YES|NO|确认|取消|是的?|否)$/i.test(trimmed) &&
@@ -1893,18 +1856,6 @@ async function handleCardAction(action) {
   const name = action.action;
 
   try {
-    if (name === "feedback") {
-      if (!config.alertFeedback?.enabled) {
-        return { toast: { type: "info", content: "反馈未开启" } };
-      }
-      const id = chatId || action.openId;
-      const result = recordFeedback(config.alertFeedback.statePath, {
-        chatId: id,
-        kind: v.kind || "useful",
-      });
-      return { toast: { type: "success", content: clipToast(result.message, 60) } };
-    }
-
     if (name === "diagnose") {
       const id = Number(v.processInstanceId);
       if (!id) return { toast: { type: "error", content: "缺少实例 id" } };
@@ -2136,15 +2087,6 @@ async function main() {
       if (alert?.taskId != null && config.alertWatch?.statePath) {
         markTaskNotified(config.alertWatch.statePath, alert.taskId);
       }
-      if (!config.alertFeedback?.enabled) return;
-      const id = chatId || userId;
-      if (!id) return;
-      rememberAlertForFeedback(config.alertFeedback.statePath, id, {
-        taskId: alert.taskId,
-        processInstanceId: alert.processInstanceId,
-        category: alert.category || null,
-        source: "watch",
-      });
     },
   });
 
