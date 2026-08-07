@@ -416,13 +416,45 @@ export async function formatMcpArchitectureStatus(config) {
   ].join("\n");
 }
 
-function getDsClient(config) {
+const KNOWN_PROJECTS = {
+  tiktok:  { code: "9892432515424",  label: "TikTok 天级" },
+  daily:   { code: "9892432515424",  label: "TikTok 天级" },
+  amazon:  { code: "15468494076768", label: "Amazon" },
+  amz:     { code: "15468494076768", label: "Amazon" },
+  shopee:  { code: "16419399873888", label: "Shopee" },
+  tiered:  { code: "9903013351008",  label: "分级任务" },
+  hourly:  { code: "9892430281952",  label: "小时任务" },
+  test:    { code: "9895112718944",  label: "测试库" },
+};
+
+// Map<chatId, projectKey> — session-level project switch via /use
+const sessionProjectByChat = new Map();
+
+function getEffectiveProjectCode(chatId, override, config) {
   const env = loadDsEnv();
-  const projectCode = config.dsProjectCode || env.projectCode;
+  const defaultCode = config.dsProjectCode || env.projectCode;
+  const key = String(override || sessionProjectByChat.get(chatId) || "").toLowerCase();
+  if (!key) return defaultCode;
+  const p = KNOWN_PROJECTS[key];
+  if (p) return p.code;
+  if (/^\d+$/.test(key)) return key;
+  return defaultCode;
+}
+
+function projectLabel(codeOrKey) {
+  const key = String(codeOrKey || "").toLowerCase();
+  const byKey = KNOWN_PROJECTS[key];
+  if (byKey) return byKey.label;
+  const byCode = Object.values(KNOWN_PROJECTS).find((p) => p.code === codeOrKey);
+  return byCode ? byCode.label : codeOrKey;
+}
+
+function getDsClient(config, projectCode = null) {
+  const env = loadDsEnv();
   return new Ds32Client({
     apiUrl: env.apiUrl,
     apiToken: env.apiToken,
-    projectCode,
+    projectCode: projectCode || config.dsProjectCode || env.projectCode,
   });
 }
 
@@ -458,8 +490,29 @@ async function runCommand(config, command, message) {
     };
   }
   if (name === "mcp") return formatMcpArchitectureStatus(config);
+  if (name === "use" || name === "switch-project") {
+    const key = String(command[1] || "").toLowerCase();
+    if (!key) {
+      const cur = sessionProjectByChat.get(message?.chatId);
+      const curLabel = cur ? projectLabel(cur) : `默认（${projectLabel(config.dsProjectCode)}）`;
+      const list = Object.entries(KNOWN_PROJECTS)
+        .filter(([, v], i, arr) => arr.findIndex(([, vv]) => vv.code === v.code) === i)
+        .map(([k, v]) => `${k} → ${v.label}（${v.code}）`)
+        .join("\n");
+      return `当前项目：${curLabel}\n\n可切换：\n${list}\n\n用法：/use <名称>`;
+    }
+    if (!KNOWN_PROJECTS[key]) {
+      const keys = [...new Set(Object.keys(KNOWN_PROJECTS))].join(" ");
+      return `未知项目「${key}」，可选：${keys}`;
+    }
+    sessionProjectByChat.set(message.chatId, key);
+    const p = KNOWN_PROJECTS[key];
+    return `已切换到 **${p.label}**（project: ${p.code}）\n本群后续指令均使用此项目。\n恢复默认：/use tiktok`;
+  }
   if (name === "board" || name === "countries" || name === "country-board") {
-    const ds = getDsClient(config);
+    const projectOverride = KNOWN_PROJECTS[String(command[1] || "").toLowerCase()] ? command[1] : null;
+    const projectCode = getEffectiveProjectCode(message?.chatId, projectOverride, config);
+    const ds = getDsClient(config, projectCode);
     const board = await listCountryDailyBoard(ds, {});
     return {
       card: boardCard(board),
@@ -467,18 +520,17 @@ async function runCommand(config, command, message) {
     };
   }
   if (name === "progress" || name === "status-country") {
-    // /progress              → all RUNNING with stage dig
-    // /progress id|vn|th…    → that country only
+    // /progress              → all RUNNING (effective project)
+    // /progress <project>    → one-off project override
+    // /progress id|vn|th…   → filter by country
     const raw = String(command[1] || "").trim().toLowerCase();
-    const country =
-      resolveCountryCode(raw) ||
-      (raw && /^[a-z]{2}$/.test(raw) ? raw : null) ||
-      null;
-    const ds = getDsClient(config);
-    const result = await listRunningProgress(ds, {
-      country,
-      pageSize: 20,
-    });
+    const projectOverride = KNOWN_PROJECTS[raw] ? raw : null;
+    const country = projectOverride
+      ? null
+      : resolveCountryCode(raw) || (raw && /^[a-z]{2}$/.test(raw) ? raw : null) || null;
+    const projectCode = getEffectiveProjectCode(message?.chatId, projectOverride, config);
+    const ds = getDsClient(config, projectCode);
+    const result = await listRunningProgress(ds, { country, pageSize: 20 });
     const env = loadDsEnv();
     return {
       card: runningCard({
@@ -487,7 +539,7 @@ async function runCommand(config, command, message) {
         uiUrlBuilder: (inst) =>
           buildProcessInstanceUiUrl({
             apiUrl: env?.apiUrl,
-            projectCode: config.dsProjectCode || env?.projectCode,
+            projectCode,
             processInstanceId: inst.id,
           }),
       }),
@@ -495,8 +547,11 @@ async function runCommand(config, command, message) {
     };
   }
   if (name === "failed") {
-    const n = Math.min(Math.max(Number(command[1] || 8) || 8, 1), 20);
-    const ds = getDsClient(config);
+    const firstArg = String(command[1] || "").toLowerCase();
+    const projectOverride = KNOWN_PROJECTS[firstArg] ? firstArg : null;
+    const n = Math.min(Math.max(Number(projectOverride ? command[2] : command[1]) || 8, 1), 20);
+    const projectCode = getEffectiveProjectCode(message?.chatId, projectOverride, config);
+    const ds = getDsClient(config, projectCode);
     const page = await ds.listProcessInstances({ stateType: "FAILURE", pageSize: n });
     const top = page?.totalList?.[0];
     if (top?.id && message?.chatId) lastFailureByChat.set(message.chatId, Number(top.id));
@@ -510,7 +565,7 @@ async function runCommand(config, command, message) {
         uiUrlBuilder: (row) =>
           buildProcessInstanceUiUrl({
             apiUrl: env.apiUrl,
-            projectCode: config.dsProjectCode || env.projectCode,
+            projectCode,
             processInstanceId: row.id,
             processDefinitionCode: row.processDefinitionCode,
           }),
@@ -555,10 +610,11 @@ async function runCommand(config, command, message) {
         jobMin = Number(args[3] || 5) || 5;
       }
     } else if (args[0] === "project" || args[0] === "--project") {
-      projectCode = args[1];
-      if (!projectCode) {
-        return "Usage: /slow project <projectCode> [n] [stageMinutes] [jobMinutes]";
+      const rawArg = String(args[1] || "");
+      if (!rawArg) {
+        return "Usage: /slow project <名称或projectCode> [n] [stageMinutes] [jobMinutes]\n可选名称：tiktok amazon shopee tiered hourly test";
       }
+      projectCode = getEffectiveProjectCode(message?.chatId, rawArg, config);
       pageSize = Math.min(Math.max(Number(args[2] || 20) || 20, 1), 50);
       stageMin = Number(args[3] || 15) || 15;
       jobMin = Number(args[4] || 5) || 5;
@@ -575,10 +631,10 @@ async function runCommand(config, command, message) {
       stageMin = Number(args[1] || 15) || 15;
       jobMin = Number(args[2] || 5) || 5;
     }
-    const ds = getDsClient(config);
-    if (projectCode) ds.projectCode = String(projectCode);
+    const effectiveCode = projectCode || getEffectiveProjectCode(message?.chatId, null, config);
+    const ds = getDsClient(config, effectiveCode);
     const result = await ds.findSlowStageJobs({
-      projectCode: ds.projectCode,
+      projectCode: effectiveCode,
       pageSize,
       processInstanceId,
       stageMinSec: stageMin * 60,
@@ -601,11 +657,11 @@ async function runCommand(config, command, message) {
         uiUrlBuilder: (hit) =>
           buildProcessInstanceUiUrl({
             apiUrl: env.apiUrl,
-            projectCode: ds.projectCode,
+            projectCode: effectiveCode,
             processInstanceId: hit.workflowId,
           }),
       }),
-      text: `project ${ds.projectCode}\n${body}`,
+      text: `project ${effectiveCode}\n${body}`,
     };
   }
   if (name === "log") {
@@ -656,7 +712,7 @@ async function runCommand(config, command, message) {
     const env = loadDsEnv();
     const uiUrl = buildProcessInstanceUiUrl({
       apiUrl: env.apiUrl,
-      projectCode: config.dsProjectCode || env.projectCode,
+      projectCode: getEffectiveProjectCode(message?.chatId, null, config),
       processInstanceId: id,
     });
     const text =
@@ -729,7 +785,7 @@ async function runCommand(config, command, message) {
           tasks: failed,
           uiUrl: buildProcessInstanceUiUrl({
             apiUrl: env.apiUrl,
-            projectCode: config.dsProjectCode || env.projectCode,
+            projectCode: getEffectiveProjectCode(message?.chatId, null, config),
             processInstanceId: wfId,
             processDefinitionCode: inst?.processDefinitionCode,
           }),
@@ -765,7 +821,7 @@ async function runCommand(config, command, message) {
     const uiUrl = pending.processInstanceId
       ? buildProcessInstanceUiUrl({
           apiUrl: env.apiUrl,
-          projectCode: config.dsProjectCode || env.projectCode,
+          projectCode: getEffectiveProjectCode(message?.chatId, null, config),
           processInstanceId: pending.processInstanceId,
           processDefinitionCode: inst?.processDefinitionCode,
         })
@@ -919,7 +975,7 @@ async function handleDiagnose(config, processInstanceId, message) {
   const env = loadDsEnv();
   const uiUrl = buildProcessInstanceUiUrl({
     apiUrl: env.apiUrl,
-    projectCode: config.dsProjectCode || env.projectCode,
+    projectCode: getEffectiveProjectCode(message?.chatId, null, config),
     processInstanceId: instId,
     processDefinitionCode: inst?.processDefinitionCode,
   });
@@ -979,7 +1035,7 @@ async function handleConfirm(config, message, accepted) {
     pending.processInstanceId != null
       ? buildProcessInstanceUiUrl({
           apiUrl: env.apiUrl,
-          projectCode: config.dsProjectCode || env.projectCode,
+          projectCode: getEffectiveProjectCode(message?.chatId, null, config),
           processInstanceId: pending.processInstanceId,
         })
       : "";
@@ -1062,7 +1118,7 @@ async function handleAlert(config, alertText, message) {
       inst: evidence.inst || { id: evidence.processInstanceId },
       classification: evidence.classification,
       highlight: evidence.highlight,
-      projectCode: config.dsProjectCode || env.projectCode,
+      projectCode: getEffectiveProjectCode(message?.chatId, null, config),
       apiUrl: env.apiUrl,
       dsReadonly: config.dsReadonly,
     };
@@ -1838,7 +1894,7 @@ async function handleCardAction(action) {
       const env = loadDsEnv();
       const uiUrl = buildProcessInstanceUiUrl({
         apiUrl: env.apiUrl,
-        projectCode: config.dsProjectCode || env.projectCode,
+        projectCode: getEffectiveProjectCode(chatId, null, config),
         processInstanceId: id,
       });
       const card = confirmCard({
@@ -1880,7 +1936,7 @@ async function handleCardAction(action) {
       const uiUrl = processInstanceId
         ? buildProcessInstanceUiUrl({
             apiUrl: env.apiUrl,
-            projectCode: config.dsProjectCode || env.projectCode,
+            projectCode: getEffectiveProjectCode(chatId, null, config),
             processInstanceId,
           })
         : "";
@@ -1942,7 +1998,7 @@ async function handleCardAction(action) {
         pending.processInstanceId != null
           ? buildProcessInstanceUiUrl({
               apiUrl: env.apiUrl,
-              projectCode: config.dsProjectCode || env.projectCode,
+              projectCode: getEffectiveProjectCode(chatId, null, config),
               processInstanceId: pending.processInstanceId,
             })
           : "";
