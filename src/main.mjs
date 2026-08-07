@@ -834,6 +834,7 @@ async function runCommand(config, command, message) {
       kind: "execute",
       processInstanceId: id,
       executeType,
+      projectCode,
       openId: message.senderId,
       summary: opLabel,
     });
@@ -899,6 +900,7 @@ async function runCommand(config, command, message) {
         kind: "force-success",
         taskInstanceId: taskId,
         processInstanceId: task?.processInstanceId ? Number(task.processInstanceId) : undefined,
+        projectCode: getEffectiveProjectCode(message?.chatId, null, config),
         openId: message.senderId,
         summary: `强制成功 #${taskId} ${label}`,
       });
@@ -1206,7 +1208,7 @@ async function handleConfirm(config, message, accepted) {
 }
 
 async function executePendingWrite(config, pending) {
-  const ds = getDsClient(config);
+  const ds = getDsClient(config, pending.projectCode || null);
   const auditBase = {
     openId: pending.openId || "unknown",
     action: pending.kind,
@@ -2028,6 +2030,7 @@ async function handleCardAction(action) {
         kind: "execute",
         processInstanceId: id,
         executeType,
+        projectCode: v.projectCode || getEffectiveProjectCode(chatId, null, config),
         openId: action.openId,
         summary: `实例 #${id}`,
       });
@@ -2069,6 +2072,7 @@ async function handleCardAction(action) {
         kind: "force-success",
         taskInstanceId: taskId,
         processInstanceId,
+        projectCode: v.projectCode || getEffectiveProjectCode(chatId, null, config),
         openId: action.openId,
         summary: `强制成功任务 #${taskId}`,
       });
