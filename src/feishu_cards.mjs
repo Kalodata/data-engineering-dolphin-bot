@@ -358,17 +358,29 @@ export function confirmCard({
   executeType,
   uiUrl = "",
   showRerunOptions = false,
+  instanceContext = null, // { project, country, dataDate, workflowName }
 } = {}) {
   const lines = [];
   const link = uiLinkMd(uiUrl, processInstanceId);
   if (link) lines.push(link);
+
+  // Rich context: project / country / dataDate / workflowName
+  if (instanceContext) {
+    if (instanceContext.project)      lines.push(`**项目：** ${instanceContext.project}`);
+    if (instanceContext.country)      lines.push(`**国家：** ${instanceContext.country.toUpperCase()}`);
+    if (instanceContext.dataDate)     lines.push(`**数据日：** ${instanceContext.dataDate}`);
+    if (instanceContext.workflowName) lines.push(`**工作流：** ${instanceContext.workflowName}`);
+    lines.push("");
+  }
+
   lines.push(`**操作：** ${summary || "?"}`);
-  if (risk) lines.push(`**风险：** ${risk}`);
+  if (risk) lines.push(`⚠️ **风险：** ${risk}`);
   lines.push("5 分钟内有效。点选项或回复 YES / 确认。");
 
   const els = [md(lines.join("\n"))];
 
-  if (showRerunOptions || kind === "execute") {
+  if (showRerunOptions) {
+    // Used by alert-card flow: user picks rerun type here
     els.push(md("**重跑方式（点即选并确认）：**"));
     els.push(
       actionRow([
@@ -407,10 +419,14 @@ export function confirmCard({
       ]),
     );
   } else {
+    const confirmLabel =
+      executeType === "REPEAT_RUNNING" ? "确认整实例重跑" :
+      executeType === "START_FAILURE_TASK_PROCESS" ? "确认从失败处恢复" :
+      "确认执行";
     els.push(
       actionRow([
         button({
-          label: "确认执行",
+          label: confirmLabel,
           action: "confirm_yes",
           type: "danger",
           value: {

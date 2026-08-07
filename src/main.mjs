@@ -16,10 +16,13 @@ import {
   formatFailedList,
   formatPracticalDiagnosis,
   formatProgressReport,
+  formatSimpleBoard,
   formatSlowStageJobs,
   formatTaskList,
+  getGlobalParam,
   interpretNaturalLanguage,
   listCountryDailyBoard,
+  listSimpleBoard,
   listRunningProgress,
   loadDsEnv,
   WH_STAGE_NAME_RE,
@@ -416,6 +419,10 @@ export async function formatMcpArchitectureStatus(config) {
   ].join("\n");
 }
 
+// Force-success is only allowed on leaf QUALITY TASK nodes (taskType=SHELL, name~=QUALITY TASK).
+// Prevents accidentally skipping stage-level or sub-workflow nodes.
+const FORCE_SUCCESS_TASK_NAME_RE = /quality[\s_-]?task/i;
+
 const KNOWN_PROJECTS = {
   tiktok:  { code: "9892432515424",  label: "TikTok 天级" },
   daily:   { code: "9892432515424",  label: "TikTok 天级" },
@@ -513,11 +520,12 @@ async function runCommand(config, command, message) {
     const projectOverride = KNOWN_PROJECTS[String(command[1] || "").toLowerCase()] ? command[1] : null;
     const projectCode = getEffectiveProjectCode(message?.chatId, projectOverride, config);
     const ds = getDsClient(config, projectCode);
-    const board = await listCountryDailyBoard(ds, {});
-    return {
-      card: boardCard(board),
-      text: formatCountryDailyBoard(board),
-    };
+    if (projectCode === KNOWN_PROJECTS.tiktok.code) {
+      const board = await listCountryDailyBoard(ds, {});
+      return { card: boardCard(board), text: formatCountryDailyBoard(board) };
+    }
+    const board = await listSimpleBoard(ds, {});
+    return { card: boardCard(board), text: formatSimpleBoard(board) };
   }
   if (name === "progress" || name === "status-country") {
     // /progress              → all RUNNING (effective project)
@@ -698,16 +706,30 @@ async function runCommand(config, command, message) {
     lastFailureByChat.set(message.chatId, id);
     const executeType =
       name === "rerun-all" ? "REPEAT_RUNNING" : "START_FAILURE_TASK_PROCESS";
-    const label =
+    const opLabel =
       executeType === "REPEAT_RUNNING"
-        ? "整实例重跑 REPEAT_RUNNING"
-        : "从失败处恢复 START_FAILURE_TASK_PROCESS（只重跑失败任务）";
+        ? "整实例重跑（影响所有任务节点）"
+        : "从失败处恢复（只重跑失败任务）";
+
+    // Fetch instance context for rich confirmation
+    const ds = getDsClient(config, getEffectiveProjectCode(message?.chatId, null, config));
+    let instanceContext = null;
+    try {
+      const inst = await ds.getProcessInstance(id);
+      instanceContext = {
+        project: projectLabel(getEffectiveProjectCode(message?.chatId, null, config)),
+        country: getGlobalParam(inst, "country_code") || null,
+        dataDate: getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || null,
+        workflowName: inst?.name || `#${id}`,
+      };
+    } catch { /* ignore — still show confirm without context */ }
+
     const pending = pendingConfirms.set(message.chatId, {
       kind: "execute",
       processInstanceId: id,
       executeType,
       openId: message.senderId,
-      summary: `实例 #${id} → ${label}`,
+      summary: opLabel,
     });
     const env = loadDsEnv();
     const uiUrl = buildProcessInstanceUiUrl({
@@ -715,23 +737,22 @@ async function runCommand(config, command, message) {
       projectCode: getEffectiveProjectCode(message?.chatId, null, config),
       processInstanceId: id,
     });
-    const text =
-      `将要对实例 #${id} 执行重跑（可选从失败处 / 整实例）。\n` +
-      `仅限当前配置的 project。\n` +
-      `5 分钟内点确认卡选项或回复 YES / 确认；取消回复 NO / 取消。`;
     return {
       card: confirmCard({
-        title: "确认重跑？",
-        summary: `实例 #${id}`,
-        risk: "会改生产实例状态；不改工作流定义。整实例重跑影响更大。",
+        title: executeType === "REPEAT_RUNNING" ? "确认整实例重跑？" : "确认从失败处恢复？",
+        summary: opLabel,
+        risk: executeType === "REPEAT_RUNNING"
+          ? "会重跑全部任务节点，影响范围最大。"
+          : "只重跑失败节点，影响范围小。",
         nonce: pending.nonce,
         kind: pending.kind,
         processInstanceId: id,
         executeType,
         uiUrl,
-        showRerunOptions: true,
+        showRerunOptions: false,
+        instanceContext,
       }),
-      text,
+      text: `将要对实例 #${id} 执行：${opLabel}\n5 分钟内确认或取消。`,
     };
   }
   if (name === "force-success" || name === "fs") {
@@ -772,8 +793,20 @@ async function runCommand(config, command, message) {
           /FAILURE|KILL/i.test(String(t.state || "")),
         );
       }
+      // Only allow force-success on QUALITY TASK leaf nodes (not SUB_PROCESS)
+      const eligible = failed.filter(
+        (t) => t.taskType !== "SUB_PROCESS" && FORCE_SUCCESS_TASK_NAME_RE.test(t.name || ""),
+      );
+      if (!eligible.length) {
+        const names = failed.map((t) => `${t.name}(${t.taskType || "?"})`).join("、") || "无";
+        return (
+          `当前实例 #${wfId} 无可强制成功的节点。\n` +
+          `强制成功仅限最小叶子节点（名称含 "QUALITY TASK"，非子流程类型）。\n` +
+          `当前失败任务：${names}`
+        );
+      }
       lastFailureByChat.set(message.chatId, wfId);
-      const text = formatFailedTasksPickList(wfId, failed, {
+      const text = formatFailedTasksPickList(wfId, eligible, {
         inst,
         instName: inst?.name || "",
       });
@@ -782,7 +815,7 @@ async function runCommand(config, command, message) {
         card: forceSuccessPickCard({
           processInstanceId: wfId,
           instName: inst?.name || "",
-          tasks: failed,
+          tasks: eligible,
           uiUrl: buildProcessInstanceUiUrl({
             apiUrl: env.apiUrl,
             projectCode: getEffectiveProjectCode(message?.chatId, null, config),
@@ -797,6 +830,13 @@ async function runCommand(config, command, message) {
     const task = await ds.resolveTaskInstance(taskId, {
       processInstanceId: lastFailureByChat.get(message.chatId) || null,
     });
+    // Restrict: only QUALITY TASK leaf nodes allowed
+    if (task && (task.taskType === "SUB_PROCESS" || !FORCE_SUCCESS_TASK_NAME_RE.test(task.name || ""))) {
+      return (
+        `任务 #${taskId}（${task.name || "?"}，类型 ${task.taskType || "?"}）不符合强制成功条件。\n` +
+        `强制成功仅限最小叶子节点（名称含 "QUALITY TASK"，非子流程类型）。`
+      );
+    }
     let inst = null;
     if (task?.processInstanceId) {
       try {
@@ -826,23 +866,27 @@ async function runCommand(config, command, message) {
           processDefinitionCode: inst?.processDefinitionCode,
         })
       : "";
-    const text =
-      `将要强制成功：\n` +
-      `#${taskId}  ${label}\n\n` +
-      `风险：跳过真实执行；下游可能还需「重跑 <实例id>」。\n` +
-      `点确认卡或 YES / 确认 · NO / 取消`;
+    const fsContext = inst
+      ? {
+          project: projectLabel(getEffectiveProjectCode(message?.chatId, null, config)),
+          country: getGlobalParam(inst, "country_code") || null,
+          dataDate: getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || null,
+          workflowName: inst.name || null,
+        }
+      : null;
     return {
       card: confirmCard({
         title: "确认强制成功？",
-        summary: pending.summary,
+        summary: `${task?.name || `任务 #${taskId}`}（QUALITY TASK）`,
         risk: "跳过真实执行；下游可能还需重跑实例。",
         nonce: pending.nonce,
         kind: pending.kind,
         taskInstanceId: taskId,
         processInstanceId: pending.processInstanceId,
         uiUrl,
+        instanceContext: fsContext,
       }),
-      text,
+      text: `将要强制成功任务 #${taskId}（${label}）。\n5 分钟内确认或取消。`,
     };
   }
   if (name === "yes" || name === "YES" || name === "确认") {

@@ -1177,7 +1177,7 @@ export function parseDurationToSeconds(duration) {
   return Number.isFinite(asNum) ? asNum : 0;
 }
 
-function getGlobalParam(inst, prop) {
+export function getGlobalParam(inst, prop) {
   try {
     const gp =
       typeof inst?.globalParams === "string"
@@ -1576,17 +1576,19 @@ export const COUNTRY_TZ = {
 };
 
 /**
- * Returns the UTC Date when "today's 02:00 local" occurs in the country's timezone.
- * "Today" is relative to what the country's clock currently shows.
+ * Returns the UTC Date when "(dataDate + 1 day) 02:00 local" occurs in the country's timezone.
+ * dataDate is the workflow data date (YYYY-MM-DD). Workflows process the previous day's data,
+ * so they are scheduled to start at 02:00 local on the NEXT day after the data date.
  */
-export function getScheduledStartUTC(country, now = new Date()) {
+export function getScheduledStartUTC(country, dataDate) {
   const tz = COUNTRY_TZ[country];
-  if (!tz) return null;
-  // Local date in the country (sv-SE gives YYYY-MM-DD)
-  const localDate = new Intl.DateTimeFormat("sv-SE", { timeZone: tz }).format(now);
-  // Treat "YYYY-MM-DD 02:00:00" as UTC — this gives us a naive timestamp
-  const naiveMs = Date.parse(`${localDate}T02:00:00.000Z`);
-  // Format that naive timestamp back in the local timezone to see the actual local time it represents
+  if (!tz || !dataDate) return null;
+  // dataDate is "YYYY-MM-DD"; scheduled day = dataDate + 1
+  const scheduledDay = new Date(Date.parse(`${dataDate}T00:00:00.000Z`) + 86400000);
+  const scheduledDateStr = new Intl.DateTimeFormat("sv-SE", { timeZone: "UTC" }).format(scheduledDay);
+  // Treat "YYYY-MM-DD 02:00:00" as UTC to get naive timestamp
+  const naiveMs = Date.parse(`${scheduledDateStr}T02:00:00.000Z`);
+  // Re-read that naive timestamp in local timezone to measure offset error
   const localAtNaive = new Intl.DateTimeFormat("sv-SE", {
     timeZone: tz,
     year: "numeric",
@@ -1596,9 +1598,7 @@ export function getScheduledStartUTC(country, now = new Date()) {
     minute: "2-digit",
     second: "2-digit",
   }).format(new Date(naiveMs));
-  // Parse the local reading back as UTC to measure the offset error
   const naiveLocalMs = Date.parse(localAtNaive.replace(" ", "T") + "Z");
-  // Correct the naive timestamp by the offset error to get the actual UTC time for local 02:00
   return new Date(naiveMs + (naiveMs - naiveLocalMs));
 }
 
@@ -1739,7 +1739,7 @@ export async function listCountryDailyBoard(
       const missing = known.filter((c) => !byCountry.has(c));
       const overdue = missing
         .filter((c) => {
-          const scheduled = getScheduledStartUTC(c, now);
+          const scheduled = getScheduledStartUTC(c, dataDate);
           return scheduled != null && now.getTime() > scheduled.getTime();
         })
         .map((c) => ({ country: c, localTime: getLocalHHMM(c, now) }));
@@ -1747,6 +1747,52 @@ export async function listCountryDailyBoard(
     });
 
   return { dayToken: token, groups };
+}
+
+/**
+ * Simple board for non-TikTok projects: list recent instances, group by start date.
+ * No country-tracking, no missing/overdue logic.
+ */
+export async function listSimpleBoard(ds, { pageSize = 50 } = {}) {
+  const token = todayYmdShanghai();
+  const page = await ds.listProcessInstances({ pageSize });
+  const rows = (page?.totalList || []).map((row) => ({
+    id: row.id,
+    name: String(row.name || ""),
+    state: String(row.state || ""),
+    startTime: row.startTime || null,
+    endTime: row.endTime || null,
+    dataDate: String(row.startTime || "").slice(0, 10) || "unknown",
+    country: null,
+  }));
+
+  const byDate = new Map();
+  for (const r of rows) {
+    if (!byDate.has(r.dataDate)) byDate.set(r.dataDate, []);
+    byDate.get(r.dataDate).push(r);
+  }
+
+  const groups = [...byDate.entries()]
+    .sort(([a], [b]) => b.localeCompare(a))
+    .map(([dataDate, dateRows]) => ({ dataDate, rows: dateRows, missing: [], overdue: [] }));
+
+  return { dayToken: token, groups };
+}
+
+export function formatSimpleBoard({ dayToken, groups = [] } = {}) {
+  const lines = [`【项目看板】查询日期 ${dayToken || "?"}`, ""];
+  for (const { dataDate, rows } of groups) {
+    lines.push(`=== ${dataDate} ===`);
+    const running = rows.filter((r) => /RUNNING/i.test(r.state));
+    const success = rows.filter((r) => /SUCCESS/i.test(r.state));
+    const other = rows.filter((r) => !/RUNNING|SUCCESS/i.test(r.state));
+    if (running.length) lines.push(`在跑（${running.length}）：${running.map((r) => r.name).join("、")}`);
+    if (success.length) lines.push(`已完成（${success.length}）：${success.map((r) => r.name).join("、")}`);
+    if (other.length) lines.push(`其它（${other.length}）：${other.map((r) => `${r.name}(${r.state})`).join("、")}`);
+    lines.push("");
+  }
+  if (!groups.length) lines.push("暂无数据");
+  return lines.join("\n");
 }
 
 export function formatCountryDailyBoard({ dayToken, groups = [] } = {}) {
