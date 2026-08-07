@@ -77,6 +77,7 @@ import {
   createConfirmStore,
 } from "./card_callback.mjs";
 import { createAuditLog } from "./audit_log.mjs";
+import { startBoardPush } from "./board_push.mjs";
 
 loadDotEnv(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.env"));
 
@@ -239,6 +240,14 @@ function loadConfig(configPath) {
         encryptKey: String(c.encrypt_key || process.env.FEISHU_ENCRYPT_KEY || ""),
       };
     })(),
+    boardPush: (() => {
+      const bp = raw.board_push || {};
+      return {
+        enabled: bp.enabled === true,
+        chatId: String(bp.chat_id || ""),
+        hours: Array.isArray(bp.hours) ? bp.hours.map(Number) : [9, 11, 15, 19],
+      };
+    })(),
   };
   // Merge allowlist.json (committed to git) into allowed_users / notify_user_ids
   const allowlistPath = path.resolve(path.dirname(resolvedConfigPath), "allowlist.json");
@@ -250,6 +259,11 @@ function loadConfig(configPath) {
         config.alertWatch.notifyUserIds.push(id);
       }
     }
+  }
+
+  // board_push chat is implicitly allowed to send commands
+  if (config.boardPush?.enabled && config.boardPush?.chatId) {
+    config.alertChatIds.add(config.boardPush.chatId);
   }
 
   // Effective poll interval after webhook mode is known
@@ -2228,6 +2242,13 @@ async function main() {
     },
   });
 
+  const boardPusher = startBoardPush({
+    config,
+    getDs: () => getDsClient(config, KNOWN_PROJECTS.tiktok.code),
+    sendText,
+    log: (line) => console.error(line),
+  });
+
   let dsIngress = null;
   if (config.dsAlertWebhook?.enabled) {
     dsIngress = startDsAlertIngress({
@@ -2278,6 +2299,11 @@ async function main() {
     }
     try {
       failureWatcher?.stop?.();
+    } catch {
+      // ignore
+    }
+    try {
+      boardPusher?.stop?.();
     } catch {
       // ignore
     }

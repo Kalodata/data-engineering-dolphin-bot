@@ -48,5 +48,10 @@
   },
   "model": "auto",
   "max_reply_chars": 6000,
-  "alert_prompt_path": "/Users/you/.cursor/agents/alert/PROMPT.md"
+  "alert_prompt_path": "/Users/you/.cursor/agents/alert/PROMPT.md",
+  "board_push": {
+    "enabled": false,
+    "chat_id": "oc_xxx",
+    "hours": [9, 11, 15, 19]
+  }
 }
