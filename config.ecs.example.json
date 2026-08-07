@@ -47,5 +47,10 @@
     "remote": "/app"
   },
   "model": "auto",
-  "max_reply_chars": 6000
+  "max_reply_chars": 6000,
+  "board_push": {
+    "enabled": true,
+    "chat_id": "oc_39183347fc477629b45751147bfe8587",
+    "hours": [9, 11, 15, 19]
+  }
 }
