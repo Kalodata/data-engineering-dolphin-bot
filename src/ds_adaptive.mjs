@@ -1,6 +1,6 @@
 /**
- * Adaptive DS triage: NL → plan (heuristic or LLM JSON) → execute local DS tools.
- * Structure first (ids / country_code / intent family); phrasing variety → LLM planner.
+ * NL intent → structured plan (Agent JSON) → execute local DS tools.
+ * Slash commands stay in main runCommand; this module maps plans and runs DS reads.
  */
 import {
   Ds32Client,
@@ -11,7 +11,6 @@ import {
   formatFailedList,
   formatPracticalDiagnosis,
   formatProgressReport,
-  formatRunningList,
   formatSlowStageJobs,
   formatTaskList,
   listCountryDailyBoard,
@@ -19,147 +18,6 @@ import {
   loadDsEnv,
 } from "./ds32_client.mjs";
 import { resolveCountryCode } from "./country_code.mjs";
-
-export function looksLikeDsOps(text) {
-  const t = String(text || "");
-  if (!t.trim()) return false;
-  if (resolveCountryCode(t)) return true;
-  return /(数仓|分层|stage|job|慢|耗时|超时|分区|country|失败|挂了|diagnose|日志|beeline|jdbc|workflow|实例|任务|ADS|DWS|DWM|DWD|ODS|DIM|前置检测|dolphinscheduler|dolphin|最近失败|失败列表|任务列表|有哪些任务|查一下.*实例|看看.*实例|workflow\/instances|在跑|正在跑|运行中|RUNNING|任务状态|工作流状态|调度状态|检查.*状态|进度|哪一步|天级|哪些国家|各国)/i.test(
-    t,
-  );
-}
-
-/** Heuristic plan is concrete enough to skip LLM planner. */
-export function heuristicPlanIsConcrete(plan) {
-  if (!plan?.tool || plan.tool === "chat") return false;
-  if (plan.tool === "progress" && plan._soft) return false;
-  if (
-    ["failed", "running", "progress", "country_board", "overview", "diagnose", "tasks", "log"].includes(
-      plan.tool,
-    )
-  )
-    return true;
-  if (plan.tool === "slow" && (plan.country || plan.layers === "wh")) return true;
-  return false;
-}
-
-export function heuristicDsPlan(text, { defaultProjectCode } = {}) {
-  const t = String(text || "");
-  const country = resolveCountryCode(t);
-
-  const wantWh =
-    /(数仓|分层|ADS|DWS|DWM|DWD|ODS|DIM|前置.*(不要|别|跳过)|不要.*前置)/i.test(t);
-  const wantSlow =
-    /慢|耗时|超时|多久|卡很久|跑太久|stage\s*[≥>=]|哪些\s*stage|慢\s*(job|任务|节点)/i.test(t);
-  const wantFail =
-    /失败|挂了|报错|failed|diagnose|诊断|什么原因|怎么挂|最近失败|失败列表/i.test(t);
-  const wantRunStatus =
-    /在跑|正在跑|运行中|RUNNING|进度|哪一步|到哪|开始|何时|什么时候|状态|跑得|天级|分区|工作流/i.test(
-      t,
-    );
-
-  const stageMin =
-    Number((t.match(/stage\s*[≥>=]?\s*(\d+)\s*分/) || [])[1]) ||
-    Number((t.match(/超过\s*(\d+)\s*分钟.*stage|stage.*超过\s*(\d+)/i) || [])[1]) ||
-    15;
-  const jobMin =
-    Number((t.match(/job\s*[≥>=]?\s*(\d+)\s*分/) || [])[1]) ||
-    Number((t.match(/超过\s*(\d+)\s*分钟.*job|job.*超过\s*(\d+)/i) || [])[1]) ||
-    5;
-
-  const urlInst = t.match(/workflow\/instances\/(\d+)/i);
-  const inst =
-    urlInst ||
-    t.match(/(?:实例|workflow|wf)\s*#?\s*(\d{5,})/i) ||
-    t.match(/\b(\d{6,8})\b/);
-  const task =
-    t.match(/(?:任务|task|job)\s*#?\s*(\d{5,})/i) ||
-    (/日志|log/i.test(t) ? t.match(/\b(\d{6,8})\b/) : null);
-
-  if (urlInst) {
-    return { tool: "diagnose", processInstanceId: Number(urlInst[1]) };
-  }
-
-  // Multi-country board:「哪些国家在跑 / 各国到哪阶段」
-  if (
-    /(哪些国家|各个国家|各国|所有国家).{0,12}(跑|运行|进度|阶段|任务|天级)|(跑|运行|进度|阶段).{0,12}(哪些国家|各国)/i.test(
-      t,
-    ) ||
-    (/(哪些国家|各国)/i.test(t) && /(跑|运行|进度|阶段|天级)/i.test(t))
-  ) {
-    return {
-      tool: "country_board",
-      pageSize: 50,
-      projectCode: defaultProjectCode || undefined,
-    };
-  }
-
-  if ((wantSlow || wantWh) && !wantFail) {
-    const useWh = wantWh || (wantSlow && Boolean(country));
-    return {
-      tool: "slow",
-      country,
-      layers: useWh ? "wh" : "all",
-      pageSize: country || useWh ? 40 : 20,
-      stageMin,
-      jobMin,
-      nestDepth: useWh ? 1 : 0,
-      projectCode: defaultProjectCode || undefined,
-    };
-  }
-
-  if (wantFail && !wantSlow) {
-    if (inst) return { tool: "diagnose", processInstanceId: Number(inst[1]) };
-    return { tool: "failed", pageSize: 8 };
-  }
-
-  if (/日志|log|beeline/i.test(t) && task) {
-    return { tool: "log", taskInstanceId: Number(task[1]) };
-  }
-  if ((/任务列表|有哪些任务|\/tasks|列任务/i.test(t) || (/任务/i.test(t) && /列表|有哪些/i.test(t))) && inst) {
-    return { tool: "tasks", processInstanceId: Number(inst[1]) };
-  }
-  if (inst && /(查|看|打开|链接|诊断).{0,24}(实例|workflow|wf)|实例\s*#?\s*\d/i.test(t) && !wantSlow) {
-    return { tool: "diagnose", processInstanceId: Number(inst[1]) };
-  }
-
-  // Any country-scoped DS ask → progress (enriched). Soft if phrasing unclear → LLM may override.
-  if (country && !wantSlow && !wantFail) {
-    return {
-      tool: "progress",
-      country,
-      pageSize: 15,
-      projectCode: defaultProjectCode || undefined,
-      _soft: !wantRunStatus,
-    };
-  }
-
-  if (
-    /(在跑|正在跑|运行中|正在运行|哪些.*在跑|有哪些.*跑|当前.*跑|RUNNING_EXECUTION|\bRUNNING\b|进度|哪一步)/i.test(
-      t,
-    ) &&
-    !wantSlow
-  ) {
-    return {
-      tool: "progress",
-      country: null,
-      pageSize: 15,
-      projectCode: defaultProjectCode || undefined,
-    };
-  }
-
-  if (
-    /(检查|查看|看看)?.{0,6}(任务|工作流|实例|调度|作业).{0,4}状态|任务状态|工作流状态|调度状态|跑得怎么样|现在(在)?跑(什么|啥)/i.test(
-      t,
-    ) &&
-    !wantSlow &&
-    !wantFail
-  ) {
-    return { tool: "overview", pageSize: 10 };
-  }
-
-  return { tool: "chat", country };
-}
 
 export function parsePlannerJson(raw) {
   const text = String(raw || "").trim();
@@ -177,34 +35,130 @@ export function parsePlannerJson(raw) {
 
 export function buildPlannerPrompt(userText, historyBlock, projectCode) {
   const guessedCountry = resolveCountryCode(userText);
-  return `你是 DolphinScheduler 只读排查的「规划器」。不要执行 shell，不要读大文件，不要改代码。
-只输出一个 JSON 对象（不要 markdown 解释），从下列工具里选一个：
+  return `你是 DolphinScheduler 飞书 bot 的「意图解析器」。不要执行 shell，不要读大文件，不要改代码，不要直接重跑。
+只输出一个 JSON 对象（不要 markdown 围栏或解释）。
 
-{"tool":"slow","country":"id|vn|th|my|…|null","layers":"wh|all","pageSize":40,"stageMin":15,"jobMin":5,"nestDepth":1}
-{"tool":"failed","pageSize":8}
-{"tool":"progress","country":"id|vn|th|my|…|null","pageSize":15}
-{"tool":"country_board","pageSize":50}
-{"tool":"overview","pageSize":10}
-{"tool":"diagnose","processInstanceId":123}
-{"tool":"tasks","processInstanceId":123}
-{"tool":"log","taskInstanceId":123}
-{"tool":"chat"}
+可选 tool：
+{"tool":"failed","pageSize":8,"confidence":"high|low"}
+{"tool":"progress","country":"jp|id|vn|…|null","pageSize":15,"confidence":"high|low"}
+{"tool":"country_board","confidence":"high|low"}
+{"tool":"overview","pageSize":10,"confidence":"high|low"}
+{"tool":"diagnose","processInstanceId":123,"confidence":"high|low"}
+{"tool":"tasks","processInstanceId":123,"confidence":"high|low"}
+{"tool":"log","taskInstanceId":123,"confidence":"high|low"}
+{"tool":"slow","country":"id|null","layers":"wh|all","pageSize":40,"stageMin":15,"jobMin":5,"nestDepth":1,"confidence":"high|low"}
+{"tool":"rerun","processInstanceId":123,"confidence":"high|low"}
+{"tool":"rerun_all","processInstanceId":123,"confidence":"high|low"}
+{"tool":"force_success","taskInstanceId":123,"confidence":"high|low"}
+{"tool":"clarify","ask":"用中文问用户缺什么或如何拆分","confidence":"low"}
+{"tool":"chat","confidence":"high|low"}
 
-规则（按意图选工具，不要死抠例句）：
-- 用户问「哪些国家在跑 / 各国到哪阶段 / 各国进度」→ country_board（今日各国天级汇总）
-- 用户提到某国/分区的天级任务、开始时间、跑到哪、进度 → progress，并填 country
-- 已解析到的国家提示：${guessedCountry || "无"}（若合理请写入 country）
-- 数仓层 / ADS|DWS|DWM|DWD|ODS|DIM / 不要前置检测 → slow + layers="wh"
-- 明确慢/耗时/stage 超过 → slow；禁止把「国家进度」答成 slow
-- 失败/挂了/诊断 → diagnose 或 failed
-- 全局「在跑什么」且无国家、也不是各国汇总 → progress（country null）或 overview
-- 拿不准 → {"tool":"chat"}，禁止默认 slow
+规则：
+- 只解析意图与槽位；真正的查数/重跑由程序执行，你禁止声称已经重跑
+- 各国天级汇总 → country_board
+- 某国/分区进度、在跑到哪 → progress，并填 country（已猜：${guessedCountry || "无"}）
+- 最近失败/失败列表 → failed
+- 诊断某实例 → diagnose（必须有 processInstanceId，否则 clarify）
+- 任务列表/日志 → tasks/log（缺 id 则 clarify）
+- 慢任务/数仓层 → slow；layers=wh 表示只要数仓层
+- 用户要重跑/整实例重跑/强制成功 → rerun / rerun_all / force_success；缺 id 时 clarify，让用户给实例 id 或先 /failed
+- 一句话里有多步（先看状态再条件重跑等）→ clarify，用 ask 说明请拆开，或先做哪一步；可附 steps 数组仅作说明
+- 开放问答（怎么修、为什么、解释概念）→ chat
+- 拿不准 → clarify 或 confidence=low，禁止瞎猜实例 id
 - 禁止输出「没有 DS 工具 / MCP 未配置」
 - 默认项目 code=${projectCode}
 
 ${historyBlock ? `## 近期对话\n${historyBlock}\n` : ""}
 ## 用户
 ${userText}`;
+}
+
+/** Map Agent intent JSON → slash command for runCommand (cards / confirm flow). */
+export function planToSlashCommand(plan) {
+  if (!plan?.tool) return null;
+  const tool = String(plan.tool);
+  if (tool === "chat" || tool === "clarify") return null;
+  if (String(plan.confidence || "").toLowerCase() === "low") return null;
+
+  switch (tool) {
+    case "failed":
+      return ["/failed"];
+    case "progress":
+    case "running":
+      return plan.country ? ["/progress", String(plan.country)] : ["/progress"];
+    case "country_board":
+    case "board":
+      return ["/board"];
+    case "diagnose":
+      return plan.processInstanceId
+        ? ["/diagnose", String(plan.processInstanceId)]
+        : ["/diagnose"];
+    case "tasks":
+      return plan.processInstanceId ? ["/tasks", String(plan.processInstanceId)] : null;
+    case "log":
+      return plan.taskInstanceId ? ["/log", String(plan.taskInstanceId)] : null;
+    case "slow": {
+      if (plan.layers === "wh" || plan.layers === "warehouse") {
+        const cmd = ["/slow", "wh"];
+        if (plan.country) cmd.push(String(plan.country));
+        return cmd;
+      }
+      // country-only / generic slow: keep executeDsPlan path
+      return null;
+    }
+    case "rerun":
+      return plan.processInstanceId
+        ? ["/rerun", String(plan.processInstanceId)]
+        : ["/rerun"];
+    case "rerun_all":
+      return plan.processInstanceId
+        ? ["/rerun-all", String(plan.processInstanceId)]
+        : ["/rerun-all"];
+    case "force_success":
+      return plan.taskInstanceId
+        ? ["/force-success", String(plan.taskInstanceId)]
+        : ["/force-success"];
+    default:
+      return null;
+  }
+}
+
+export function needsClarify(plan) {
+  if (!plan || !plan.tool) return true;
+  if (plan.tool === "clarify") return true;
+  if (String(plan.confidence || "").toLowerCase() === "low") return true;
+  if (Array.isArray(plan.steps) && plan.steps.length > 1) return true;
+  if (plan.tool === "tasks" && !plan.processInstanceId) return true;
+  if (plan.tool === "log" && !plan.taskInstanceId) return true;
+  if (
+    (plan.tool === "rerun" || plan.tool === "rerun_all") &&
+    !plan.processInstanceId
+  ) {
+    // allow bare rerun → program uses lastFailureByChat; not clarify
+    return false;
+  }
+  if (plan.tool === "force_success" && !plan.taskInstanceId) return false;
+  return false;
+}
+
+export function formatClarifyReply(plan) {
+  const ask = plan?.ask || plan?.message;
+  if (ask && String(ask).trim()) return String(ask).trim();
+  if (Array.isArray(plan?.steps) && plan.steps.length > 1) {
+    return (
+      `这句话包含多步（${plan.steps.join(" → ")}）。请拆开说，或改用命令：\n` +
+      `· /progress [国家]  · /failed  · /board\n` +
+      `· /diagnose <实例id>  · /rerun <实例id>`
+    );
+  }
+  return (
+    `没太确定你的意图。请再说具体一点，或直接用命令：\n` +
+    `· /failed 最近失败\n` +
+    `· /progress jp 某国进度\n` +
+    `· /board 各国天级\n` +
+    `· /diagnose <实例id>\n` +
+    `· /rerun <实例id>`
+  );
 }
 
 function getDs(config, projectCode) {
