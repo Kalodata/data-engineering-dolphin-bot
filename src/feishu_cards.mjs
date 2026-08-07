@@ -358,18 +358,19 @@ export function confirmCard({
   executeType,
   uiUrl = "",
   showRerunOptions = false,
-  instanceContext = null, // { project, country, dataDate, workflowName }
+  instanceContext = null, // { country, dataDate, workflowName }
+  taskName = null,        // force-success only: node/task name
 } = {}) {
   const lines = [];
   const link = uiLinkMd(uiUrl, processInstanceId);
   if (link) lines.push(link);
 
-  // Rich context: project / country / dataDate / workflowName
+  // Context: workflowName → taskName (force-success) → country → dataDate
   if (instanceContext) {
-    if (instanceContext.project)      lines.push(`**项目：** ${instanceContext.project}`);
+    if (instanceContext.workflowName) lines.push(`**工作流：** ${clip(instanceContext.workflowName, 60)}`);
+    if (taskName)                     lines.push(`**节点：** ${clip(taskName, 60)}`);
     if (instanceContext.country)      lines.push(`**国家：** ${instanceContext.country.toUpperCase()}`);
     if (instanceContext.dataDate)     lines.push(`**数据日：** ${instanceContext.dataDate}`);
-    if (instanceContext.workflowName) lines.push(`**工作流：** ${instanceContext.workflowName}`);
     lines.push("");
   }
 

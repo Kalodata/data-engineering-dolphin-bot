@@ -24,6 +24,7 @@ import {
   listSimpleBoard,
   listRunningProgress,
   loadDsEnv,
+  resolveInstanceByCountryDate,
   WH_STAGE_NAME_RE,
   formatTaskIdentity,
   formatFailedTasksPickList,
@@ -464,6 +465,101 @@ function getDsClient(config, projectCode = null) {
   });
 }
 
+/**
+ * Parse [project] [country] [YYYY-MM-DD] [nodeName] from command args.
+ * If command[1] is a plain number, returns it as instanceId (legacy).
+ * Returns { projectCode, country, dataDate, instanceId, nodeName }.
+ */
+function parseInstanceLookupArgs(command, chatId, config) {
+  const args = command.slice(1);
+  let idx = 0;
+
+  const first = String(args[idx] || "").toLowerCase();
+  if (!first) {
+    return { projectCode: getEffectiveProjectCode(chatId, null, config), country: null, dataDate: null, instanceId: null, nodeName: null };
+  }
+  if (/^\d+$/.test(first)) {
+    return { projectCode: getEffectiveProjectCode(chatId, null, config), country: null, dataDate: null, instanceId: Number(first), nodeName: null };
+  }
+
+  let projectOverride = null;
+  if (KNOWN_PROJECTS[first]) {
+    projectOverride = first;
+    idx++;
+  }
+
+  const countryArg = String(args[idx] || "").toLowerCase();
+  let country = null;
+  if (countryArg && /^[a-z]{2}$/.test(countryArg)) {
+    country = countryArg;
+    idx++;
+  }
+
+  const dateArg = String(args[idx] || "");
+  let dataDate = null;
+  if (dateArg && /^\d{4}-\d{2}-\d{2}$/.test(dateArg)) {
+    dataDate = dateArg;
+    idx++;
+  }
+
+  // Everything remaining is an optional node/sub-process name filter
+  const nodeName = args.slice(idx).join(" ").trim() || null;
+
+  return {
+    projectCode: getEffectiveProjectCode(chatId, projectOverride, config),
+    country,
+    dataDate,
+    instanceId: null,
+    nodeName,
+  };
+}
+
+/**
+ * Collect QUALITY TASK nodes eligible for force-success from a workflow instance.
+ * - Checks direct failed tasks (non-SUB_PROCESS).
+ * - Drills into failed SUB_PROCESS tasks via getSubProcessInstanceId.
+ * - nodeName: if provided, only drills into sub-processes whose name includes this string.
+ * Each result includes _parentName (sub-process task name) when nested.
+ */
+async function collectEligibleFsTasks(ds, processInstanceId, { nodeName = null } = {}) {
+  let page = await ds.listTaskInstances({ processInstanceId, stateType: "FAILURE", pageSize: 50 });
+  let failed = page?.totalList || [];
+  if (!failed.length) {
+    page = await ds.listTaskInstances({ processInstanceId, pageSize: 100 });
+    failed = (page?.totalList || []).filter((t) => /FAILURE|KILL/i.test(String(t.state || "")));
+  }
+
+  const eligible = [];
+  for (const t of failed) {
+    if (t.taskType === "SUB_PROCESS") {
+      // Optional: only drill into sub-processes matching nodeName
+      if (nodeName && !String(t.name || "").toLowerCase().includes(nodeName.toLowerCase())) {
+        continue;
+      }
+      try {
+        const childId = await ds.getSubProcessInstanceId(t.id);
+        if (!childId) continue;
+        let cp = await ds.listTaskInstances({ processInstanceId: childId, stateType: "FAILURE", pageSize: 50 });
+        let childFailed = cp?.totalList || [];
+        if (!childFailed.length) {
+          cp = await ds.listTaskInstances({ processInstanceId: childId, pageSize: 100 });
+          childFailed = (cp?.totalList || []).filter((ct) => /FAILURE|KILL/i.test(String(ct.state || "")));
+        }
+        for (const ct of childFailed) {
+          if (ct.taskType !== "SUB_PROCESS" && FORCE_SUCCESS_TASK_NAME_RE.test(ct.name || "")) {
+            eligible.push({ ...ct, _parentName: t.name || null });
+          }
+        }
+      } catch {
+        // ignore drill-down failure for individual sub-process
+      }
+    } else if (FORCE_SUCCESS_TASK_NAME_RE.test(t.name || "")) {
+      eligible.push(t);
+    }
+  }
+  return eligible;
+}
+
 async function runCommand(config, command, message) {
   const name = command[0].replace(/^\//, "");
   if (name === "status") {
@@ -689,39 +785,66 @@ async function runCommand(config, command, message) {
         "需要时在 config.json 设 ds_readonly=false 并重启 bot。"
       );
     }
-    let id = Number(command[1]);
+    const { projectCode, country, dataDate, instanceId } = parseInstanceLookupArgs(
+      command, message?.chatId, config,
+    );
+    const ds = getDsClient(config, projectCode);
+    const executeType = name === "rerun-all" ? "REPEAT_RUNNING" : "START_FAILURE_TASK_PROCESS";
+    const opLabel =
+      executeType === "REPEAT_RUNNING"
+        ? "整实例重跑"
+        : "从失败处恢复";
+
+    let id = instanceId;
+
+    if (!id && country) {
+      const matches = await resolveInstanceByCountryDate(ds, {
+        country,
+        dataDate,
+      });
+      if (!matches.length) {
+        return (
+          `未找到匹配实例（country=${country}${dataDate ? ` date=${dataDate}` : ""}）。\n` +
+          `可先用 /failed /progress 确认实例状态，或直接 /${name} <id>。`
+        );
+      }
+      if (matches.length > 1) {
+        const list = matches
+          .slice(0, 5)
+          .map((inst) => {
+            const dd = getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day");
+            return `#${inst.id}  ${inst.name || "?"}  数据日:${dd || "?"}  ${inst.state || ""}`;
+          })
+          .join("\n");
+        return `找到多个匹配实例，请用 /${name} <id> 精确指定：\n${list}`;
+      }
+      id = Number(matches[0].id);
+    }
+
     if (!id) id = Number(lastFailureByChat.get(message.chatId) || 0);
     if (!id) {
-      const ds = getDsClient(config);
       const page = await ds.listProcessInstances({ stateType: "FAILURE", pageSize: 1 });
       id = Number(page?.totalList?.[0]?.id || 0);
     }
     if (!id) {
       return (
-        `Usage: /${name} <processInstanceId>\n` +
+        `Usage: /${name} [project] <country> [YYYY-MM-DD]\n` +
+        `或：/${name} <processInstanceId>\n` +
         `或先 /failed、/diagnose，再发「重跑」/「确认」。`
       );
     }
     lastFailureByChat.set(message.chatId, id);
-    const executeType =
-      name === "rerun-all" ? "REPEAT_RUNNING" : "START_FAILURE_TASK_PROCESS";
-    const opLabel =
-      executeType === "REPEAT_RUNNING"
-        ? "整实例重跑（影响所有任务节点）"
-        : "从失败处恢复（只重跑失败任务）";
 
-    // Fetch instance context for rich confirmation
-    const ds = getDsClient(config, getEffectiveProjectCode(message?.chatId, null, config));
     let instanceContext = null;
     try {
       const inst = await ds.getProcessInstance(id);
       instanceContext = {
-        project: projectLabel(getEffectiveProjectCode(message?.chatId, null, config)),
+        project: projectLabel(projectCode),
         country: getGlobalParam(inst, "country_code") || null,
         dataDate: getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || null,
         workflowName: inst?.name || `#${id}`,
       };
-    } catch { /* ignore — still show confirm without context */ }
+    } catch { /* ignore */ }
 
     const pending = pendingConfirms.set(message.chatId, {
       kind: "execute",
@@ -733,7 +856,7 @@ async function runCommand(config, command, message) {
     const env = loadDsEnv();
     const uiUrl = buildProcessInstanceUiUrl({
       apiUrl: env.apiUrl,
-      projectCode: getEffectiveProjectCode(message?.chatId, null, config),
+      projectCode,
       processInstanceId: id,
     });
     return {
@@ -761,131 +884,141 @@ async function runCommand(config, command, message) {
         "需要时在 config.json 设 ds_readonly=false 并重启 bot。"
       );
     }
-    const ds = getDsClient(config);
-    let taskId = Number(command[1]);
-    if (!taskId) taskId = Number(lastTaskByChat.get(message.chatId) || 0);
 
-    // No task id → list failed tasks on last/known workflow so user can pick
-    if (!taskId) {
-      let wfId = Number(lastFailureByChat.get(message.chatId) || 0);
-      if (!wfId) {
-        const page = await ds.listProcessInstances({ stateType: "FAILURE", pageSize: 1 });
-        wfId = Number(page?.totalList?.[0]?.id || 0);
-      }
-      if (!wfId) {
-        return (
-          "请先指定任务实例 id，或先 /failed、/diagnose 定位。\n" +
-          "用法：强制成功 任务 #<taskId>\n" +
-          "查某实例失败节点：/tasks <实例id>"
-        );
-      }
-      const inst = await ds.getProcessInstance(wfId);
-      let page = await ds.listTaskInstances({
-        processInstanceId: wfId,
-        stateType: "FAILURE",
-        pageSize: 50,
+    // command[1] is a plain number → treat as taskId (existing behavior)
+    const firstArg = String(command[1] || "").toLowerCase();
+    const isTaskId = /^\d+$/.test(firstArg) && firstArg;
+
+    if (isTaskId) {
+      // --- Legacy: explicit taskId path ---
+      const taskId = Number(firstArg);
+      const ds = getDsClient(config);
+      const task = await ds.resolveTaskInstance(taskId, {
+        processInstanceId: lastFailureByChat.get(message.chatId) || null,
       });
-      let failed = page?.totalList || [];
-      if (!failed.length) {
-        page = await ds.listTaskInstances({ processInstanceId: wfId, pageSize: 100 });
-        failed = (page?.totalList || []).filter((t) =>
-          /FAILURE|KILL/i.test(String(t.state || "")),
-        );
-      }
-      // Only allow force-success on QUALITY TASK leaf nodes (not SUB_PROCESS)
-      const eligible = failed.filter(
-        (t) => t.taskType !== "SUB_PROCESS" && FORCE_SUCCESS_TASK_NAME_RE.test(t.name || ""),
-      );
-      if (!eligible.length) {
-        const names = failed.map((t) => `${t.name}(${t.taskType || "?"})`).join("、") || "无";
+      if (task && (task.taskType === "SUB_PROCESS" || !FORCE_SUCCESS_TASK_NAME_RE.test(task.name || ""))) {
         return (
-          `当前实例 #${wfId} 无可强制成功的节点。\n` +
-          `强制成功仅限最小叶子节点（名称含 "QUALITY TASK"，非子流程类型）。\n` +
-          `当前失败任务：${names}`
+          `任务 #${taskId}（${task.name || "?"}，类型 ${task.taskType || "?"}）不符合强制成功条件。\n` +
+          `强制成功仅限最小叶子节点（名称含 "QUALITY TASK"，非子流程类型）。`
         );
       }
-      lastFailureByChat.set(message.chatId, wfId);
-      const text = formatFailedTasksPickList(wfId, eligible, {
-        inst,
-        instName: inst?.name || "",
+      let inst = null;
+      if (task?.processInstanceId) {
+        try {
+          inst = await ds.getProcessInstance(task.processInstanceId);
+          lastFailureByChat.set(message.chatId, Number(task.processInstanceId));
+        } catch { /* ignore */ }
+      }
+      lastTaskByChat.set(message.chatId, taskId);
+      const label = formatTaskIdentity(task || { id: taskId, name: "?" }, { inst });
+      const pending = pendingConfirms.set(message.chatId, {
+        kind: "force-success",
+        taskInstanceId: taskId,
+        processInstanceId: task?.processInstanceId ? Number(task.processInstanceId) : undefined,
+        openId: message.senderId,
+        summary: `强制成功 #${taskId} ${label}`,
       });
       const env = loadDsEnv();
-      return {
-        card: forceSuccessPickCard({
-          processInstanceId: wfId,
-          instName: inst?.name || "",
-          tasks: eligible,
-          uiUrl: buildProcessInstanceUiUrl({
+      const uiUrl = pending.processInstanceId
+        ? buildProcessInstanceUiUrl({
             apiUrl: env.apiUrl,
             projectCode: getEffectiveProjectCode(message?.chatId, null, config),
-            processInstanceId: wfId,
+            processInstanceId: pending.processInstanceId,
             processDefinitionCode: inst?.processDefinitionCode,
-          }),
+          })
+        : "";
+      const fsContext = inst
+        ? {
+            project: projectLabel(getEffectiveProjectCode(message?.chatId, null, config)),
+            country: getGlobalParam(inst, "country_code") || null,
+            dataDate: getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || null,
+            workflowName: inst.name || null,
+          }
+        : null;
+      return {
+        card: confirmCard({
+          title: "确认强制成功？",
+          summary: "强制成功",
+          risk: "跳过真实执行；下游可能还需重跑实例。",
+          nonce: pending.nonce,
+          kind: pending.kind,
+          taskInstanceId: taskId,
+          processInstanceId: pending.processInstanceId,
+          uiUrl,
+          instanceContext: fsContext,
+          taskName: task?.name || null,
         }),
-        text,
+        text: `将要强制成功任务 #${taskId}（${label}）。\n5 分钟内确认或取消。`,
       };
     }
 
-    const task = await ds.resolveTaskInstance(taskId, {
-      processInstanceId: lastFailureByChat.get(message.chatId) || null,
-    });
-    // Restrict: only QUALITY TASK leaf nodes allowed
-    if (task && (task.taskType === "SUB_PROCESS" || !FORCE_SUCCESS_TASK_NAME_RE.test(task.name || ""))) {
+    // --- New: locate instance by [project] [country] [date] [nodeName] → pick QUALITY TASK ---
+    const { projectCode, country, dataDate, nodeName } = parseInstanceLookupArgs(
+      command, message?.chatId, config,
+    );
+    const ds = getDsClient(config, projectCode);
+
+    let wfId = null;
+    if (country) {
+      const matches = await resolveInstanceByCountryDate(ds, { country, dataDate });
+      if (!matches.length) {
+        return (
+          `未找到匹配实例（country=${country}${dataDate ? ` date=${dataDate}` : ""}）。\n` +
+          `可先用 /failed 确认实例状态，或直接 /force-success <taskId>。`
+        );
+      }
+      if (matches.length > 1) {
+        const list = matches
+          .slice(0, 5)
+          .map((inst) => {
+            const dd = getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day");
+            return `#${inst.id}  ${inst.name || "?"}  数据日:${dd || "?"}  ${inst.state || ""}`;
+          })
+          .join("\n");
+        return `找到多个匹配实例，请用 /force-success <taskId> 或 /tasks <id> 查看后指定：\n${list}`;
+      }
+      wfId = Number(matches[0].id);
+    }
+
+    if (!wfId) wfId = Number(lastFailureByChat.get(message.chatId) || 0);
+    if (!wfId) {
+      const page = await ds.listProcessInstances({ stateType: "FAILURE", pageSize: 1 });
+      wfId = Number(page?.totalList?.[0]?.id || 0);
+    }
+    if (!wfId) {
       return (
-        `任务 #${taskId}（${task.name || "?"}，类型 ${task.taskType || "?"}）不符合强制成功条件。\n` +
-        `强制成功仅限最小叶子节点（名称含 "QUALITY TASK"，非子流程类型）。`
+        "请先指定参数，或先 /failed、/diagnose 定位。\n" +
+        "用法：/force-success [project] <country> [YYYY-MM-DD] [子流程名]\n" +
+        "或：/force-success <taskId>"
       );
     }
-    let inst = null;
-    if (task?.processInstanceId) {
-      try {
-        inst = await ds.getProcessInstance(task.processInstanceId);
-        lastFailureByChat.set(message.chatId, Number(task.processInstanceId));
-      } catch {
-        // ignore
-      }
+
+    const inst = await ds.getProcessInstance(wfId);
+    // Collect QUALITY TASK nodes, including those nested inside SUB_PROCESS tasks
+    const eligible = await collectEligibleFsTasks(ds, wfId, { nodeName });
+    if (!eligible.length) {
+      const hint = nodeName ? `（子流程过滤：${nodeName}）` : "";
+      return (
+        `实例 #${wfId} 无可强制成功的节点${hint}。\n` +
+        `强制成功仅限叶子 QUALITY TASK 节点（会向下钻取子流程）。`
+      );
     }
-    lastTaskByChat.set(message.chatId, taskId);
-    const label = formatTaskIdentity(task || { id: taskId, name: "?" }, { inst });
-    const pending = pendingConfirms.set(message.chatId, {
-      kind: "force-success",
-      taskInstanceId: taskId,
-      processInstanceId: task?.processInstanceId
-        ? Number(task.processInstanceId)
-        : undefined,
-      openId: message.senderId,
-      summary: `强制成功 #${taskId} ${label}`,
-    });
+    lastFailureByChat.set(message.chatId, wfId);
+    const text = formatFailedTasksPickList(wfId, eligible, { inst, instName: inst?.name || "" });
     const env = loadDsEnv();
-    const uiUrl = pending.processInstanceId
-      ? buildProcessInstanceUiUrl({
-          apiUrl: env.apiUrl,
-          projectCode: getEffectiveProjectCode(message?.chatId, null, config),
-          processInstanceId: pending.processInstanceId,
-          processDefinitionCode: inst?.processDefinitionCode,
-        })
-      : "";
-    const fsContext = inst
-      ? {
-          project: projectLabel(getEffectiveProjectCode(message?.chatId, null, config)),
-          country: getGlobalParam(inst, "country_code") || null,
-          dataDate: getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || null,
-          workflowName: inst.name || null,
-        }
-      : null;
     return {
-      card: confirmCard({
-        title: "确认强制成功？",
-        summary: `${task?.name || `任务 #${taskId}`}（QUALITY TASK）`,
-        risk: "跳过真实执行；下游可能还需重跑实例。",
-        nonce: pending.nonce,
-        kind: pending.kind,
-        taskInstanceId: taskId,
-        processInstanceId: pending.processInstanceId,
-        uiUrl,
-        instanceContext: fsContext,
+      card: forceSuccessPickCard({
+        processInstanceId: wfId,
+        instName: inst?.name || "",
+        tasks: eligible,
+        uiUrl: buildProcessInstanceUiUrl({
+          apiUrl: env.apiUrl,
+          projectCode,
+          processInstanceId: wfId,
+          processDefinitionCode: inst?.processDefinitionCode,
+        }),
       }),
-      text: `将要强制成功任务 #${taskId}（${label}）。\n5 分钟内确认或取消。`,
+      text,
     };
   }
   if (name === "yes" || name === "YES" || name === "确认") {

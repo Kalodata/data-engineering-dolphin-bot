@@ -1192,6 +1192,49 @@ export function getGlobalParam(inst, prop) {
   return "";
 }
 
+/**
+ * Find process instances matching a country code and optional data date.
+ * Fetches detail for each candidate (N+1) to read globalParams.
+ * Returns all matching instances; caller decides what to do with 0 / 1 / many.
+ */
+/**
+ * Find process instances by country + dataDate via globalParams.
+ * Workflow names do NOT contain country/date, so we scan recent instances
+ * without searchVal and filter via N+1 detail fetches.
+ * dataDate should always be provided; country is required.
+ */
+export async function resolveInstanceByCountryDate(
+  ds,
+  { country, dataDate, stateType, pageSize = 50 } = {},
+) {
+  const page = await ds.listProcessInstances({ stateType, pageSize });
+  const candidates = (page?.totalList || []).slice(0, 50);
+  if (!candidates.length) return [];
+
+  const settled = await Promise.allSettled(
+    candidates.map((c) => ds.getProcessInstance(c.id)),
+  );
+  let results = settled
+    .filter((r) => r.status === "fulfilled")
+    .map((r) => r.value)
+    .filter(Boolean);
+
+  if (country) {
+    const cc = country.toLowerCase();
+    results = results.filter(
+      (inst) => getGlobalParam(inst, "country_code").toLowerCase() === cc,
+    );
+  }
+  if (dataDate) {
+    results = results.filter((inst) => {
+      const dd =
+        getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day");
+      return dd === dataDate;
+    });
+  }
+  return results;
+}
+
 export const WH_STAGE_NAME_RE = /^(ADS|DWS|DWM|DWD|ODS|DIM)-STAGE$/i;
 
 function formatMinutesLabel(sec) {
