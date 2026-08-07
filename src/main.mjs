@@ -174,7 +174,7 @@ function loadConfig(configPath) {
     ),
     alertCwd: path.resolve(raw.alert_cwd ?? path.dirname(resolvedConfigPath)),
     dsProjectCode: String(raw.ds_project_code || process.env.DS_PROJECT_CODE || ""),
-    dsReadonly: raw.ds_readonly !== false, // default true when key missing after this change; config sets true
+    dsReadonly: raw.ds_readonly !== false && process.env.DS_READONLY !== "false",
     sqlRepoPath: raw.sql_repo_path
       ? path.resolve(raw.sql_repo_path)
       : path.resolve(os.homedir(), "data-analysis-tiktok"),

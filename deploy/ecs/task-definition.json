@@ -26,6 +26,7 @@
         { "name": "LARK_PROFILE", "value": "kalodata-alert" },
         { "name": "DS_API_URL", "value": "https://ds-offline.kalowave.com/dolphinscheduler" },
         { "name": "DS_PROJECT_CODE", "value": "9892432515424" },
+        { "name": "DS_READONLY", "value": "false" },
         { "name": "NODE_ENV", "value": "production" }
       ],
       "secrets": [
