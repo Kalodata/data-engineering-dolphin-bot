@@ -3,7 +3,7 @@
   "allowed_chats": [],
   "alert_chat_ids": [],
   "ds_project_code": "YOUR_DS_PROJECT_CODE",
-  "ds_readonly": true,
+  "ds_readonly": false,
   "sql_repo_path": "/path/to/your-pipeline-sql-repo",
   "enable_pr_lookup": true,
   "hive_probe": {
