@@ -9,7 +9,6 @@ import {
   formatFailedList,
   formatPracticalDiagnosis,
   formatTaskList,
-  interpretNaturalLanguage,
 } from "../src/ds32_client.mjs";
 
 test("extractLogHighlights finds Exception context", () => {
@@ -199,32 +198,6 @@ test("Livy UploadProductPic dead is not JDBC", () => {
   assert.match(c.verdict || "", /Livy/);
   assert.ok(c.fixes.some((f) => /batches\/4488\/log|Livy/.test(f)));
   assert.ok(c.fixes.some((f) => /YARN|队列|盲重跑|不要当|勿当/.test(f)));
-});
-
-test("interpretNaturalLanguage board and progress shortcuts", () => {
-  assert.deepEqual(interpretNaturalLanguage("各国天级进度"), ["/board"]);
-  assert.deepEqual(interpretNaturalLanguage("id分区进度"), ["/progress", "id"]);
-  assert.deepEqual(interpretNaturalLanguage("越南跑到哪了"), ["/progress", "vn"]);
-});
-
-test("interpretNaturalLanguage diagnose vs chat follow-up", () => {
-  assert.deepEqual(interpretNaturalLanguage("问题出在哪"), ["/diagnose"]);
-  assert.deepEqual(interpretNaturalLanguage("诊断 1877773"), [
-    "/diagnose",
-    "1877773",
-  ]);
-  assert.deepEqual(interpretNaturalLanguage("重跑 1939974"), ["/rerun", "1939974"]);
-  assert.deepEqual(interpretNaturalLanguage("帮我重跑"), ["/rerun"]);
-  assert.deepEqual(interpretNaturalLanguage("强制成功 任务 #9441911"), [
-    "/force-success",
-    "9441911",
-  ]);
-  assert.deepEqual(interpretNaturalLanguage("force-success 9441911"), [
-    "/force-success",
-    "9441911",
-  ]);
-  assert.equal(interpretNaturalLanguage("怎么修复这个问题"), null);
-  assert.equal(interpretNaturalLanguage("如何解决"), null);
 });
 
 test("formatFailedList includes next step", () => {

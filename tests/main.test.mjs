@@ -11,7 +11,6 @@ import {
   sanitizeFeishuReply,
   stripBotMention,
 } from "../src/main.mjs";
-import { interpretNaturalLanguage } from "../src/ds32_client.mjs";
 
 test("parse Feishu text content", () => {
   assert.equal(parseContent('{"text":"/status"}'), "/status");
@@ -73,10 +72,6 @@ test("looksLikeBotStatus", () => {
   assert.equal(looksLikeBotStatus("/status"), true);
   assert.equal(looksLikeBotStatus("mcp 状态"), false);
   assert.equal(looksLikeBotStatus("最近失败有哪些"), false);
-});
-
-test("interpretNaturalLanguage maps mcp 状态", () => {
-  assert.deepEqual(interpretNaturalLanguage("mcp 状态"), ["/mcp"]);
 });
 
 test("sanitizeFeishuReply flattens markdown tables", () => {

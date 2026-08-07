@@ -20,7 +20,6 @@ import {
   formatSlowStageJobs,
   formatTaskList,
   getGlobalParam,
-  interpretNaturalLanguage,
   listCountryDailyBoard,
   listSimpleBoard,
   listRunningProgress,
@@ -34,10 +33,10 @@ import { analyzeSqlAgainstFailure } from "./sql_repo_analysis.mjs";
 import {
   buildPlannerPrompt,
   executeDsPlan,
-  heuristicDsPlan,
-  heuristicPlanIsConcrete,
-  looksLikeDsOps,
+  formatClarifyReply,
+  needsClarify,
   parsePlannerJson,
+  planToSlashCommand,
 } from "./ds_adaptive.mjs";
 import { resolveCountryCode } from "./country_code.mjs";
 import {
@@ -1241,59 +1240,84 @@ async function runAlertLocal(config, alertText, evidenceBlock = "") {
   return runCursor(config.alertCwd, config.model, prompt);
 }
 
-async function handleAdaptiveDs(config, message) {
+async function handleNlIntent(config, message) {
   const history = chatHistories.get(message.chatId) || [];
   const historyBlock = history
     .slice(-CHAT_HISTORY_MAX)
     .map((m) => `${m.role}: ${m.text}`)
     .join("\n");
   const env = loadDsEnv();
-  const projectCode = config.dsProjectCode || env.projectCode || "";
+  const projectCode =
+    getEffectiveProjectCode(message.chatId, null, config) ||
+    config.dsProjectCode ||
+    env.projectCode ||
+    "";
   const cwd =
     config.projects.remote ||
     config.alertCwd ||
     path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-  let plan = heuristicDsPlan(message.text, { defaultProjectCode: projectCode });
-  // Only call LLM planner when heuristic is ambiguous (generic slow / chat-ish).
-  if (!heuristicPlanIsConcrete(plan)) {
-    try {
-      const plannerRaw = await runCursor(
-        cwd,
-        config.model,
-        buildPlannerPrompt(message.text, historyBlock, projectCode),
-        { timeoutMs: 45_000 },
-      );
-      const parsed = parsePlannerJson(plannerRaw);
-      if (parsed?.tool) {
-        plan = { ...plan, ...parsed };
-        // Keep structurally extracted country if planner omitted it.
-        if (!plan.country && resolveCountryCode(message.text)) {
-          plan.country = resolveCountryCode(message.text);
-        }
-        delete plan._soft;
-      }
-    } catch (error) {
-      console.error(`[adaptive-plan] fallback heuristic: ${error.message}`);
-    }
-  } else {
-    console.error(`[adaptive] skip planner (concrete ${plan.tool})`);
+  let plan = null;
+  try {
+    const plannerRaw = await runCursor(
+      cwd,
+      config.model,
+      buildPlannerPrompt(message.text, historyBlock, projectCode),
+      { timeoutMs: 45_000 },
+    );
+    plan = parsePlannerJson(plannerRaw);
+  } catch (error) {
+    console.error(`[nl-intent] planner failed: ${error.message}`);
+    const text =
+      formatClarifyReply(null) +
+      `\n（意图解析失败：${error.message}；可改用 /failed /progress /diagnose）`;
+    pushChat(message.chatId, "user", message.text);
+    pushChat(message.chatId, "assistant", text);
+    return text;
   }
 
-  if (!plan || plan.tool === "chat") {
-    return null; // caller falls through to normal chat
+  if (!plan?.tool) {
+    const text = formatClarifyReply(plan);
+    pushChat(message.chatId, "user", message.text);
+    pushChat(message.chatId, "assistant", text);
+    return text;
   }
 
-  console.error(`[adaptive] execute ${JSON.stringify(plan)}`);
+  // Keep country if model omitted it but text has a clear alias.
+  if (!plan.country && resolveCountryCode(message.text)) {
+    plan.country = resolveCountryCode(message.text);
+  }
+  if (!plan.projectCode) plan.projectCode = projectCode;
+
+  if (needsClarify(plan)) {
+    const text = formatClarifyReply(plan);
+    console.error(`[nl-intent] clarify ${JSON.stringify(plan)}`);
+    pushChat(message.chatId, "user", message.text);
+    pushChat(message.chatId, "assistant", text);
+    return text;
+  }
+
+  if (plan.tool === "chat") {
+    return handleChat(config, message);
+  }
+
+  const command = planToSlashCommand(plan);
+  if (command) {
+    console.error(`[nl-intent] → ${command.join(" ")} from ${JSON.stringify(plan)}`);
+    const response = await runCommand(config, command, message);
+    pushChat(message.chatId, "user", message.text);
+    pushChat(message.chatId, "assistant", replyToHistoryText(response));
+    return response;
+  }
+
+  console.error(`[nl-intent] executeDsPlan ${JSON.stringify(plan)}`);
   const executed = await executeDsPlan(config, plan);
-  if (executed.kind === "chat" || !executed.text) return null;
-
-  // Structured DS tools already Feishu-ready — skip Agent rewrite.
-  const finalText = executed.text;
-
+  if (executed.kind === "chat" || !executed.text) {
+    return handleChat(config, message);
+  }
   pushChat(message.chatId, "user", message.text);
-  pushChat(message.chatId, "assistant", finalText);
-  return finalText;
+  pushChat(message.chatId, "assistant", executed.text);
+  return executed.text;
 }
 
 async function handleChat(config, message) {
@@ -1789,9 +1813,7 @@ async function handleMessage(config, message) {
   }
 
   let command = parseCommand(message.text);
-  if (!command) {
-    command = interpretNaturalLanguage(message.text);
-  }
+  // Slash commands only here. Natural language → Agent intent JSON → program execute.
 
   let response;
   let ackId = null;
@@ -1821,23 +1843,13 @@ async function handleMessage(config, message) {
       response = await handleAlert(config, message.text, message);
       pushChat(message.chatId, "user", message.text.slice(0, 1500));
       pushChat(message.chatId, "assistant", replyToHistoryText(response));
-    } else if ((isP2p || alertChat) && looksLikeDsOps(message.text)) {
+    } else if (isP2p || alertChat) {
       try {
         ackId = await ackReaction(message.messageId);
       } catch {
         // ignore
       }
-      response = await handleAdaptiveDs(config, message);
-      if (!response) {
-        response = await handleChat(config, message);
-      }
-    } else if (isP2p || alertChat) {
-      try {
-        ackId = await ackReaction(message.messageId);
-      } catch {
-        // ignore ack failure
-      }
-      response = await handleChat(config, message);
+      response = await handleNlIntent(config, message);
     } else {
       return;
     }

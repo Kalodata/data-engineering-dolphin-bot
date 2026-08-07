@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { resolveCountryCode } from "./country_code.mjs";
 
 const DEFAULT_ENV_FILE = path.join(os.homedir(), ".config/dsctl/offline.env");
 
@@ -1195,32 +1194,6 @@ export function getGlobalParam(inst, prop) {
 
 export const WH_STAGE_NAME_RE = /^(ADS|DWS|DWM|DWD|ODS|DIM)-STAGE$/i;
 
-const COUNTRY_ALIASES = {
-  印尼: "id",
-  印度尼西亚: "id",
-  indonesia: "id",
-  id: "id",
-  越南: "vn",
-  vn: "vn",
-  泰国: "th",
-  th: "th",
-  马来: "my",
-  马来西亚: "my",
-  my: "my",
-  菲律宾: "ph",
-  ph: "ph",
-  新加坡: "sg",
-  sg: "sg",
-  墨西哥: "mx",
-  mx: "mx",
-  美国: "us",
-  us: "us",
-  英国: "gb",
-  gb: "gb",
-  德国: "de",
-  de: "de",
-};
-
 function formatMinutesLabel(sec) {
   if (sec >= 3600) {
     const h = Math.floor(sec / 3600);
@@ -1935,101 +1908,4 @@ export function formatFailedTasksPickList(processInstanceId, tasks, { inst = nul
   }
   lines.push("", "选定后发：强制成功 任务 #<id>   再回 YES");
   return lines.join("\n");
-}
-
-/** Map casual Chinese / English to a slash command argv, or null. */
-export function interpretNaturalLanguage(text) {
-  const t = String(text || "").trim();
-  if (!t || t.startsWith("/")) return null;
-  if (/^(YES|NO)$/i.test(t)) return null;
-
-  // Follow-ups / how-to questions → free chat (Cursor Agent), not another /diagnose.
-  if (
-    /怎么修复|如何修复|怎么解决|如何解决|具体怎么做|下一步怎么做|然后呢|为什么会|详细说说|帮我看看怎么/i.test(
-      t,
-    )
-  ) {
-    return null;
-  }
-
-  const idMatch =
-    t.match(/(?:实例|instance|#)\s*(\d{4,})/i) || t.match(/\b(\d{6,})\b/);
-  const id = idMatch ? idMatch[1] : null;
-
-  // Explicit diagnose intents only (avoid matching 怎么修复).
-  if (
-    /^(问题出在哪|出什么问题|诊断一下|诊断|diagnose)\b/i.test(t) ||
-    /^(问题出在哪|诊断一下|自动诊断)/i.test(t)
-  ) {
-    return id ? ["/diagnose", id] : ["/diagnose"];
-  }
-  if (/诊断\s*\d+/i.test(t) && id) return ["/diagnose", id];
-
-  if (/最近失败|有哪些失败|失败列表|failed list/i.test(t)) {
-    return ["/failed"];
-  }
-  if (/失败了吗|挂了吗|有报错吗/i.test(t)) {
-    return ["/failed"];
-  }
-  if (
-    /(哪些国家|各个国家|各国|所有国家).{0,12}(跑|运行|进度|阶段|任务|天级)|(跑|运行|进度|阶段).{0,12}(哪些国家|各国)|各国天级|国家进度看板/i.test(
-      t,
-    )
-  ) {
-    return ["/board"];
-  }
-  // 「id分区进度」「越南跑到哪了」→ /progress <country>
-  if (
-    /(分区)?进度|跑到哪|到哪一步|在跑啥|运行状态|开始了没|开跑了吗/i.test(t) &&
-    !/慢|耗时|失败|诊断|各国|哪些国家/i.test(t)
-  ) {
-    const country = resolveCountryCode(t);
-    if (country) return ["/progress", country];
-  }
-  if (/慢\s*(stage|job)|耗时超过|慢任务|慢节点|哪些\s*job\s*慢|stage.*job.*慢/i.test(t)) {
-    return ["/slow"];
-  }
-  // Warehouse layers (+ optional country) → /slow wh；禁止「印尼任务」这类无慢意图误进
-  if (
-    /(数仓|数仓层|ADS|DWS|DWM|DWD|ODS|DIM).*(层|stage|任务|慢|耗时)|只看.*(ADS|DWS|DWM|DWD)|前置检测.*不要|不要.*前置/i.test(
-      t,
-    ) ||
-    /(印尼|印度尼西亚|indonesia).*(慢|耗时|stage|数仓层)|(慢|耗时|stage|数仓层).*(印尼|印度尼西亚|indonesia)/i.test(
-      t,
-    )
-  ) {
-    let country = null;
-    for (const [alias, code] of Object.entries(COUNTRY_ALIASES)) {
-      if (t.toLowerCase().includes(alias.toLowerCase()) || new RegExp(alias, "i").test(t)) {
-        if (alias === "id" && !/(印尼|印度尼西亚|indonesia|\bcountry|\bid\b)/i.test(t)) {
-          continue;
-        }
-        country = code;
-        if (/印尼|印度尼西亚|indonesia/i.test(t)) {
-          country = "id";
-          break;
-        }
-      }
-    }
-    if (/印尼|印度尼西亚|indonesia/i.test(t)) country = "id";
-    return country ? ["/slow", "wh", country] : ["/slow", "wh"];
-  }
-  if (/强制成功|force[- ]?success|强制过|标成成功/i.test(t)) {
-    const taskId =
-      t.match(/(?:任务|task)\s*#?\s*(\d{5,})/i)?.[1] ||
-      t.match(/\b(\d{6,8})\b/)?.[1] ||
-      null;
-    return taskId ? ["/force-success", String(taskId)] : ["/force-success"];
-  }
-  if (/重跑全部|整[个次]重跑|rerun-all/i.test(t)) {
-    return id ? ["/rerun-all", String(id)] : ["/rerun-all"];
-  }
-  if (/重跑|再跑|帮我重跑|重新跑|rerun/i.test(t)) {
-    return id ? ["/rerun", String(id)] : ["/rerun"];
-  }
-  if (/^帮助$|^help$|能做什么/i.test(t)) return ["/help"];
-  if (/mcp\s*状态|mcp状态|^\/?mcp$|MCP\s*(连|通)|ds-offline\s*mcp/i.test(t)) {
-    return ["/mcp"];
-  }
-  return null;
 }
