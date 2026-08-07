@@ -505,7 +505,9 @@ function parseInstanceLookupArgs(command, chatId, config) {
  * - nodeName: if provided, only drills into sub-processes whose name includes this string.
  * Each result includes _parentName (sub-process task name) when nested.
  */
-async function collectEligibleFsTasks(ds, processInstanceId, { nodeName = null } = {}) {
+async function collectEligibleFsTasks(ds, processInstanceId, { nodeName = null, maxDepth = 5, _depth = 0, _parentName = null } = {}) {
+  if (_depth >= maxDepth) return [];
+
   let page = await ds.listTaskInstances({ processInstanceId, stateType: "FAILURE", pageSize: 50 });
   let failed = page?.totalList || [];
   if (!failed.length) {
@@ -516,29 +518,28 @@ async function collectEligibleFsTasks(ds, processInstanceId, { nodeName = null }
   const eligible = [];
   for (const t of failed) {
     if (t.taskType === "SUB_PROCESS") {
-      // Optional: only drill into sub-processes matching nodeName
-      if (nodeName && !String(t.name || "").toLowerCase().includes(nodeName.toLowerCase())) {
-        continue;
-      }
+      // If this node matches nodeName → clear filter so all QUALITY TASKs inside are collected.
+      // If it doesn't match → keep searching deeper with the same filter.
+      // If no nodeName → drill into all sub-processes.
+      const nodeNameMatches = !nodeName || String(t.name || "").toLowerCase().includes(nodeName.toLowerCase());
       try {
         const childId = await ds.getSubProcessInstanceId(t.id);
         if (!childId) continue;
-        let cp = await ds.listTaskInstances({ processInstanceId: childId, stateType: "FAILURE", pageSize: 50 });
-        let childFailed = cp?.totalList || [];
-        if (!childFailed.length) {
-          cp = await ds.listTaskInstances({ processInstanceId: childId, pageSize: 100 });
-          childFailed = (cp?.totalList || []).filter((ct) => /FAILURE|KILL/i.test(String(ct.state || "")));
-        }
-        for (const ct of childFailed) {
-          if (ct.taskType !== "SUB_PROCESS" && FORCE_SUCCESS_TASK_NAME_RE.test(ct.name || "")) {
-            eligible.push({ ...ct, _parentName: t.name || null });
-          }
+        const childEligible = await collectEligibleFsTasks(ds, childId, {
+          nodeName: nodeNameMatches ? null : nodeName,
+          maxDepth,
+          _depth: _depth + 1,
+          _parentName: t.name || _parentName,
+        });
+        for (const ct of childEligible) {
+          eligible.push({ ...ct, _parentName: ct._parentName || t.name || null });
         }
       } catch {
         // ignore drill-down failure for individual sub-process
       }
-    } else if (FORCE_SUCCESS_TASK_NAME_RE.test(t.name || "")) {
-      eligible.push(t);
+    } else if (!nodeName && FORCE_SUCCESS_TASK_NAME_RE.test(t.name || "")) {
+      // nodeName=null means either no filter or we're inside the matched subtree
+      eligible.push({ ...t, _parentName: _parentName || null });
     }
   }
   return eligible;
