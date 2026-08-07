@@ -10,11 +10,6 @@ import {
   extractDsIdsFromText,
   shouldUseAlertTemplate,
 } from "../src/alert_evidence.mjs";
-import {
-  parseFeedback,
-  recordFeedback,
-  rememberAlertForFeedback,
-} from "../src/alert_feedback.mjs";
 import { resolveHealHoldMinutes } from "../src/failure_watcher.mjs";
 
 test("extractDsIdsFromText finds instance and task", () => {
@@ -79,21 +74,4 @@ test("claimAlert dedupes same key", () => {
   assert.equal(claimAlert(statePath, key).claimed, true);
   assert.equal(claimAlert(statePath, key).claimed, false);
   assert.equal(claimAlert(statePath, key, { ttlMs: 0 }).claimed, true);
-});
-
-test("feedback parse and record", () => {
-  assert.equal(parseFeedback("有用").kind, "useful");
-  assert.equal(parseFeedback("误报").kind, "false_alarm");
-  assert.equal(parseFeedback("hello"), null);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "alert-fb-"));
-  const statePath = path.join(dir, "fb.json");
-  rememberAlertForFeedback(statePath, "oc_1", {
-    taskId: 9,
-    processInstanceId: 8,
-    category: "数据质量",
-  });
-  const r = recordFeedback(statePath, { chatId: "oc_1", kind: "false_alarm" });
-  assert.equal(r.ok, true);
-  assert.match(r.message, /误报/);
-  assert.equal(r.event.taskId, 9);
 });

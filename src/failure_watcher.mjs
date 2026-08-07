@@ -8,7 +8,6 @@ import {
   buildActionPlaybook,
 } from "./ds32_client.mjs";
 import { alertDedupeKey, claimAlert } from "./alert_dedupe.mjs";
-import { FEEDBACK_HINT } from "./alert_feedback.mjs";
 import { enrichFailureContext } from "./deep_enrich.mjs";
 import { analyzeSqlAgainstFailure } from "./sql_repo_analysis.mjs";
 import { buildAlertCardFromReportFields } from "./feishu_cards.mjs";
@@ -169,7 +168,6 @@ export function formatAlertReport({
 
   lines.push("");
   lines.push(`深挖：点告警卡「诊断」或 /diagnose ${instId}  /log ${task.id}`);
-  lines.push(FEEDBACK_HINT);
   return lines.join("\n");
 }
 

@@ -27,10 +27,6 @@
     "notify_user_ids": ["ou_xxx"],
     "dedupe_path": ".data/alert-dedupe.json"
   },
-  "alert_feedback": {
-    "enabled": true,
-    "state_path": ".data/alert-feedback.json"
-  },
   "ds_alert_webhook": {
     "enabled": false,
     "prefer_push": true,
