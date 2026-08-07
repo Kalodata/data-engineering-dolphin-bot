@@ -3,7 +3,7 @@
   "allowed_chats": [],
   "alert_chat_ids": [],
   "ds_project_code": "9892432515424",
-  "ds_readonly": true,
+  "ds_readonly": false,
   "sql_repo_path": "",
   "enable_pr_lookup": false,
   "hive_probe": {
