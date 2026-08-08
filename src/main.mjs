@@ -246,6 +246,7 @@ function loadConfig(configPath) {
         enabled: bp.enabled === true,
         chatId: String(bp.chat_id || ""),
         hours: Array.isArray(bp.hours) ? bp.hours.map(Number) : [9, 11, 15, 19],
+        minute: Number(bp.minute ?? 0),
       };
     })(),
   };
