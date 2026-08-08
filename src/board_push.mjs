@@ -8,13 +8,15 @@ import {
 } from "./ds32_client.mjs";
 import { boardCard, runningCard } from "./feishu_cards.mjs";
 
-export function getBeijingHour(now = new Date()) {
-  const str = new Intl.DateTimeFormat("en-US", {
+export function getBeijingTime(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Shanghai",
     hour: "numeric",
+    minute: "numeric",
     hour12: false,
-  }).format(now);
-  return Number(str);
+  }).formatToParts(now);
+  const get = (type) => Number(parts.find((p) => p.type === type)?.value ?? 0);
+  return { hour: get("hour"), minute: get("minute") };
 }
 
 export function startBoardPush({ config, getDs, sendText, log = console.error }) {
@@ -24,14 +26,15 @@ export function startBoardPush({ config, getDs, sendText, log = console.error })
     return { stop: () => {} };
   }
   const hours = bp.hours || [9, 11, 15, 19];
+  const minute = bp.minute ?? 0;
   let lastPushedHour = -1;
   let stopped = false;
 
   async function tick() {
     if (stopped) return;
-    const hour = getBeijingHour();
+    const { hour, minute: currentMinute } = getBeijingTime();
     if (lastPushedHour === hour) return;
-    if (!hours.includes(hour)) return;
+    if (!hours.includes(hour) || currentMinute !== minute) return;
     lastPushedHour = hour;
     try {
       const ds = getDs();
