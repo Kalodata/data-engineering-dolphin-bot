@@ -1,10 +1,12 @@
 import {
+  buildProcessInstanceUiUrl,
   formatCountryDailyBoard,
   formatProgressReport,
   listCountryDailyBoard,
   listRunningProgress,
+  loadDsEnv,
 } from "./ds32_client.mjs";
-import { boardCard } from "./feishu_cards.mjs";
+import { boardCard, runningCard } from "./feishu_cards.mjs";
 
 export function getBeijingHour(now = new Date()) {
   const str = new Intl.DateTimeFormat("en-US", {
@@ -33,12 +35,23 @@ export function startBoardPush({ config, getDs, sendText, log = console.error })
     lastPushedHour = hour;
     try {
       const ds = getDs();
+      const env = loadDsEnv();
+      const projectCode = ds.projectCode;
       const [board, progress] = await Promise.all([
         listCountryDailyBoard(ds, {}),
         listRunningProgress(ds, {}),
       ]);
       await sendText({ chatId: bp.chatId, card: boardCard(board), text: formatCountryDailyBoard(board) });
-      await sendText({ chatId: bp.chatId, text: formatProgressReport(progress) });
+      await sendText({
+        chatId: bp.chatId,
+        card: runningCard({
+          enrich: progress.enrich,
+          total: progress.page?.total,
+          uiUrlBuilder: (inst) =>
+            buildProcessInstanceUiUrl({ apiUrl: env.apiUrl, projectCode, processInstanceId: inst.id }),
+        }),
+        text: formatProgressReport(progress),
+      });
       log(`[board-push] sent board+progress to ${bp.chatId} at Beijing hour=${hour}`);
     } catch (err) {
       log(`[board-push] error at hour=${hour}: ${err.message}`);
