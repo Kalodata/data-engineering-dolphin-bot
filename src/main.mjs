@@ -497,8 +497,11 @@ function parseInstanceLookupArgs(command, chatId, config) {
     idx++;
   }
 
-  const dateArg = String(args[idx] || "");
+  const rawDateArg = String(args[idx] || "");
   let dataDate = null;
+  const dateArg = /^\d{8}$/.test(rawDateArg)
+    ? `${rawDateArg.slice(0, 4)}-${rawDateArg.slice(4, 6)}-${rawDateArg.slice(6, 8)}`
+    : rawDateArg;
   if (dateArg && /^\d{4}-\d{2}-\d{2}$/.test(dateArg)) {
     dataDate = dateArg;
     idx++;
@@ -892,7 +895,10 @@ async function runCommand(config, command, message) {
     // /force-success <country> <date> → guided card flow
     {
       const arg1 = String(command[1] || "").toLowerCase();
-      const arg2 = String(command[2] || "");
+      const rawArg2 = String(command[2] || "");
+      const arg2 = /^\d{8}$/.test(rawArg2)
+        ? `${rawArg2.slice(0, 4)}-${rawArg2.slice(4, 6)}-${rawArg2.slice(6, 8)}`
+        : rawArg2;
       if (/^[a-z]{2}$/.test(arg1) && /^\d{4}-\d{2}-\d{2}$/.test(arg2)) {
         return handleFsCountryDate(config, arg1, arg2, message);
       }
