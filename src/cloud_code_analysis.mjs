@@ -4,6 +4,11 @@
  */
 
 import { resolveCloudReposForSession } from "./agent_runtime.mjs";
+import { redactSecrets } from "./redact_secrets.mjs";
+
+/** Max concurrent Cloud code-analysis runs (alert storms). */
+let cloudAnalyzeInFlight = 0;
+export const CLOUD_CODE_MAX_CONCURRENT = 2;
 
 /**
  * Necessary conditions to spend a Cloud Agent run on code reading.
@@ -49,13 +54,14 @@ export function buildCloudCodeAnalysisPrompt({
   repoUrl = "",
   startingRef = "main",
 } = {}) {
+  const safeLog = redactSecrets(logText);
   const params = Object.entries(varsMap || {})
-    .filter(([k, v]) => k && v != null && v !== "" && !/jdbc_server|project|password|token/i.test(k))
+    .filter(([k, v]) => k && v != null && v !== "" && !/jdbc_server|project|password|token|secret|key/i.test(k))
     .slice(0, 10)
-    .map(([k, v]) => `${k}=${v}`)
+    .map(([k, v]) => `${k}=${redactSecrets(String(v))}`)
     .join(", ");
 
-  const logClip = String(logText || "")
+  const logClip = String(safeLog || "")
     .split(/\r?\n/)
     .filter((l) =>
       /Exception|Error|FAILED|Caused by|No rows selected|Partition|AnalysisException|return code/i.test(
@@ -119,6 +125,7 @@ export async function runCloudCodeAnalysis({
   category,
   logText,
   varsMap = {},
+  maxConcurrent = CLOUD_CODE_MAX_CONCURRENT,
 } = {}) {
   if (typeof runAgent !== "function") {
     return { ok: false, lines: [], error: "no runAgent" };
@@ -126,6 +133,15 @@ export async function runCloudCodeAnalysis({
   if (!sqlFile || !cloudRepos?.length) {
     return { ok: false, lines: [], error: "missing sqlFile or cloudRepos" };
   }
+  if (cloudAnalyzeInFlight >= maxConcurrent) {
+    return {
+      ok: false,
+      lines: [`Cloud 代码分析跳过：并发已满（${maxConcurrent}）`],
+      error: "busy",
+      source: "cloud",
+    };
+  }
+
   const prompt = buildCloudCodeAnalysisPrompt({
     sqlFile,
     category,
@@ -134,12 +150,15 @@ export async function runCloudCodeAnalysis({
     repoUrl: cloudRepos[0].url,
     startingRef: cloudRepos[0].startingRef || "main",
   });
+
+  cloudAnalyzeInFlight += 1;
   try {
     const raw = await runAgent(prompt, {
       model,
       timeoutMs,
       runtime: "cloud",
       cloudRepos,
+      cancellable: true,
     });
     const lines = cloudAnalysisToLines(raw);
     return {
@@ -155,13 +174,24 @@ export async function runCloudCodeAnalysis({
       error: String(error.message || error),
       source: "cloud",
     };
+  } finally {
+    cloudAnalyzeInFlight = Math.max(0, cloudAnalyzeInFlight - 1);
   }
 }
 
-export function resolveCloudReposForCodeAnalysis(config, sessionProjectKey = "") {
+/** Test helper */
+export function __resetCloudAnalyzeInFlight() {
+  cloudAnalyzeInFlight = 0;
+}
+
+export function resolveCloudReposForCodeAnalysis(
+  config,
+  { sessionProjectKey = "", projectCode = "" } = {},
+) {
   return resolveCloudReposForSession({
     cloudRepos: config.cloudRepos,
     sessionProjectKey: sessionProjectKey || config.defaultCloudRepoKey || "tiktok",
     defaultKey: config.defaultCloudRepoKey || "tiktok",
+    projectCode,
   });
 }

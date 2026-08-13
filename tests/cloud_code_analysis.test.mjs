@@ -46,15 +46,15 @@ test("cloudAnalysisToLines strips bullets", () => {
   assert.deepEqual(lines, ["脚本存在", "分区可能缺失"]);
 });
 
-test("buildCloudCodeAnalysisPrompt mentions sql file", () => {
+test("buildCloudCodeAnalysisPrompt redacts jdbc password in log", () => {
   const p = buildCloudCodeAnalysisPrompt({
-    sqlFile: "output/boost/ads_boost_marketplace_creators.sql",
+    sqlFile: "output/boost/x.sql",
     category: "SQL/JDBC",
-    varsMap: { country_code: "ID", data_date: "2026-08-10" },
-    logText: "No rows selected (12 seconds)\n",
+    varsMap: { country_code: "ID" },
+    logText: "Error jdbc:hive2://u:secret@host:10001 failed\nNo rows selected (1 seconds)",
     repoUrl: "https://github.com/Kalodata/data-analysis-tiktok",
   });
-  assert.match(p, /ads_boost_marketplace_creators/);
-  assert.match(p, /country_code=ID/);
-  assert.match(p, /No rows selected/);
+  assert.doesNotMatch(p, /secret@/);
+  assert.match(p, /\[REDACTED\]/);
+  assert.match(p, /ads_boost|output\/boost\/x\.sql/);
 });

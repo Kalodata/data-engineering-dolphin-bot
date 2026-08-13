@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildAgentPromptOptions,
+  cloudRepoKeyFromProjectCode,
   loadCloudReposMap,
   normalizeCloudRepoKey,
   resolveCloudReposForSession,
@@ -16,13 +17,28 @@ test("normalizeCloudRepoKey aliases", () => {
   assert.equal(normalizeCloudRepoKey("shopee"), "shopee");
 });
 
-test("resolveCloudReposForSession picks amazon", () => {
+test("cloudRepoKeyFromProjectCode maps amz and shopee codes", () => {
+  assert.equal(cloudRepoKeyFromProjectCode("15468494076768"), "amazon");
+  assert.equal(cloudRepoKeyFromProjectCode("16419399873888"), "shopee");
+  assert.equal(cloudRepoKeyFromProjectCode("9892432515424"), "tiktok");
+  assert.equal(cloudRepoKeyFromProjectCode("amz"), "amazon");
+});
+
+test("resolveCloudReposForSession picks amazon by projectCode", () => {
   const repos = resolveCloudReposForSession({
     cloudRepos: DEFAULT_CLOUD_REPOS,
-    sessionProjectKey: "amz",
+    projectCode: "15468494076768",
   });
   assert.equal(repos.length, 1);
   assert.match(repos[0].url, /data-analysis-amazon/);
+});
+
+test("resolveCloudReposForSession picks shopee by projectCode", () => {
+  const repos = resolveCloudReposForSession({
+    cloudRepos: DEFAULT_CLOUD_REPOS,
+    projectCode: "16419399873888",
+  });
+  assert.match(repos[0].url, /data-analysis-shopee/);
 });
 
 test("loadCloudReposMap merges overrides", () => {
@@ -32,6 +48,10 @@ test("loadCloudReposMap merges overrides", () => {
   assert.equal(map.tiktok.url, "https://github.com/example/tiktok");
   assert.equal(map.tiktok.startingRef, "develop");
   assert.match(map.amazon.url, /data-analysis-amazon/);
+});
+
+test("loadCloudReposMap false disables defaults", () => {
+  assert.deepEqual(loadCloudReposMap(false), {});
 });
 
 test("buildAgentPromptOptions cloud excludes local", () => {

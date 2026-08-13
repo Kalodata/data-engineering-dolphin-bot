@@ -264,21 +264,39 @@ function loadConfig(configPath) {
       };
     })(),
     /**
-     * Chat / Alert Agent runtime:
-     * - cloud: Cursor Cloud clones GitHub (no ECS disk repo needed)
+     * Chat / Alert Agent runtime (backward compatible default: local).
+     * ECS has no pipeline checkout — set agent_chat_runtime: "cloud" explicitly.
+     * - cloud: Cursor Cloud clones GitHub
      * - local: Agent.prompt({ local: { cwd } }) against projects.remote / alert_cwd
      * Planner always stays local (cheap intent JSON).
      */
-    agentChatRuntime: String(raw.agent_chat_runtime || "cloud").toLowerCase() === "local"
-      ? "local"
-      : "cloud",
-    cloudRepos: loadCloudReposMap(raw.cloud_repos || {}),
+    agentChatRuntime: String(raw.agent_chat_runtime || "local").toLowerCase() === "cloud"
+      ? "cloud"
+      : "local",
+    cloudRepos: loadCloudReposMap(
+      Object.prototype.hasOwnProperty.call(raw, "cloud_repos") ? raw.cloud_repos : {},
+    ),
     defaultCloudRepoKey: normalizeCloudRepoKey(
       raw.default_cloud_repo_key || raw.default_ds_project || "tiktok",
     ),
-    /** Diagnose / alert: auto Cloud-read pipeline SQL when local enrich insufficient. */
-    cloudCodeOnDiagnose: raw.cloud_code_on_diagnose !== false,
-    cloudCodeOnAlert: raw.cloud_code_on_alert !== false,
+    /**
+     * Cloud code analysis for diagnose/alert.
+     * Default ON only when agent_chat_runtime=cloud; otherwise OFF unless explicitly true.
+     */
+    cloudCodeOnDiagnose: (() => {
+      const runtimeCloud =
+        String(raw.agent_chat_runtime || "local").toLowerCase() === "cloud";
+      if (raw.cloud_code_on_diagnose === true) return true;
+      if (raw.cloud_code_on_diagnose === false) return false;
+      return runtimeCloud;
+    })(),
+    cloudCodeOnAlert: (() => {
+      const runtimeCloud =
+        String(raw.agent_chat_runtime || "local").toLowerCase() === "cloud";
+      if (raw.cloud_code_on_alert === true) return true;
+      if (raw.cloud_code_on_alert === false) return false;
+      return runtimeCloud;
+    })(),
     cloudCodeTimeoutMs: Number(raw.cloud_code_timeout_ms ?? 120_000),
   };
   // Merge allowlist.json (committed to git) into allowed_users / notify_user_ids
@@ -1204,6 +1222,7 @@ async function handleDiagnose(config, processInstanceId, message) {
     logText,
     repoAnalysis,
     mode: "diagnose",
+    projectCode: getEffectiveProjectCode(message?.chatId, null, config),
   });
 
   let evidenceLines = [];
@@ -1718,9 +1737,10 @@ async function maybeAttachCloudCodeAnalysis({
   logText = "",
   repoAnalysis = null,
   mode = "diagnose",
+  projectCode = "",
 } = {}) {
   const enabled =
-    mode === "diagnose" ? config.cloudCodeOnDiagnose !== false : config.cloudCodeOnAlert !== false;
+    mode === "diagnose" ? config.cloudCodeOnDiagnose === true : config.cloudCodeOnAlert === true;
   if (!enabled || !process.env.CURSOR_API_KEY) return repoAnalysis;
 
   const sessionKey =
@@ -1735,7 +1755,14 @@ async function maybeAttachCloudCodeAnalysis({
   });
   if (!need) return repoAnalysis;
 
-  const cloudRepos = resolveCloudReposForCodeAnalysis(config, sessionKey);
+  const cloudRepos = resolveCloudReposForCodeAnalysis(config, {
+    sessionProjectKey: sessionKey,
+    projectCode:
+      projectCode ||
+      getEffectiveProjectCode(chatId, null, config) ||
+      config.dsProjectCode ||
+      "",
+  });
   if (!cloudRepos.length) return repoAnalysis;
 
   console.error(
@@ -1777,7 +1804,7 @@ async function maybeAttachCloudCodeAnalysis({
 
 /**
  * @param {string} prompt
- * @param {{ model?: string, timeoutMs?: number, runtime?: "cloud"|"local", localCwd?: string, cloudRepos?: Array<{url:string,startingRef?:string}> }} opts
+ * @param {{ model?: string, timeoutMs?: number, runtime?: "cloud"|"local", localCwd?: string, cloudRepos?: Array<{url:string,startingRef?:string}>, cancellable?: boolean }} opts
  */
 async function runCursor(prompt, opts = {}) {
   const {
@@ -1786,6 +1813,7 @@ async function runCursor(prompt, opts = {}) {
     runtime = "local",
     localCwd = null,
     cloudRepos = [],
+    cancellable = false,
   } = opts;
   if (!process.env.CURSOR_API_KEY) {
     throw new Error("CURSOR_API_KEY is required for chat / /alert / /ask（写在项目 .env）");
@@ -1804,6 +1832,46 @@ async function runCursor(prompt, opts = {}) {
         ? ` repos=${(cloudRepos || []).map((r) => r.url).join(",") || "(none)"}`
         : ` cwd=${localCwd}`),
   );
+
+  // Cloud code analysis: create+send so we can cancel on timeout (Agent.prompt cannot).
+  if (cancellable && runtime === "cloud") {
+    const agent = await Agent.create(agentOpts);
+    let run = null;
+    try {
+      run = await agent.send(prompt);
+      const waited = run.wait().then((result) => {
+        if (result?.status === "error") {
+          return `Cursor run failed: ${result.result ?? result.id ?? "unknown error"}`;
+        }
+        return String(result?.result ?? "").trim();
+      });
+      const timeout = new Promise((_, reject) => {
+        setTimeout(async () => {
+          try {
+            if (run && typeof run.supports === "function" && run.supports("cancel")) {
+              await run.cancel();
+            }
+          } catch {
+            // ignore cancel errors
+          }
+          reject(
+            new Error(
+              `Cursor Agent 超时（>${Math.round(timeoutMs / 1000)}s），请重发或改用 /diagnose /slow`,
+            ),
+          );
+        }, timeoutMs);
+      });
+      return await Promise.race([waited, timeout]);
+    } finally {
+      try {
+        if (typeof agent.close === "function") agent.close();
+        else if (agent[Symbol.asyncDispose]) await agent[Symbol.asyncDispose]();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
   const run = Agent.prompt(prompt, agentOpts).then((result) => {
     if (result.status === "error") {
       return `Cursor run failed: ${result.result ?? result.id ?? "unknown error"}`;
@@ -2616,6 +2684,7 @@ async function main() {
         logText: args.logText,
         repoAnalysis: args.repoAnalysis,
         mode: args.mode || "alert",
+        projectCode: args.projectCode || "",
       }),
     onAlertSent: ({ chatId, userId, alert }) => {
       if (alert?.taskId != null && config.alertWatch?.statePath) {
@@ -2657,6 +2726,7 @@ async function main() {
               logText: args.logText,
               repoAnalysis: args.repoAnalysis,
               mode: args.mode || "alert",
+              projectCode: args.projectCode || "",
             }),
         });
         if (!alert?.text && !alert?.card) return { skipped: true, reason: "no_card" };

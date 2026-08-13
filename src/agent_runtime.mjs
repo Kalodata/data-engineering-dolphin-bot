@@ -3,6 +3,16 @@
  * Chat/Alert can run on Cursor Cloud against GitHub; Planner stays local/no-repo.
  */
 
+/** DS project codes → cloud_repos key (alert watcher has no /use session). */
+export const DS_PROJECT_CODE_TO_CLOUD_KEY = {
+  "9892432515424": "tiktok", // TikTok 天级 / daily
+  "9892430281952": "tiktok", // hourly
+  "9903013351008": "tiktok", // tiered
+  "9895112718944": "tiktok", // test
+  "15468494076768": "amazon",
+  "16419399873888": "shopee",
+};
+
 export const DEFAULT_CLOUD_REPOS = {
   tiktok: {
     url: "https://github.com/Kalodata/data-analysis-tiktok",
@@ -47,11 +57,23 @@ export function normalizeCloudRepoKey(key) {
   return k;
 }
 
+/** Map DS REST projectCode (or /use key) → cloud repo key. */
+export function cloudRepoKeyFromProjectCode(projectCodeOrKey, fallback = "tiktok") {
+  const raw = String(projectCodeOrKey || "").trim();
+  if (!raw) return normalizeCloudRepoKey(fallback);
+  if (/^\d+$/.test(raw)) {
+    return DS_PROJECT_CODE_TO_CLOUD_KEY[raw] || normalizeCloudRepoKey(fallback);
+  }
+  return normalizeCloudRepoKey(raw);
+}
+
 /**
  * Merge config cloud_repos over defaults.
+ * Pass `cloud_repos: false` or `null` to disable built-in defaults (empty map).
  * @returns {Record<string, { url: string, startingRef: string }>}
  */
-export function loadCloudReposMap(rawCloudRepos = {}) {
+export function loadCloudReposMap(rawCloudRepos) {
+  if (rawCloudRepos === false || rawCloudRepos === null) return {};
   const out = { ...DEFAULT_CLOUD_REPOS };
   for (const [key, value] of Object.entries(rawCloudRepos || {})) {
     const k = String(key).toLowerCase();
@@ -77,8 +99,11 @@ export function resolveCloudReposForSession({
   cloudRepos,
   sessionProjectKey = "",
   defaultKey = "tiktok",
+  projectCode = "",
 } = {}) {
-  const key = normalizeCloudRepoKey(sessionProjectKey || defaultKey);
+  const key = projectCode
+    ? cloudRepoKeyFromProjectCode(projectCode, sessionProjectKey || defaultKey)
+    : normalizeCloudRepoKey(sessionProjectKey || defaultKey);
   const map = cloudRepos || DEFAULT_CLOUD_REPOS;
   const entry = map[key] || map.tiktok || map[normalizeCloudRepoKey(defaultKey)];
   if (!entry?.url) return [];

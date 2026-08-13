@@ -549,6 +549,7 @@ export async function collectNewFailureAlerts(ds, options = {}) {
           logText,
           repoAnalysis,
           mode: "alert",
+          projectCode: ds.projectCode,
         });
       } catch (error) {
         console.error(`[alert] cloud code analyze failed: ${error.message}`);
@@ -685,6 +686,7 @@ export async function materializeTaskAlert(ds, event = {}, options = {}) {
         logText,
         repoAnalysis,
         mode: "alert",
+        projectCode: ds.projectCode,
       });
     } catch {
       // keep local-only
