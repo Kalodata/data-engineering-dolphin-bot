@@ -899,3 +899,129 @@ export function buildAlertCardFromReportFields(fields = {}) {
     dsReadonly: Boolean(dsReadonly),
   });
 }
+
+/**
+ * Card 1: pick a failed workflow by country + date.
+ * instances: [{ id, name, country, dataDate }]
+ */
+export function fsWorkflowPickCard({ instances = [], country = "", dataDate = "" } = {}) {
+  const els = [
+    md(
+      `找到 **${instances.length}** 个失败工作流（**${country.toUpperCase()}** / **${dataDate}**）：\n` +
+        `点击选择要处理的工作流：`,
+    ),
+  ];
+  const actions = instances.slice(0, 8).map((inst) =>
+    button({
+      label: `${clip(inst.name || `#${inst.id}`, 28)}  ${inst.country}  ${inst.dataDate}`,
+      action: "fs_wf_picked",
+      value: {
+        processInstanceId: String(inst.id),
+        instName: inst.name || "",
+        country: inst.country,
+        dataDate: inst.dataDate,
+      },
+    }),
+  );
+  for (let i = 0; i < actions.length; i += 2) {
+    els.push(actionRow(actions.slice(i, i + 2)));
+  }
+  if (!actions.length) els.push(md("没有符合条件的失败工作流。"));
+  return card({ title: "选择要强制成功的工作流", template: "wathet", elements: els });
+}
+
+/**
+ * Card 2: confirm drill-down into a selected workflow.
+ * failedNodes: [{ id, name, taskType }]
+ */
+export function fsDrillConfirmCard({
+  processInstanceId,
+  instName = "",
+  country = "",
+  dataDate = "",
+  failedNodes = [],
+} = {}) {
+  const nodeLines = failedNodes
+    .slice(0, 10)
+    .map((t) => `· ${clip(t.name || `#${t.id}`, 40)}（${t.taskType || "?"}）`)
+    .join("\n") || "· （无失败节点）";
+  const els = [
+    md(
+      `**工作流：** ${clip(instName || `#${processInstanceId}`, 40)}\n` +
+        `**国家：** ${country}  **日期：** ${dataDate}\n\n` +
+        `失败节点：\n${nodeLines}\n\n` +
+        `将下钻（最多4层）找到所有 quality-task 并逐个确认。`,
+    ),
+    hr(),
+    actionRow([
+      button({
+        label: "确认下钻",
+        action: "fs_drill_confirm",
+        type: "danger",
+        value: {
+          processInstanceId: String(processInstanceId),
+          instName,
+          country,
+          dataDate,
+        },
+      }),
+      button({ label: "取消", action: "fs_drill_cancel", value: {} }),
+    ]),
+  ];
+  return card({ title: "确认下钻强制成功？", template: "orange", elements: els });
+}
+
+/**
+ * Card 3: confirm force-success for one quality-task.
+ * remaining: JSON string of [{id, name, parentName}] for tasks not yet shown.
+ */
+export function fsQualityConfirmCard({
+  taskInstanceId,
+  taskName = "",
+  parentName = "",
+  processInstanceId,
+  remainingJson = "[]",
+  current = 1,
+  total = 1,
+} = {}) {
+  const remaining = Number(total) - Number(current);
+  const els = [
+    md(
+      `**任务：** ${clip(taskName || `#${taskInstanceId}`, 40)}\n` +
+        `**所属：** ${clip(parentName, 40)}\n` +
+        `**实例 ID：** #${taskInstanceId}\n\n` +
+        `进度：${current} / ${total}（剩余 ${remaining} 个待确认）`,
+    ),
+    hr(),
+    actionRow([
+      button({
+        label: "确认强制成功",
+        action: "fs_quality_confirm",
+        type: "danger",
+        value: {
+          taskInstanceId: String(taskInstanceId),
+          processInstanceId: String(processInstanceId),
+          remainingJson,
+          current: String(current),
+          total: String(total),
+        },
+      }),
+      button({
+        label: "跳过",
+        action: "fs_quality_skip",
+        value: {
+          taskInstanceId: String(taskInstanceId),
+          processInstanceId: String(processInstanceId),
+          remainingJson,
+          current: String(current),
+          total: String(total),
+        },
+      }),
+    ]),
+  ];
+  return card({
+    title: `强制成功 quality-task？（${current} / ${total}）`,
+    template: "orange",
+    elements: els,
+  });
+}

@@ -71,6 +71,9 @@ import {
   slowJobsCard,
   runningCard,
   boardCard,
+  fsWorkflowPickCard,
+  fsDrillConfirmCard,
+  fsQualityConfirmCard,
 } from "./feishu_cards.mjs";
 import {
   startCardCallbackServer,
@@ -885,6 +888,14 @@ async function runCommand(config, command, message) {
         "需要时在 config.json 设 ds_readonly=false 并重启 bot。"
       );
     }
+    // /force-success <country> <date> → guided card flow
+    {
+      const arg1 = String(command[1] || "").toLowerCase();
+      const arg2 = String(command[2] || "");
+      if (/^[a-z]{2}$/.test(arg1) && /^\d{4}-\d{2}-\d{2}$/.test(arg2)) {
+        return handleFsCountryDate(config, arg1, arg2, message);
+      }
+    }
 
     // command[1] is a plain number → treat as taskId (existing behavior)
     const firstArg = String(command[1] || "").toLowerCase();
@@ -1221,6 +1232,64 @@ async function handleConfirm(config, message, accepted) {
     card: doneCard({ body: resultText, uiUrl, processInstanceId: pending.processInstanceId }),
     text: resultText,
   };
+}
+
+/** Fetch failed workflows matching country + dataDate, return card 1. */
+async function handleFsCountryDate(config, country, dataDate, message) {
+  const ds = getDsClient(config);
+  const page = await ds.listProcessInstances({ stateType: "FAILURE", pageSize: 50 });
+  const all = page?.totalList || [];
+  const matched = all
+    .filter((inst) => {
+      const c = getGlobalParam(inst, "country_code").toLowerCase();
+      const d = getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || "";
+      return c === country && d === dataDate;
+    })
+    .map((inst) => ({
+      id: inst.id,
+      name: inst.name || "",
+      country: (getGlobalParam(inst, "country_code") || country).toUpperCase(),
+      dataDate: getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || dataDate,
+    }));
+  if (!matched.length) {
+    return `未找到 ${country.toUpperCase()} / ${dataDate} 的失败工作流（最近50条内）。\n可先 /failed 确认实例状态。`;
+  }
+  if (message?.chatId) lastFailureByChat.set(message.chatId, Number(matched[0].id));
+  return {
+    card: fsWorkflowPickCard({ instances: matched, country: country.toUpperCase(), dataDate }),
+    text: `找到 ${matched.length} 个失败工作流（${country.toUpperCase()} / ${dataDate}）：`,
+  };
+}
+
+/**
+ * Recursively drill into SUB_PROCESS nodes to collect leaf quality-task instances.
+ * Returns [{ id, name, parentName }]
+ */
+async function drillForQualityTasks(ds, processInstanceId, depth = 0, maxDepth = 4) {
+  if (depth >= maxDepth) return [];
+  const page = await ds.listTaskInstances({
+    processInstanceId,
+    stateType: "FAILURE",
+    pageSize: 100,
+  });
+  const tasks = page?.totalList || [];
+  const results = [];
+  for (const t of tasks) {
+    if (t.taskType === "SUB_PROCESS") {
+      const subId = await ds.getSubProcessInstanceId(t.id).catch(() => null);
+      if (subId) {
+        const sub = await drillForQualityTasks(ds, subId, depth + 1, maxDepth);
+        results.push(...sub);
+      }
+    } else if (FORCE_SUCCESS_TASK_NAME_RE.test(t.name || "")) {
+      results.push({
+        id: t.id,
+        name: t.name || `#${t.id}`,
+        parentName: t.processInstanceName || String(processInstanceId),
+      });
+    }
+  }
+  return results;
 }
 
 async function executePendingWrite(config, pending) {
@@ -2113,6 +2182,119 @@ async function handleCardAction(action) {
       if (chatId) await sendCard({ chatId, card });
       else if (action.openId) await sendCard({ userId: action.openId, card });
       return { toast: { type: "info", content: "请确认强制成功" } };
+    }
+
+    if (name === "fs_wf_picked") {
+      const processInstanceId = Number(v.processInstanceId);
+      if (!processInstanceId) return { toast: { type: "error", content: "缺少实例 id" } };
+      const ds = getDsClient(config);
+      const page = await ds.listTaskInstances({
+        processInstanceId,
+        stateType: "FAILURE",
+        pageSize: 100,
+      });
+      const failedNodes = (page?.totalList || []).map((t) => ({
+        id: t.id,
+        name: t.name || `#${t.id}`,
+        taskType: t.taskType || "?",
+      }));
+      const card = fsDrillConfirmCard({
+        processInstanceId,
+        instName: v.instName || "",
+        country: v.country || "",
+        dataDate: v.dataDate || "",
+        failedNodes,
+      });
+      if (chatId) await sendCard({ chatId, card });
+      else if (action.openId) await sendCard({ userId: action.openId, card });
+      return { toast: { type: "info", content: "请确认下钻" } };
+    }
+
+    if (name === "fs_drill_cancel") {
+      return { toast: { type: "info", content: "已取消" } };
+    }
+
+    if (name === "fs_drill_confirm") {
+      if (config.dsReadonly) return { toast: { type: "error", content: "只读模式，禁止强制成功" } };
+      const processInstanceId = Number(v.processInstanceId);
+      if (!processInstanceId) return { toast: { type: "error", content: "缺少实例 id" } };
+      const ds = getDsClient(config, getEffectiveProjectCode(chatId, null, config));
+      const qualityTasks = await drillForQualityTasks(ds, processInstanceId);
+      if (!qualityTasks.length) {
+        const text =
+          `实例 #${processInstanceId} 下未找到失败的 quality-task。\n` +
+          `可用 /tasks ${processInstanceId} 手动查看节点状态。`;
+        if (chatId) await sendText({ chatId, text });
+        else if (action.openId) await sendText({ userId: action.openId, text });
+        return { toast: { type: "info", content: "未找到 quality-task" } };
+      }
+      const [first, ...rest] = qualityTasks;
+      const card = fsQualityConfirmCard({
+        taskInstanceId: first.id,
+        taskName: first.name,
+        parentName: first.parentName,
+        processInstanceId,
+        remainingJson: JSON.stringify(rest),
+        current: 1,
+        total: qualityTasks.length,
+      });
+      if (chatId) await sendCard({ chatId, card });
+      else if (action.openId) await sendCard({ userId: action.openId, card });
+      return { toast: { type: "info", content: `找到 ${qualityTasks.length} 个 quality-task，开始逐个确认` } };
+    }
+
+    if (name === "fs_quality_confirm" || name === "fs_quality_skip") {
+      if (name === "fs_quality_confirm" && config.dsReadonly) {
+        return { toast: { type: "error", content: "只读模式，禁止强制成功" } };
+      }
+      const taskInstanceId = Number(v.taskInstanceId);
+      const processInstanceId = Number(v.processInstanceId);
+      const current = Number(v.current || 1);
+      const total = Number(v.total || 1);
+      let remaining = [];
+      try { remaining = JSON.parse(v.remainingJson || "[]"); } catch { remaining = []; }
+
+      if (name === "fs_quality_confirm" && taskInstanceId) {
+        const ds = getDsClient(config, getEffectiveProjectCode(chatId, null, config));
+        await ds.forceTaskSuccess(taskInstanceId);
+        auditLog?.write({
+          openId: action.openId || "unknown",
+          action: "force-success",
+          detail: `quality-task #${taskInstanceId} via guided flow`,
+          ok: true,
+        });
+      }
+
+      if (!remaining.length) {
+        const text = `强制成功流程完成：${current}/${total} 已处理。`;
+        if (chatId) await sendText({ chatId, text });
+        else if (action.openId) await sendText({ userId: action.openId, text });
+        return {
+          toast: {
+            type: "success",
+            content: name === "fs_quality_confirm" ? `已强制成功 #${taskInstanceId}` : `已跳过`,
+          },
+        };
+      }
+
+      const [next, ...rest] = remaining;
+      const card = fsQualityConfirmCard({
+        taskInstanceId: next.id,
+        taskName: next.name,
+        parentName: next.parentName,
+        processInstanceId,
+        remainingJson: JSON.stringify(rest),
+        current: current + 1,
+        total,
+      });
+      if (chatId) await sendCard({ chatId, card });
+      else if (action.openId) await sendCard({ userId: action.openId, card });
+      return {
+        toast: {
+          type: name === "fs_quality_confirm" ? "success" : "info",
+          content: name === "fs_quality_confirm" ? `已强制成功 #${taskInstanceId}` : "已跳过",
+        },
+      };
     }
 
     if (name === "confirm_yes" || name === "confirm_no") {

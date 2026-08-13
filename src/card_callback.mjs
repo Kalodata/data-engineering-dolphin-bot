@@ -190,7 +190,10 @@ export function startCardCallbackServer({
 }
 
 function isSlowCardAction(name) {
-  return ["diagnose", "log"].includes(String(name || ""));
+  return [
+    "diagnose", "log",
+    "fs_wf_picked", "fs_drill_confirm", "fs_quality_confirm", "fs_quality_skip",
+  ].includes(String(name || ""));
 }
 
 /**
