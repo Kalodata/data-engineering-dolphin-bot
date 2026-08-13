@@ -1244,23 +1244,17 @@ async function handleConfirm(config, message, accepted) {
 /** Fetch failed workflows matching country + dataDate, return card 1. */
 async function handleFsCountryDate(config, country, dataDate, message) {
   const ds = getDsClient(config);
-  const page = await ds.listProcessInstances({ stateType: "FAILURE", pageSize: 50 });
-  const all = page?.totalList || [];
-  const matched = all
-    .filter((inst) => {
-      const c = getGlobalParam(inst, "country_code").toLowerCase();
-      const d = getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || "";
-      return c === country && d === dataDate;
-    })
-    .map((inst) => ({
-      id: inst.id,
-      name: inst.name || "",
-      country: (getGlobalParam(inst, "country_code") || country).toUpperCase(),
-      dataDate: getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || dataDate,
-    }));
-  if (!matched.length) {
+  // resolveInstanceByCountryDate fetches detail for each candidate (N+1) to read globalParams
+  const results = await resolveInstanceByCountryDate(ds, { country, dataDate, stateType: "FAILURE" });
+  if (!results.length) {
     return `未找到 ${country.toUpperCase()} / ${dataDate} 的失败工作流（最近50条内）。\n可先 /failed 确认实例状态。`;
   }
+  const matched = results.map((inst) => ({
+    id: inst.id,
+    name: inst.name || "",
+    country: (getGlobalParam(inst, "country_code") || country).toUpperCase(),
+    dataDate: getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || dataDate,
+  }));
   if (message?.chatId) lastFailureByChat.set(message.chatId, Number(matched[0].id));
   return {
     card: fsWorkflowPickCard({ instances: matched, country: country.toUpperCase(), dataDate }),

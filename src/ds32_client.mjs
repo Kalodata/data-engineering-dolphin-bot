@@ -1227,8 +1227,11 @@ export async function resolveInstanceByCountryDate(
   }
   if (dataDate) {
     results = results.filter((inst) => {
-      const dd =
+      const rawDd =
         getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day");
+      const dd = /^\d{8}$/.test(rawDd)
+        ? `${rawDd.slice(0, 4)}-${rawDd.slice(4, 6)}-${rawDd.slice(6, 8)}`
+        : rawDd;
       return dd === dataDate;
     });
   }
