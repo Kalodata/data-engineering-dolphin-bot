@@ -46,6 +46,25 @@
   "projects": {
     "remote": "/path/to/dolphin-feishu-bot"
   },
+  "agent_chat_runtime": "local",
+  "default_cloud_repo_key": "tiktok",
+  "cloud_code_on_diagnose": false,
+  "cloud_code_on_alert": false,
+  "cloud_code_timeout_ms": 120000,
+  "cloud_repos": {
+    "tiktok": {
+      "url": "https://github.com/Kalodata/data-analysis-tiktok",
+      "starting_ref": "main"
+    },
+    "amazon": {
+      "url": "https://github.com/Kalodata/data-analysis-amazon",
+      "starting_ref": "main"
+    },
+    "shopee": {
+      "url": "https://github.com/Kalodata/data-analysis-shopee",
+      "starting_ref": "main"
+    }
+  },
   "model": "auto",
   "max_reply_chars": 6000,
   "alert_prompt_path": "/Users/you/.cursor/agents/alert/PROMPT.md",

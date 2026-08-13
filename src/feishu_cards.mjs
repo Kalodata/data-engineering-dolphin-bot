@@ -127,6 +127,7 @@ export function alertCard({
   repoLines = [],
   fixes = [],
   dsReadonly = true,
+  projectCode = "",
 } = {}) {
   const lines = [];
   if (cause) lines.push(`**原因：** ${clip(cause, 160)}`);
@@ -177,7 +178,13 @@ export function alertCard({
         label: "诊断",
         action: "diagnose",
         type: "primary",
-        value: { processInstanceId: String(processInstanceId), taskId: taskId ? String(taskId) : "" },
+        value: withProjectCode(
+          {
+            processInstanceId: String(processInstanceId),
+            taskId: taskId ? String(taskId) : "",
+          },
+          projectCode,
+        ),
       }),
     );
     if (!dsReadonly) {
@@ -186,10 +193,13 @@ export function alertCard({
           label: "重跑",
           action: "rerun_request",
           type: "danger",
-          value: {
-            processInstanceId: String(processInstanceId),
-            executeType: "START_FAILURE_TASK_PROCESS",
-          },
+          value: withProjectCode(
+            {
+              processInstanceId: String(processInstanceId),
+              executeType: "START_FAILURE_TASK_PROCESS",
+            },
+            projectCode,
+          ),
         }),
       );
     }
@@ -199,7 +209,7 @@ export function alertCard({
       button({
         label: "看日志",
         action: "log",
-        value: { taskId: String(taskId) },
+        value: withProjectCode({ taskId: String(taskId) }, projectCode),
       }),
     );
   }
@@ -231,6 +241,7 @@ export function diagnoseCard({
   extraFailed = [],
   uiUrl = "",
   dsReadonly = true,
+  projectCode = "",
 } = {}) {
   const lines = [
     `**类别：** ${category || "?"}`,
@@ -295,10 +306,13 @@ export function diagnoseCard({
         label: "重跑（从失败处）",
         action: "rerun_request",
         type: "danger",
-        value: {
-          processInstanceId: String(processInstanceId),
-          executeType: "START_FAILURE_TASK_PROCESS",
-        },
+        value: withProjectCode(
+          {
+            processInstanceId: String(processInstanceId),
+            executeType: "START_FAILURE_TASK_PROCESS",
+          },
+          projectCode,
+        ),
       }),
     );
   }
@@ -307,10 +321,13 @@ export function diagnoseCard({
       button({
         label: "强制成功",
         action: "force_success_request",
-        value: {
-          taskId: String(taskId),
-          processInstanceId: processInstanceId ? String(processInstanceId) : "",
-        },
+        value: withProjectCode(
+          {
+            taskId: String(taskId),
+            processInstanceId: processInstanceId ? String(processInstanceId) : "",
+          },
+          projectCode,
+        ),
       }),
     );
   }
@@ -319,7 +336,7 @@ export function diagnoseCard({
       button({
         label: "看日志",
         action: "log",
-        value: { taskId: String(taskId) },
+        value: withProjectCode({ taskId: String(taskId) }, projectCode),
       }),
     );
   }
@@ -470,6 +487,7 @@ export function forceSuccessPickCard({
   instName = "",
   tasks = [],
   uiUrl = "",
+  projectCode = "",
 } = {}) {
   const link = uiLinkMd(uiUrl, processInstanceId);
   const els = [
@@ -483,10 +501,13 @@ export function forceSuccessPickCard({
     button({
       label: `#${t.id} ${clip(t.name || "?", 18)}`,
       action: "force_success_request",
-      value: {
-        taskId: String(t.id),
-        processInstanceId: String(processInstanceId),
-      },
+      value: withProjectCode(
+        {
+          taskId: String(t.id),
+          processInstanceId: String(processInstanceId),
+        },
+        projectCode,
+      ),
     }),
   );
   for (let i = 0; i < actions.length; i += 2) {
@@ -506,6 +527,7 @@ export function failedListCard({
   total = null,
   dsReadonly = true,
   uiUrlBuilder = null,
+  projectCode = "",
 } = {}) {
   if (!rows.length) {
     return card({
@@ -536,7 +558,7 @@ export function failedListCard({
         label: "诊断",
         action: "diagnose",
         type: "primary",
-        value: { processInstanceId: String(id) },
+        value: withProjectCode({ processInstanceId: String(id) }, projectCode),
       }),
     ];
     if (!dsReadonly) {
@@ -545,10 +567,13 @@ export function failedListCard({
           label: "重跑",
           action: "rerun_request",
           type: "danger",
-          value: {
-            processInstanceId: String(id),
-            executeType: "START_FAILURE_TASK_PROCESS",
-          },
+          value: withProjectCode(
+            {
+              processInstanceId: String(id),
+              executeType: "START_FAILURE_TASK_PROCESS",
+            },
+            projectCode,
+          ),
         }),
       );
     }
@@ -704,6 +729,7 @@ export function slowJobsCard({
   stageNameRe = null,
   dsReadonly = true,
   uiUrlBuilder = null,
+  projectCode = "",
 } = {}) {
   const stageLabel = Math.round(Number(stageMinSec || 0) / 60) || 15;
   const jobLabel = Math.round(Number(jobMinSec || 0) / 60) || 5;
@@ -766,7 +792,10 @@ export function slowJobsCard({
         label: "诊断",
         action: "diagnose",
         type: "primary",
-        value: { processInstanceId: String(hit.workflowId) },
+        value: withProjectCode(
+          { processInstanceId: String(hit.workflowId) },
+          projectCode,
+        ),
       }),
     ];
     const firstJob = hit.jobs?.[0];
@@ -775,7 +804,7 @@ export function slowJobsCard({
         button({
           label: "看日志",
           action: "log",
-          value: { taskId: String(firstJob.id) },
+          value: withProjectCode({ taskId: String(firstJob.id) }, projectCode),
         }),
       );
     }
@@ -785,10 +814,13 @@ export function slowJobsCard({
           label: "重跑",
           action: "rerun_request",
           type: "danger",
-          value: {
-            processInstanceId: String(hit.workflowId),
-            executeType: "START_FAILURE_TASK_PROCESS",
-          },
+          value: withProjectCode(
+            {
+              processInstanceId: String(hit.workflowId),
+              executeType: "START_FAILURE_TASK_PROCESS",
+            },
+            projectCode,
+          ),
         }),
       );
     }
@@ -827,6 +859,12 @@ export function simpleResultCard({ title = "结果", template = "blue", body } =
     template,
     elements: [md(body || "(empty)")],
   });
+}
+
+function withProjectCode(value, projectCode) {
+  const code = String(projectCode || "").trim();
+  if (!code) return value;
+  return { ...value, projectCode: code };
 }
 
 function clip(s, n) {
@@ -897,6 +935,7 @@ export function buildAlertCardFromReportFields(fields = {}) {
     repoLines: repoAnalysis?.useful ? repoAnalysis.lines || [] : [],
     fixes: classification?.fixes || [],
     dsReadonly: Boolean(dsReadonly),
+    projectCode,
   });
 }
 

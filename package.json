@@ -16,7 +16,7 @@
     "deploy:ecs": "bash scripts/ecs/deploy.sh"
   },
   "dependencies": {
-    "@cursor/sdk": "latest",
+    "@cursor/sdk": "1.0.17",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "zod": "^4.4.3"
   },

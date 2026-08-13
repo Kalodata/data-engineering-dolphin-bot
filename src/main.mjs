@@ -41,6 +41,17 @@ import {
 } from "./ds_adaptive.mjs";
 import { resolveCountryCode } from "./country_code.mjs";
 import {
+  buildAgentPromptOptions,
+  loadCloudReposMap,
+  normalizeCloudRepoKey,
+  resolveCloudReposForSession,
+} from "./agent_runtime.mjs";
+import {
+  shouldCloudCodeAnalyze,
+  runCloudCodeAnalysis,
+  resolveCloudReposForCodeAnalysis,
+} from "./cloud_code_analysis.mjs";
+import {
   formatAlertReport,
   formatAlertCard,
   materializeTaskAlert,
@@ -252,6 +263,41 @@ function loadConfig(configPath) {
         minute: Number(bp.minute ?? 0),
       };
     })(),
+    /**
+     * Chat / Alert Agent runtime (backward compatible default: local).
+     * ECS has no pipeline checkout — set agent_chat_runtime: "cloud" explicitly.
+     * - cloud: Cursor Cloud clones GitHub
+     * - local: Agent.prompt({ local: { cwd } }) against projects.remote / alert_cwd
+     * Planner always stays local (cheap intent JSON).
+     */
+    agentChatRuntime: String(raw.agent_chat_runtime || "local").toLowerCase() === "cloud"
+      ? "cloud"
+      : "local",
+    cloudRepos: loadCloudReposMap(
+      Object.prototype.hasOwnProperty.call(raw, "cloud_repos") ? raw.cloud_repos : {},
+    ),
+    defaultCloudRepoKey: normalizeCloudRepoKey(
+      raw.default_cloud_repo_key || raw.default_ds_project || "tiktok",
+    ),
+    /**
+     * Cloud code analysis for diagnose/alert.
+     * Default ON only when agent_chat_runtime=cloud; otherwise OFF unless explicitly true.
+     */
+    cloudCodeOnDiagnose: (() => {
+      const runtimeCloud =
+        String(raw.agent_chat_runtime || "local").toLowerCase() === "cloud";
+      if (raw.cloud_code_on_diagnose === true) return true;
+      if (raw.cloud_code_on_diagnose === false) return false;
+      return runtimeCloud;
+    })(),
+    cloudCodeOnAlert: (() => {
+      const runtimeCloud =
+        String(raw.agent_chat_runtime || "local").toLowerCase() === "cloud";
+      if (raw.cloud_code_on_alert === true) return true;
+      if (raw.cloud_code_on_alert === false) return false;
+      return runtimeCloud;
+    })(),
+    cloudCodeTimeoutMs: Number(raw.cloud_code_timeout_ms ?? 120_000),
   };
   // Merge allowlist.json (committed to git) into allowed_users / notify_user_ids
   const allowlistPath = path.resolve(path.dirname(resolvedConfigPath), "allowlist.json");
@@ -588,6 +634,10 @@ async function runCommand(config, command, message) {
       `\nalert_mode: ${describeAlertMode(config)}` +
       `\nds_push: ${config.dsAlertWebhook?.enabled ? `on :${config.dsAlertWebhook.port}${config.dsAlertWebhook.path}` : "off"}` +
       `\ncard_callback: ${config.feishuCardCallback?.enabled ? `on :${config.feishuCardCallback.port}${config.feishuCardCallback.path}` : "off"}` +
+      `\nagent_chat: ${config.agentChatRuntime}` +
+      (config.agentChatRuntime === "cloud"
+        ? ` default=${config.defaultCloudRepoKey} (${config.cloudRepos?.[config.defaultCloudRepoKey]?.url || "?"})`
+        : "") +
       `\nmcp: 飞书bot不走Cursor MCP；详询 /mcp`
     );
   }
@@ -615,7 +665,13 @@ async function runCommand(config, command, message) {
     }
     sessionProjectByChat.set(message.chatId, key);
     const p = KNOWN_PROJECTS[key];
-    return `已切换到 **${p.label}**（project: ${p.code}）\n本群后续指令均使用此项目。\n恢复默认：/use tiktok`;
+    const cloudKey = normalizeCloudRepoKey(key);
+    const cloud = config.cloudRepos?.[cloudKey] || config.cloudRepos?.tiktok;
+    const cloudLine =
+      config.agentChatRuntime === "cloud" && cloud?.url
+        ? `\nChat/Alert 代码仓（Cloud）：${cloud.url}@${cloud.startingRef || "main"}`
+        : "";
+    return `已切换到 **${p.label}**（project: ${p.code}）\n本群后续指令均使用此项目。${cloudLine}\n恢复默认：/use tiktok`;
   }
   if (name === "board" || name === "countries" || name === "country-board") {
     const projectOverride = KNOWN_PROJECTS[String(command[1] || "").toLowerCase()] ? command[1] : null;
@@ -671,6 +727,7 @@ async function runCommand(config, command, message) {
         rows: page?.totalList || [],
         total: page?.total,
         dsReadonly: config.dsReadonly,
+        projectCode,
         uiUrlBuilder: (row) =>
           buildProcessInstanceUiUrl({
             apiUrl: env.apiUrl,
@@ -685,7 +742,8 @@ async function runCommand(config, command, message) {
   if (name === "tasks") {
     const id = Number(command[1]);
     if (!id) return "Usage: /tasks <processInstanceId>";
-    const ds = getDsClient(config);
+    const projectCode = getEffectiveProjectCode(message?.chatId, null, config);
+    const ds = getDsClient(config, projectCode);
     const page = await ds.listTaskInstances({ processInstanceId: id });
     return formatTaskList(id, page);
   }
@@ -763,6 +821,7 @@ async function runCommand(config, command, message) {
         country,
         stageNameRe: stageNameRe ? String(stageNameRe) : null,
         dsReadonly: config.dsReadonly,
+        projectCode: effectiveCode,
         uiUrlBuilder: (hit) =>
           buildProcessInstanceUiUrl({
             apiUrl: env.apiUrl,
@@ -777,7 +836,7 @@ async function runCommand(config, command, message) {
     const id = Number(command[1]);
     if (!id) return "Usage: /log <taskInstanceId>";
     if (message?.chatId) lastTaskByChat.set(message.chatId, id);
-    return handleLog(config, id);
+    return handleLog(config, id, message);
   }
   if (name === "diagnose") {
     const id = command[1] ? Number(command[1]) : null;
@@ -1031,6 +1090,7 @@ async function runCommand(config, command, message) {
         processInstanceId: wfId,
         instName: inst?.name || "",
         tasks: eligible,
+        projectCode,
         uiUrl: buildProcessInstanceUiUrl({
           apiUrl: env.apiUrl,
           projectCode,
@@ -1057,8 +1117,13 @@ async function runCommand(config, command, message) {
   return "Unknown command. Try /help.";
 }
 
-async function handleLog(config, taskInstanceId) {
-  const ds = getDsClient(config);
+async function handleLog(config, taskInstanceId, message = null, projectCodeOverride = null) {
+  const projectCode = getEffectiveProjectCode(
+    message?.chatId,
+    projectCodeOverride || message?.projectCode || null,
+    config,
+  );
+  const ds = getDsClient(config, projectCode);
   const logText = await ds.getTaskLogChunks(taskInstanceId);
   const highlight = extractLogHighlights(logText);
   if (highlight.purged) {
@@ -1073,8 +1138,13 @@ async function handleLog(config, taskInstanceId) {
   );
 }
 
-async function handleDiagnose(config, processInstanceId, message) {
-  const ds = getDsClient(config);
+async function handleDiagnose(config, processInstanceId, message, projectCodeOverride = null) {
+  const projectCode = getEffectiveProjectCode(
+    message?.chatId,
+    projectCodeOverride || message?.projectCode || null,
+    config,
+  );
+  const ds = getDsClient(config, projectCode);
   let instId = processInstanceId;
   if (!instId) {
     const page = await ds.listProcessInstances({ stateType: "FAILURE", pageSize: 10 });
@@ -1159,6 +1229,16 @@ async function handleDiagnose(config, processInstanceId, message) {
     }
   }
 
+  repoAnalysis = await maybeAttachCloudCodeAnalysis({
+    config,
+    chatId: message?.chatId,
+    classification,
+    logText,
+    repoAnalysis,
+    mode: "diagnose",
+    projectCode,
+  });
+
   let evidenceLines = [];
   if (highlight?.purged) {
     evidenceLines = [highlight.summary, classification.rawScript].filter(Boolean);
@@ -1171,7 +1251,7 @@ async function handleDiagnose(config, processInstanceId, message) {
   const env = loadDsEnv();
   const uiUrl = buildProcessInstanceUiUrl({
     apiUrl: env.apiUrl,
-    projectCode: getEffectiveProjectCode(message?.chatId, null, config),
+    projectCode,
     processInstanceId: instId,
     processDefinitionCode: inst?.processDefinitionCode,
   });
@@ -1205,6 +1285,7 @@ async function handleDiagnose(config, processInstanceId, message) {
       extraFailed: failed.slice(1, 6).map((t) => ({ id: t.id, name: t.name })),
       uiUrl,
       dsReadonly: config.dsReadonly,
+      projectCode,
     }),
     text,
   };
@@ -1370,7 +1451,7 @@ async function handleAlert(config, alertText, message) {
     );
   } else {
     console.error("[alert] weak evidence → local Agent card");
-    cardText = await runAlertLocal(config, alertText, evidence?.block || "");
+    cardText = await runAlertLocal(config, alertText, evidence?.block || "", message);
   }
   if (interactive) {
     return { card: interactive, text: cardText };
@@ -1428,13 +1509,17 @@ async function runAlertWebhook(url, key, alertText, message) {
   return `Webhook 已接受，未解析到处置卡文本。响应: ${raw.slice(0, 800)}`;
 }
 
-async function runAlertLocal(config, alertText, evidenceBlock = "") {
+async function runAlertLocal(config, alertText, evidenceBlock = "", message = null) {
   if (!fs.existsSync(config.alertPromptPath)) {
     throw new Error(`Alert prompt missing: ${config.alertPromptPath}`);
   }
   const system = fs.readFileSync(config.alertPromptPath, "utf8");
   const prompt = buildEvidenceAwareAlertPrompt(system, alertText, evidenceBlock);
-  return runCursor(config.alertCwd, config.model, prompt);
+  return runCursor(prompt, {
+    model: config.model,
+    timeoutMs: 300_000,
+    ...agentRuntimeForChat(config, message?.chatId),
+  });
 }
 
 async function handleNlIntent(config, message) {
@@ -1449,18 +1534,22 @@ async function handleNlIntent(config, message) {
     config.dsProjectCode ||
     env.projectCode ||
     "";
-  const cwd =
+  const plannerCwd =
     config.projects.remote ||
     config.alertCwd ||
     path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
   let plan = null;
   try {
+    // Planner: always local + bot cwd — do not clone pipeline repos for intent JSON.
     const plannerRaw = await runCursor(
-      cwd,
-      config.model,
       buildPlannerPrompt(message.text, historyBlock, projectCode),
-      { timeoutMs: 45_000 },
+      {
+        model: config.model,
+        timeoutMs: 45_000,
+        runtime: "local",
+        localCwd: plannerCwd,
+      },
     );
     plan = parsePlannerJson(plannerRaw);
   } catch (error) {
@@ -1524,14 +1613,23 @@ async function handleChat(config, message) {
     .map((m) => `${m.role}: ${m.text}`)
     .join("\n");
   const env = loadDsEnv();
-  const projectCode = config.dsProjectCode || env.projectCode || "(unset)";
-  const cwd =
-    config.projects.remote ||
-    config.alertCwd ||
-    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const projectCode =
+    getEffectiveProjectCode(message.chatId, null, config) ||
+    config.dsProjectCode ||
+    env.projectCode ||
+    "(unset)";
+  const runtimeOpts = agentRuntimeForChat(config, message.chatId);
+  const repoHint =
+    runtimeOpts.runtime === "cloud" && runtimeOpts.cloudRepos?.[0]?.url
+      ? `当前可阅读的 GitHub 仓：${runtimeOpts.cloudRepos[0].url}@${runtimeOpts.cloudRepos[0].startingRef || "main"}（只读；禁止开 PR/改代码提交）`
+      : `当前本地工作目录可读代码（只读）`;
 
   const prompt = `你是通过飞书私聊接入的 Cursor Agent（体验尽量接近 IDE 里对话）。
 用中文简洁回答。可以查代码、解释报错、给修复步骤。
+
+【代码上下文】
+- ${repoHint}
+- 用 /use tiktok|amz|shopee 切换调度项目与对应代码仓
 
 【飞书排版硬约束】
 - 禁止 Markdown 表格（不要用 | 列 |）；改用短行或「· 项 — 值」
@@ -1555,7 +1653,7 @@ DolphinScheduler（offline，经典 REST；dsctl /v2 暂不可用）：
 - 快捷命令：/diagnose /failed /slow /tasks /log /mcp /rerun /rerun-all /force-success
 
 约束：
-- 不要 commit/push/删数据
+- 不要 commit/push/删数据/开 PR
 - 不要直接调用 DS API；让用户走确认卡 / YES
 - 禁止建议改工作流定义
 - 不输出 token、密码、完整 JDBC 连接串
@@ -1565,7 +1663,11 @@ ${historyBlock ? `## 近期对话\n${historyBlock}\n` : ""}
 ## 用户本轮
 ${message.text}`;
 
-  const answer = await runCursor(cwd, config.model, prompt);
+  const answer = await runCursor(prompt, {
+    model: config.model,
+    timeoutMs: 300_000,
+    ...runtimeOpts,
+  });
   pushChat(message.chatId, "user", message.text);
   pushChat(message.chatId, "assistant", answer);
   return answer;
@@ -1588,7 +1690,11 @@ async function ask(config, command) {
     "about this local project. Do not modify files, install dependencies, " +
     "commit, push, or run destructive commands.\n\n" +
     `Question: ${question}`;
-  return runCursor(projectPath, config.model, prompt);
+  return runCursor(prompt, {
+    model: config.model,
+    runtime: "local",
+    localCwd: projectPath,
+  });
 }
 
 async function review(config, command) {
@@ -1599,7 +1705,11 @@ async function review(config, command) {
     "regressions, security risks, and missing tests. Do not modify files, " +
     "install dependencies, commit, push, or run destructive commands. " +
     "Return concise findings first. If there are no findings, say so.";
-  return runCursor(projectPath, config.model, prompt);
+  return runCursor(prompt, {
+    model: config.model,
+    runtime: "local",
+    localCwd: projectPath,
+  });
 }
 
 function projectPathFor(config, projectName) {
@@ -1612,15 +1722,172 @@ function projectPathFor(config, projectName) {
   return projectPath;
 }
 
-async function runCursor(cwd, model, prompt, { timeoutMs = 180_000 } = {}) {
+/** Chat/Alert: cloud.repos by /use session, or local cwd fallback. */
+function agentRuntimeForChat(config, chatId) {
+  const sessionKey =
+    (chatId && sessionProjectByChat.get(chatId)) || config.defaultCloudRepoKey || "tiktok";
+  if (config.agentChatRuntime === "cloud") {
+    const cloudRepos = resolveCloudReposForSession({
+      cloudRepos: config.cloudRepos,
+      sessionProjectKey: sessionKey,
+      defaultKey: config.defaultCloudRepoKey,
+    });
+    return { runtime: "cloud", cloudRepos };
+  }
+  const localCwd =
+    config.projects.remote ||
+    config.alertCwd ||
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  return { runtime: "local", localCwd };
+}
+
+/**
+ * Local sql_repo enrich first; if necessary, Cloud Agent reads GitHub pipeline repo.
+ * @param {"diagnose"|"alert"} mode
+ */
+async function maybeAttachCloudCodeAnalysis({
+  config,
+  chatId = null,
+  classification,
+  logText = "",
+  repoAnalysis = null,
+  mode = "diagnose",
+  projectCode = "",
+} = {}) {
+  const enabled =
+    mode === "diagnose" ? config.cloudCodeOnDiagnose === true : config.cloudCodeOnAlert === true;
+  if (!enabled || !process.env.CURSOR_API_KEY) return repoAnalysis;
+
+  const sessionKey =
+    (chatId && sessionProjectByChat.get(chatId)) || config.defaultCloudRepoKey || "tiktok";
+  const need = shouldCloudCodeAnalyze({
+    sqlFile: classification?.sqlFile,
+    category: classification?.category,
+    logText,
+    repoAnalysis,
+    // Diagnose: if we have a script path, prefer Cloud when local empty/miss.
+    force: mode === "diagnose" && Boolean(classification?.sqlFile) && !repoAnalysis?.found,
+  });
+  if (!need) return repoAnalysis;
+
+  const cloudRepos = resolveCloudReposForCodeAnalysis(config, {
+    sessionProjectKey: sessionKey,
+    projectCode:
+      projectCode ||
+      getEffectiveProjectCode(chatId, null, config) ||
+      config.dsProjectCode ||
+      "",
+  });
+  if (!cloudRepos.length) return repoAnalysis;
+
+  console.error(
+    `[cloud-code] ${mode} sql=${classification.sqlFile} repos=${cloudRepos.map((r) => r.url).join(",")}`,
+  );
+  const cloud = await runCloudCodeAnalysis({
+    runAgent: runCursor,
+    model: config.model,
+    timeoutMs: config.cloudCodeTimeoutMs || 120_000,
+    cloudRepos,
+    sqlFile: classification.sqlFile,
+    category: classification.category,
+    logText,
+    varsMap: classification.varsMap || {},
+  });
+
+  const cloudLines = (cloud.lines || []).map((l) =>
+    l.startsWith("Cloud") || l.startsWith("【") ? l : `Cloud：${l}`,
+  );
+  if (!cloudLines.length) return repoAnalysis;
+
+  const base = repoAnalysis || {
+    found: false,
+    useful: true,
+    lines: [],
+    relativePath: classification.sqlFile,
+  };
+  const merged = [
+    ...(base.lines || []).filter((l) => !/仓库未找到脚本/.test(l)),
+    ...cloudLines,
+  ].slice(0, 8);
+  return {
+    ...base,
+    useful: true,
+    cloud: true,
+    lines: merged,
+  };
+}
+
+/**
+ * @param {string} prompt
+ * @param {{ model?: string, timeoutMs?: number, runtime?: "cloud"|"local", localCwd?: string, cloudRepos?: Array<{url:string,startingRef?:string}>, cancellable?: boolean }} opts
+ */
+async function runCursor(prompt, opts = {}) {
+  const {
+    model = "auto",
+    timeoutMs = 180_000,
+    runtime = "local",
+    localCwd = null,
+    cloudRepos = [],
+    cancellable = false,
+  } = opts;
   if (!process.env.CURSOR_API_KEY) {
     throw new Error("CURSOR_API_KEY is required for chat / /alert / /ask（写在项目 .env）");
   }
-  const run = Agent.prompt(prompt, {
+  const agentOpts = buildAgentPromptOptions({
     apiKey: process.env.CURSOR_API_KEY,
-    model: { id: model },
-    local: { cwd },
-  }).then((result) => {
+    model,
+    runtime,
+    localCwd,
+    cloudRepos,
+    autoCreatePR: false,
+  });
+  console.error(
+    `[cursor] runtime=${runtime}` +
+      (runtime === "cloud"
+        ? ` repos=${(cloudRepos || []).map((r) => r.url).join(",") || "(none)"}`
+        : ` cwd=${localCwd}`),
+  );
+
+  // Cloud code analysis: create+send so we can cancel on timeout (Agent.prompt cannot).
+  if (cancellable && runtime === "cloud") {
+    const agent = await Agent.create(agentOpts);
+    let run = null;
+    try {
+      run = await agent.send(prompt);
+      const waited = run.wait().then((result) => {
+        if (result?.status === "error") {
+          return `Cursor run failed: ${result.result ?? result.id ?? "unknown error"}`;
+        }
+        return String(result?.result ?? "").trim();
+      });
+      const timeout = new Promise((_, reject) => {
+        setTimeout(async () => {
+          try {
+            if (run && typeof run.supports === "function" && run.supports("cancel")) {
+              await run.cancel();
+            }
+          } catch {
+            // ignore cancel errors
+          }
+          reject(
+            new Error(
+              `Cursor Agent 超时（>${Math.round(timeoutMs / 1000)}s），请重发或改用 /diagnose /slow`,
+            ),
+          );
+        }, timeoutMs);
+      });
+      return await Promise.race([waited, timeout]);
+    } finally {
+      try {
+        if (typeof agent.close === "function") agent.close();
+        else if (agent[Symbol.asyncDispose]) await agent[Symbol.asyncDispose]();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  const run = Agent.prompt(prompt, agentOpts).then((result) => {
     if (result.status === "error") {
       return `Cursor run failed: ${result.result ?? result.id ?? "unknown error"}`;
     }
@@ -1628,7 +1895,12 @@ async function runCursor(cwd, model, prompt, { timeoutMs = 180_000 } = {}) {
   });
   const timeout = new Promise((_, reject) => {
     setTimeout(
-      () => reject(new Error(`Cursor Agent 超时（>${Math.round(timeoutMs / 1000)}s），请重发或改用 /diagnose /slow`)),
+      () =>
+        reject(
+          new Error(
+            `Cursor Agent 超时（>${Math.round(timeoutMs / 1000)}s），请重发或改用 /diagnose /slow`,
+          ),
+        ),
       timeoutMs,
     );
   });
@@ -2086,7 +2358,7 @@ async function handleCardAction(action) {
         senderId: action.openId,
         messageId: action.messageId,
       };
-      const result = await handleDiagnose(config, id, fakeMsg);
+      const result = await handleDiagnose(config, id, fakeMsg, v.projectCode);
       if (chatId && result?.card) {
         await sendCard({ chatId, card: result.card });
       } else if (action.openId && result?.card) {
@@ -2098,7 +2370,12 @@ async function handleCardAction(action) {
     if (name === "log") {
       const taskId = Number(v.taskId);
       if (!taskId) return { toast: { type: "error", content: "缺少任务 id" } };
-      const text = await handleLog(config, taskId);
+      const fakeMsg = {
+        chatId: chatId || `cb:${action.openId || "anon"}`,
+        senderId: action.openId,
+        messageId: action.messageId,
+      };
+      const text = await handleLog(config, taskId, fakeMsg, v.projectCode);
       if (chatId) await sendText({ chatId, text });
       else if (action.openId) await sendText({ userId: action.openId, text });
       return { toast: { type: "success", content: `日志 #${taskId}` } };
@@ -2113,18 +2390,23 @@ async function handleCardAction(action) {
       const executeType = v.executeType || "START_FAILURE_TASK_PROCESS";
       const key = chatId || `user:${action.openId}`;
       if (chatId) lastFailureByChat.set(chatId, id);
+      const projectCode = getEffectiveProjectCode(
+        chatId,
+        v.projectCode || null,
+        config,
+      );
       const pending = pendingConfirms.set(key, {
         kind: "execute",
         processInstanceId: id,
         executeType,
-        projectCode: v.projectCode || getEffectiveProjectCode(chatId, null, config),
+        projectCode,
         openId: action.openId,
         summary: `实例 #${id}`,
       });
       const env = loadDsEnv();
       const uiUrl = buildProcessInstanceUiUrl({
         apiUrl: env.apiUrl,
-        projectCode: getEffectiveProjectCode(chatId, null, config),
+        projectCode,
         processInstanceId: id,
       });
       const card = confirmCard({
@@ -2155,11 +2437,16 @@ async function handleCardAction(action) {
       const key = chatId || `user:${action.openId}`;
       if (chatId && processInstanceId) lastFailureByChat.set(chatId, processInstanceId);
       if (chatId) lastTaskByChat.set(chatId, taskId);
+      const projectCode = getEffectiveProjectCode(
+        chatId,
+        v.projectCode || null,
+        config,
+      );
       const pending = pendingConfirms.set(key, {
         kind: "force-success",
         taskInstanceId: taskId,
         processInstanceId,
-        projectCode: v.projectCode || getEffectiveProjectCode(chatId, null, config),
+        projectCode,
         openId: action.openId,
         summary: `强制成功任务 #${taskId}`,
       });
@@ -2167,7 +2454,7 @@ async function handleCardAction(action) {
       const uiUrl = processInstanceId
         ? buildProcessInstanceUiUrl({
             apiUrl: env.apiUrl,
-            projectCode: getEffectiveProjectCode(chatId, null, config),
+            projectCode,
             processInstanceId,
           })
         : "";
@@ -2420,6 +2707,15 @@ async function main() {
     config,
     sendText,
     log: (line) => console.error(line),
+    cloudCodeAnalyze: (args) =>
+      maybeAttachCloudCodeAnalysis({
+        config,
+        classification: args.classification,
+        logText: args.logText,
+        repoAnalysis: args.repoAnalysis,
+        mode: args.mode || "alert",
+        projectCode: args.projectCode || "",
+      }),
     onAlertSent: ({ chatId, userId, alert }) => {
       if (alert?.taskId != null && config.alertWatch?.statePath) {
         markTaskNotified(config.alertWatch.statePath, alert.taskId);
@@ -2453,6 +2749,15 @@ async function main() {
             ? { ...config.hiveProbe, onAlert: config.hiveProbe.onAlert === true }
             : null,
           enablePrLookup: config.enablePrLookup !== false,
+          cloudCodeAnalyze: (args) =>
+            maybeAttachCloudCodeAnalysis({
+              config,
+              classification: args.classification,
+              logText: args.logText,
+              repoAnalysis: args.repoAnalysis,
+              mode: args.mode || "alert",
+              projectCode: args.projectCode || "",
+            }),
         });
         if (!alert?.text && !alert?.card) return { skipped: true, reason: "no_card" };
         markTaskNotified(config.alertWatch.statePath, alert.taskId);

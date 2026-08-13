@@ -542,6 +542,19 @@ export async function collectNewFailureAlerts(ds, options = {}) {
         }
       }
     }
+    if (typeof options.cloudCodeAnalyze === "function" && classification.sqlFile) {
+      try {
+        repoAnalysis = await options.cloudCodeAnalyze({
+          classification,
+          logText,
+          repoAnalysis,
+          mode: "alert",
+          projectCode: ds.projectCode,
+        });
+      } catch (error) {
+        console.error(`[alert] cloud code analyze failed: ${error.message}`);
+      }
+    }
     const reportFields = {
       task,
       inst,
@@ -666,6 +679,19 @@ export async function materializeTaskAlert(ds, event = {}, options = {}) {
       repoAnalysis = null;
     }
   }
+  if (typeof options.cloudCodeAnalyze === "function" && classification.sqlFile) {
+    try {
+      repoAnalysis = await options.cloudCodeAnalyze({
+        classification,
+        logText,
+        repoAnalysis,
+        mode: "alert",
+        projectCode: ds.projectCode,
+      });
+    } catch {
+      // keep local-only
+    }
+  }
 
   const reportFields = {
     task,
@@ -707,6 +733,7 @@ export function startFailureWatcher({
   sendText,
   log = console.error,
   onAlertSent = null,
+  cloudCodeAnalyze = null,
 }) {
   const watch = config.alertWatch;
   if (!watch?.enabled) {
@@ -794,6 +821,7 @@ export function startFailureWatcher({
           ? { ...config.hiveProbe, onAlert: config.hiveProbe.onAlert === true }
           : null,
         enablePrLookup: config.enablePrLookup !== false,
+        cloudCodeAnalyze: cloudCodeAnalyze || null,
       });
       if (result.seeded) {
         log(

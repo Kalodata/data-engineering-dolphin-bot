@@ -45,6 +45,7 @@ test("alertCard includes action buttons", () => {
     taskId: 9441911,
     taskName: "jdbc_sql",
     dsReadonly: false,
+    projectCode: "15468494076768",
   });
   const blob = JSON.stringify(c);
   assert.match(blob, /diagnose/);
@@ -53,6 +54,7 @@ test("alertCard includes action buttons", () => {
   assert.doesNotMatch(blob, /feedback/);
   assert.doesNotMatch(blob, /有用|误报|需升级/);
   assert.match(blob, /1939974/);
+  assert.match(blob, /15468494076768/);
 });
 
 test("alertCard hides rerun when readonly", () => {
@@ -143,11 +145,14 @@ test("failedListCard and slowJobsCard buttons", () => {
   const f = failedListCard({
     rows: [{ id: 11, name: "wf_a", state: "FAILURE", startTime: "a", endTime: "b" }],
     dsReadonly: false,
+    projectCode: "15468494076768",
     uiUrlBuilder: (r) => `https://x/${r.id}`,
   });
-  assert.match(JSON.stringify(f), /diagnose/);
-  assert.match(JSON.stringify(f), /rerun_request/);
-  assert.match(JSON.stringify(f), /打开/);
+  const fb = JSON.stringify(f);
+  assert.match(fb, /diagnose/);
+  assert.match(fb, /rerun_request/);
+  assert.match(fb, /打开/);
+  assert.match(fb, /15468494076768/);
 
   const s = slowJobsCard({
     hits: [
@@ -163,12 +168,14 @@ test("failedListCard and slowJobsCard buttons", () => {
     ],
     scannedInstances: 10,
     dsReadonly: false,
+    projectCode: "9892432515424",
     uiUrlBuilder: (h) => `https://x/${h.workflowId}`,
   });
   const sb = JSON.stringify(s);
   assert.match(sb, /diagnose/);
   assert.match(sb, /看日志/);
   assert.match(sb, /打开实例/);
+  assert.match(sb, /9892432515424/);
 });
 
 test("diagnoseCard and doneCard build", () => {
@@ -180,8 +187,11 @@ test("diagnoseCard and doneCard build", () => {
     evidenceLines: ["Exception: x"],
     fixes: ["fix partition"],
     dsReadonly: false,
+    projectCode: "15468494076768",
   });
-  assert.match(JSON.stringify(d), /force_success_request/);
+  const db = JSON.stringify(d);
+  assert.match(db, /force_success_request/);
+  assert.match(db, /15468494076768/);
   const done = doneCard({ body: "已提交" });
   assert.match(done.header.title.content, /完成/);
 });
@@ -217,6 +227,7 @@ test("buildAlertCardFromReportFields / formatAlertCard", () => {
   assert.match(text, /工作流告警/);
   assert.equal(card.header.template, "red");
   assert.equal(buildAlertCardFromReportFields(fields).header.template, "red");
+  assert.match(JSON.stringify(card), /"projectCode":"123"/);
 });
 
 test("normalizeCardAction parses button value", () => {
