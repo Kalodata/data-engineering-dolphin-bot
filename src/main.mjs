@@ -804,6 +804,7 @@ async function runCommand(config, command, message) {
       const matches = await resolveInstanceByCountryDate(ds, {
         country,
         dataDate,
+        stateType: "FAILURE",
       });
       if (!matches.length) {
         return (
@@ -973,7 +974,7 @@ async function runCommand(config, command, message) {
 
     let wfId = null;
     if (country) {
-      const matches = await resolveInstanceByCountryDate(ds, { country, dataDate });
+      const matches = await resolveInstanceByCountryDate(ds, { country, dataDate, stateType: "FAILURE" });
       if (!matches.length) {
         return (
           `未找到匹配实例（country=${country}${dataDate ? ` date=${dataDate}` : ""}）。\n` +
