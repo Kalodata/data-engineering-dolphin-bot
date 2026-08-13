@@ -1267,7 +1267,7 @@ async function handleFsCountryDate(config, country, dataDate, message) {
  * Recursively drill into SUB_PROCESS nodes to collect leaf quality-task instances.
  * Returns [{ id, name, parentName }]
  */
-async function drillForQualityTasks(ds, processInstanceId, depth = 0, maxDepth = 4) {
+async function drillForQualityTasks(ds, processInstanceId, depth = 0, maxDepth = 4, scriptName = null) {
   if (depth >= maxDepth) return [];
   const page = await ds.listTaskInstances({
     processInstanceId,
@@ -1280,14 +1280,14 @@ async function drillForQualityTasks(ds, processInstanceId, depth = 0, maxDepth =
     if (t.taskType === "SUB_PROCESS") {
       const subId = await ds.getSubProcessInstanceId(t.id).catch(() => null);
       if (subId) {
-        const sub = await drillForQualityTasks(ds, subId, depth + 1, maxDepth);
+        const sub = await drillForQualityTasks(ds, subId, depth + 1, maxDepth, t.name || scriptName);
         results.push(...sub);
       }
     } else if (FORCE_SUCCESS_TASK_NAME_RE.test(t.name || "")) {
       results.push({
         id: t.id,
         name: t.name || `#${t.id}`,
-        parentName: t.processInstanceName || String(processInstanceId),
+        parentName: scriptName || t.processInstanceName || String(processInstanceId),
       });
     }
   }
