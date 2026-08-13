@@ -41,6 +41,17 @@ import {
 } from "./ds_adaptive.mjs";
 import { resolveCountryCode } from "./country_code.mjs";
 import {
+  buildAgentPromptOptions,
+  loadCloudReposMap,
+  normalizeCloudRepoKey,
+  resolveCloudReposForSession,
+} from "./agent_runtime.mjs";
+import {
+  shouldCloudCodeAnalyze,
+  runCloudCodeAnalysis,
+  resolveCloudReposForCodeAnalysis,
+} from "./cloud_code_analysis.mjs";
+import {
   formatAlertReport,
   formatAlertCard,
   materializeTaskAlert,
@@ -252,6 +263,23 @@ function loadConfig(configPath) {
         minute: Number(bp.minute ?? 0),
       };
     })(),
+    /**
+     * Chat / Alert Agent runtime:
+     * - cloud: Cursor Cloud clones GitHub (no ECS disk repo needed)
+     * - local: Agent.prompt({ local: { cwd } }) against projects.remote / alert_cwd
+     * Planner always stays local (cheap intent JSON).
+     */
+    agentChatRuntime: String(raw.agent_chat_runtime || "cloud").toLowerCase() === "local"
+      ? "local"
+      : "cloud",
+    cloudRepos: loadCloudReposMap(raw.cloud_repos || {}),
+    defaultCloudRepoKey: normalizeCloudRepoKey(
+      raw.default_cloud_repo_key || raw.default_ds_project || "tiktok",
+    ),
+    /** Diagnose / alert: auto Cloud-read pipeline SQL when local enrich insufficient. */
+    cloudCodeOnDiagnose: raw.cloud_code_on_diagnose !== false,
+    cloudCodeOnAlert: raw.cloud_code_on_alert !== false,
+    cloudCodeTimeoutMs: Number(raw.cloud_code_timeout_ms ?? 120_000),
   };
   // Merge allowlist.json (committed to git) into allowed_users / notify_user_ids
   const allowlistPath = path.resolve(path.dirname(resolvedConfigPath), "allowlist.json");
@@ -588,6 +616,10 @@ async function runCommand(config, command, message) {
       `\nalert_mode: ${describeAlertMode(config)}` +
       `\nds_push: ${config.dsAlertWebhook?.enabled ? `on :${config.dsAlertWebhook.port}${config.dsAlertWebhook.path}` : "off"}` +
       `\ncard_callback: ${config.feishuCardCallback?.enabled ? `on :${config.feishuCardCallback.port}${config.feishuCardCallback.path}` : "off"}` +
+      `\nagent_chat: ${config.agentChatRuntime}` +
+      (config.agentChatRuntime === "cloud"
+        ? ` default=${config.defaultCloudRepoKey} (${config.cloudRepos?.[config.defaultCloudRepoKey]?.url || "?"})`
+        : "") +
       `\nmcp: 飞书bot不走Cursor MCP；详询 /mcp`
     );
   }
@@ -615,7 +647,13 @@ async function runCommand(config, command, message) {
     }
     sessionProjectByChat.set(message.chatId, key);
     const p = KNOWN_PROJECTS[key];
-    return `已切换到 **${p.label}**（project: ${p.code}）\n本群后续指令均使用此项目。\n恢复默认：/use tiktok`;
+    const cloudKey = normalizeCloudRepoKey(key);
+    const cloud = config.cloudRepos?.[cloudKey] || config.cloudRepos?.tiktok;
+    const cloudLine =
+      config.agentChatRuntime === "cloud" && cloud?.url
+        ? `\nChat/Alert 代码仓（Cloud）：${cloud.url}@${cloud.startingRef || "main"}`
+        : "";
+    return `已切换到 **${p.label}**（project: ${p.code}）\n本群后续指令均使用此项目。${cloudLine}\n恢复默认：/use tiktok`;
   }
   if (name === "board" || name === "countries" || name === "country-board") {
     const projectOverride = KNOWN_PROJECTS[String(command[1] || "").toLowerCase()] ? command[1] : null;
@@ -1159,6 +1197,15 @@ async function handleDiagnose(config, processInstanceId, message) {
     }
   }
 
+  repoAnalysis = await maybeAttachCloudCodeAnalysis({
+    config,
+    chatId: message?.chatId,
+    classification,
+    logText,
+    repoAnalysis,
+    mode: "diagnose",
+  });
+
   let evidenceLines = [];
   if (highlight?.purged) {
     evidenceLines = [highlight.summary, classification.rawScript].filter(Boolean);
@@ -1370,7 +1417,7 @@ async function handleAlert(config, alertText, message) {
     );
   } else {
     console.error("[alert] weak evidence → local Agent card");
-    cardText = await runAlertLocal(config, alertText, evidence?.block || "");
+    cardText = await runAlertLocal(config, alertText, evidence?.block || "", message);
   }
   if (interactive) {
     return { card: interactive, text: cardText };
@@ -1428,13 +1475,17 @@ async function runAlertWebhook(url, key, alertText, message) {
   return `Webhook 已接受，未解析到处置卡文本。响应: ${raw.slice(0, 800)}`;
 }
 
-async function runAlertLocal(config, alertText, evidenceBlock = "") {
+async function runAlertLocal(config, alertText, evidenceBlock = "", message = null) {
   if (!fs.existsSync(config.alertPromptPath)) {
     throw new Error(`Alert prompt missing: ${config.alertPromptPath}`);
   }
   const system = fs.readFileSync(config.alertPromptPath, "utf8");
   const prompt = buildEvidenceAwareAlertPrompt(system, alertText, evidenceBlock);
-  return runCursor(config.alertCwd, config.model, prompt);
+  return runCursor(prompt, {
+    model: config.model,
+    timeoutMs: 300_000,
+    ...agentRuntimeForChat(config, message?.chatId),
+  });
 }
 
 async function handleNlIntent(config, message) {
@@ -1449,18 +1500,22 @@ async function handleNlIntent(config, message) {
     config.dsProjectCode ||
     env.projectCode ||
     "";
-  const cwd =
+  const plannerCwd =
     config.projects.remote ||
     config.alertCwd ||
     path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
   let plan = null;
   try {
+    // Planner: always local + bot cwd — do not clone pipeline repos for intent JSON.
     const plannerRaw = await runCursor(
-      cwd,
-      config.model,
       buildPlannerPrompt(message.text, historyBlock, projectCode),
-      { timeoutMs: 45_000 },
+      {
+        model: config.model,
+        timeoutMs: 45_000,
+        runtime: "local",
+        localCwd: plannerCwd,
+      },
     );
     plan = parsePlannerJson(plannerRaw);
   } catch (error) {
@@ -1524,14 +1579,23 @@ async function handleChat(config, message) {
     .map((m) => `${m.role}: ${m.text}`)
     .join("\n");
   const env = loadDsEnv();
-  const projectCode = config.dsProjectCode || env.projectCode || "(unset)";
-  const cwd =
-    config.projects.remote ||
-    config.alertCwd ||
-    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const projectCode =
+    getEffectiveProjectCode(message.chatId, null, config) ||
+    config.dsProjectCode ||
+    env.projectCode ||
+    "(unset)";
+  const runtimeOpts = agentRuntimeForChat(config, message.chatId);
+  const repoHint =
+    runtimeOpts.runtime === "cloud" && runtimeOpts.cloudRepos?.[0]?.url
+      ? `当前可阅读的 GitHub 仓：${runtimeOpts.cloudRepos[0].url}@${runtimeOpts.cloudRepos[0].startingRef || "main"}（只读；禁止开 PR/改代码提交）`
+      : `当前本地工作目录可读代码（只读）`;
 
   const prompt = `你是通过飞书私聊接入的 Cursor Agent（体验尽量接近 IDE 里对话）。
 用中文简洁回答。可以查代码、解释报错、给修复步骤。
+
+【代码上下文】
+- ${repoHint}
+- 用 /use tiktok|amz|shopee 切换调度项目与对应代码仓
 
 【飞书排版硬约束】
 - 禁止 Markdown 表格（不要用 | 列 |）；改用短行或「· 项 — 值」
@@ -1555,7 +1619,7 @@ DolphinScheduler（offline，经典 REST；dsctl /v2 暂不可用）：
 - 快捷命令：/diagnose /failed /slow /tasks /log /mcp /rerun /rerun-all /force-success
 
 约束：
-- 不要 commit/push/删数据
+- 不要 commit/push/删数据/开 PR
 - 不要直接调用 DS API；让用户走确认卡 / YES
 - 禁止建议改工作流定义
 - 不输出 token、密码、完整 JDBC 连接串
@@ -1565,7 +1629,11 @@ ${historyBlock ? `## 近期对话\n${historyBlock}\n` : ""}
 ## 用户本轮
 ${message.text}`;
 
-  const answer = await runCursor(cwd, config.model, prompt);
+  const answer = await runCursor(prompt, {
+    model: config.model,
+    timeoutMs: 300_000,
+    ...runtimeOpts,
+  });
   pushChat(message.chatId, "user", message.text);
   pushChat(message.chatId, "assistant", answer);
   return answer;
@@ -1588,7 +1656,11 @@ async function ask(config, command) {
     "about this local project. Do not modify files, install dependencies, " +
     "commit, push, or run destructive commands.\n\n" +
     `Question: ${question}`;
-  return runCursor(projectPath, config.model, prompt);
+  return runCursor(prompt, {
+    model: config.model,
+    runtime: "local",
+    localCwd: projectPath,
+  });
 }
 
 async function review(config, command) {
@@ -1599,7 +1671,11 @@ async function review(config, command) {
     "regressions, security risks, and missing tests. Do not modify files, " +
     "install dependencies, commit, push, or run destructive commands. " +
     "Return concise findings first. If there are no findings, say so.";
-  return runCursor(projectPath, config.model, prompt);
+  return runCursor(prompt, {
+    model: config.model,
+    runtime: "local",
+    localCwd: projectPath,
+  });
 }
 
 function projectPathFor(config, projectName) {
@@ -1612,15 +1688,123 @@ function projectPathFor(config, projectName) {
   return projectPath;
 }
 
-async function runCursor(cwd, model, prompt, { timeoutMs = 180_000 } = {}) {
+/** Chat/Alert: cloud.repos by /use session, or local cwd fallback. */
+function agentRuntimeForChat(config, chatId) {
+  const sessionKey =
+    (chatId && sessionProjectByChat.get(chatId)) || config.defaultCloudRepoKey || "tiktok";
+  if (config.agentChatRuntime === "cloud") {
+    const cloudRepos = resolveCloudReposForSession({
+      cloudRepos: config.cloudRepos,
+      sessionProjectKey: sessionKey,
+      defaultKey: config.defaultCloudRepoKey,
+    });
+    return { runtime: "cloud", cloudRepos };
+  }
+  const localCwd =
+    config.projects.remote ||
+    config.alertCwd ||
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  return { runtime: "local", localCwd };
+}
+
+/**
+ * Local sql_repo enrich first; if necessary, Cloud Agent reads GitHub pipeline repo.
+ * @param {"diagnose"|"alert"} mode
+ */
+async function maybeAttachCloudCodeAnalysis({
+  config,
+  chatId = null,
+  classification,
+  logText = "",
+  repoAnalysis = null,
+  mode = "diagnose",
+} = {}) {
+  const enabled =
+    mode === "diagnose" ? config.cloudCodeOnDiagnose !== false : config.cloudCodeOnAlert !== false;
+  if (!enabled || !process.env.CURSOR_API_KEY) return repoAnalysis;
+
+  const sessionKey =
+    (chatId && sessionProjectByChat.get(chatId)) || config.defaultCloudRepoKey || "tiktok";
+  const need = shouldCloudCodeAnalyze({
+    sqlFile: classification?.sqlFile,
+    category: classification?.category,
+    logText,
+    repoAnalysis,
+    // Diagnose: if we have a script path, prefer Cloud when local empty/miss.
+    force: mode === "diagnose" && Boolean(classification?.sqlFile) && !repoAnalysis?.found,
+  });
+  if (!need) return repoAnalysis;
+
+  const cloudRepos = resolveCloudReposForCodeAnalysis(config, sessionKey);
+  if (!cloudRepos.length) return repoAnalysis;
+
+  console.error(
+    `[cloud-code] ${mode} sql=${classification.sqlFile} repos=${cloudRepos.map((r) => r.url).join(",")}`,
+  );
+  const cloud = await runCloudCodeAnalysis({
+    runAgent: runCursor,
+    model: config.model,
+    timeoutMs: config.cloudCodeTimeoutMs || 120_000,
+    cloudRepos,
+    sqlFile: classification.sqlFile,
+    category: classification.category,
+    logText,
+    varsMap: classification.varsMap || {},
+  });
+
+  const cloudLines = (cloud.lines || []).map((l) =>
+    l.startsWith("Cloud") || l.startsWith("【") ? l : `Cloud：${l}`,
+  );
+  if (!cloudLines.length) return repoAnalysis;
+
+  const base = repoAnalysis || {
+    found: false,
+    useful: true,
+    lines: [],
+    relativePath: classification.sqlFile,
+  };
+  const merged = [
+    ...(base.lines || []).filter((l) => !/仓库未找到脚本/.test(l)),
+    ...cloudLines,
+  ].slice(0, 8);
+  return {
+    ...base,
+    useful: true,
+    cloud: true,
+    lines: merged,
+  };
+}
+
+/**
+ * @param {string} prompt
+ * @param {{ model?: string, timeoutMs?: number, runtime?: "cloud"|"local", localCwd?: string, cloudRepos?: Array<{url:string,startingRef?:string}> }} opts
+ */
+async function runCursor(prompt, opts = {}) {
+  const {
+    model = "auto",
+    timeoutMs = 180_000,
+    runtime = "local",
+    localCwd = null,
+    cloudRepos = [],
+  } = opts;
   if (!process.env.CURSOR_API_KEY) {
     throw new Error("CURSOR_API_KEY is required for chat / /alert / /ask（写在项目 .env）");
   }
-  const run = Agent.prompt(prompt, {
+  const agentOpts = buildAgentPromptOptions({
     apiKey: process.env.CURSOR_API_KEY,
-    model: { id: model },
-    local: { cwd },
-  }).then((result) => {
+    model,
+    runtime,
+    localCwd,
+    cloudRepos,
+    autoCreatePR: false,
+  });
+  console.error(
+    `[cursor] runtime=${runtime}` +
+      (runtime === "cloud"
+        ? ` repos=${(cloudRepos || []).map((r) => r.url).join(",") || "(none)"}`
+        : ` cwd=${localCwd}`),
+  );
+  const run = Agent.prompt(prompt, agentOpts).then((result) => {
     if (result.status === "error") {
       return `Cursor run failed: ${result.result ?? result.id ?? "unknown error"}`;
     }
@@ -1628,7 +1812,12 @@ async function runCursor(cwd, model, prompt, { timeoutMs = 180_000 } = {}) {
   });
   const timeout = new Promise((_, reject) => {
     setTimeout(
-      () => reject(new Error(`Cursor Agent 超时（>${Math.round(timeoutMs / 1000)}s），请重发或改用 /diagnose /slow`)),
+      () =>
+        reject(
+          new Error(
+            `Cursor Agent 超时（>${Math.round(timeoutMs / 1000)}s），请重发或改用 /diagnose /slow`,
+          ),
+        ),
       timeoutMs,
     );
   });
@@ -2420,6 +2609,14 @@ async function main() {
     config,
     sendText,
     log: (line) => console.error(line),
+    cloudCodeAnalyze: (args) =>
+      maybeAttachCloudCodeAnalysis({
+        config,
+        classification: args.classification,
+        logText: args.logText,
+        repoAnalysis: args.repoAnalysis,
+        mode: args.mode || "alert",
+      }),
     onAlertSent: ({ chatId, userId, alert }) => {
       if (alert?.taskId != null && config.alertWatch?.statePath) {
         markTaskNotified(config.alertWatch.statePath, alert.taskId);
@@ -2453,6 +2650,14 @@ async function main() {
             ? { ...config.hiveProbe, onAlert: config.hiveProbe.onAlert === true }
             : null,
           enablePrLookup: config.enablePrLookup !== false,
+          cloudCodeAnalyze: (args) =>
+            maybeAttachCloudCodeAnalysis({
+              config,
+              classification: args.classification,
+              logText: args.logText,
+              repoAnalysis: args.repoAnalysis,
+              mode: args.mode || "alert",
+            }),
         });
         if (!alert?.text && !alert?.card) return { skipped: true, reason: "no_card" };
         markTaskNotified(config.alertWatch.statePath, alert.taskId);
