@@ -741,7 +741,8 @@ async function runCommand(config, command, message) {
   if (name === "tasks") {
     const id = Number(command[1]);
     if (!id) return "Usage: /tasks <processInstanceId>";
-    const ds = getDsClient(config);
+    const projectCode = getEffectiveProjectCode(message?.chatId, null, config);
+    const ds = getDsClient(config, projectCode);
     const page = await ds.listTaskInstances({ processInstanceId: id });
     return formatTaskList(id, page);
   }
@@ -833,7 +834,7 @@ async function runCommand(config, command, message) {
     const id = Number(command[1]);
     if (!id) return "Usage: /log <taskInstanceId>";
     if (message?.chatId) lastTaskByChat.set(message.chatId, id);
-    return handleLog(config, id);
+    return handleLog(config, id, message);
   }
   if (name === "diagnose") {
     const id = command[1] ? Number(command[1]) : null;
@@ -1113,8 +1114,9 @@ async function runCommand(config, command, message) {
   return "Unknown command. Try /help.";
 }
 
-async function handleLog(config, taskInstanceId) {
-  const ds = getDsClient(config);
+async function handleLog(config, taskInstanceId, message = null) {
+  const projectCode = getEffectiveProjectCode(message?.chatId, null, config);
+  const ds = getDsClient(config, projectCode);
   const logText = await ds.getTaskLogChunks(taskInstanceId);
   const highlight = extractLogHighlights(logText);
   if (highlight.purged) {
@@ -1130,7 +1132,8 @@ async function handleLog(config, taskInstanceId) {
 }
 
 async function handleDiagnose(config, processInstanceId, message) {
-  const ds = getDsClient(config);
+  const projectCode = getEffectiveProjectCode(message?.chatId, null, config);
+  const ds = getDsClient(config, projectCode);
   let instId = processInstanceId;
   if (!instId) {
     const page = await ds.listProcessInstances({ stateType: "FAILURE", pageSize: 10 });
@@ -1222,7 +1225,7 @@ async function handleDiagnose(config, processInstanceId, message) {
     logText,
     repoAnalysis,
     mode: "diagnose",
-    projectCode: getEffectiveProjectCode(message?.chatId, null, config),
+    projectCode,
   });
 
   let evidenceLines = [];
@@ -2355,7 +2358,12 @@ async function handleCardAction(action) {
     if (name === "log") {
       const taskId = Number(v.taskId);
       if (!taskId) return { toast: { type: "error", content: "缺少任务 id" } };
-      const text = await handleLog(config, taskId);
+      const fakeMsg = {
+        chatId: chatId || `cb:${action.openId || "anon"}`,
+        senderId: action.openId,
+        messageId: action.messageId,
+      };
+      const text = await handleLog(config, taskId, fakeMsg);
       if (chatId) await sendText({ chatId, text });
       else if (action.openId) await sendText({ userId: action.openId, text });
       return { toast: { type: "success", content: `日志 #${taskId}` } };
