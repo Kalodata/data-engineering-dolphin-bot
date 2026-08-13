@@ -19,6 +19,28 @@ test("redacts password= and token=", () => {
   assert.doesNotMatch(out, /hunter2|abc\.def|kk/);
 });
 
+test("redacts JSON and quoted credentials", () => {
+  const out = redactSecrets(
+    `cfg={"password":"secret123","token":"abc123"} password='secret123' token="abc123"`,
+  );
+  assert.match(out, /"password":"\[REDACTED\]"/);
+  assert.match(out, /"token":"\[REDACTED\]"/);
+  assert.match(out, /password='\[REDACTED\]'/);
+  assert.match(out, /token="\[REDACTED\]"/);
+  assert.doesNotMatch(out, /secret123|abc123/);
+});
+
+test("redacts URL query case variants and trailing brace", () => {
+  const out = redactSecrets(
+    'GET /x?Password=p1&Token=t1&api_key=k1} leftover {"password":"z}"',
+  );
+  assert.match(out, /Password=\[REDACTED\]/i);
+  assert.match(out, /Token=\[REDACTED\]/i);
+  assert.match(out, /api_key=\[REDACTED\]/);
+  assert.match(out, /"password":"\[REDACTED\]"/);
+  assert.doesNotMatch(out, /p1|t1|k1|\bz\}/);
+});
+
 test("redacts Authorization Bearer", () => {
   const out = redactSecrets("Authorization: Bearer eyJhbGciOi.xxx");
   assert.match(out, /Authorization: Bearer \[REDACTED\]/i);

@@ -727,6 +727,7 @@ async function runCommand(config, command, message) {
         rows: page?.totalList || [],
         total: page?.total,
         dsReadonly: config.dsReadonly,
+        projectCode,
         uiUrlBuilder: (row) =>
           buildProcessInstanceUiUrl({
             apiUrl: env.apiUrl,
@@ -820,6 +821,7 @@ async function runCommand(config, command, message) {
         country,
         stageNameRe: stageNameRe ? String(stageNameRe) : null,
         dsReadonly: config.dsReadonly,
+        projectCode: effectiveCode,
         uiUrlBuilder: (hit) =>
           buildProcessInstanceUiUrl({
             apiUrl: env.apiUrl,
@@ -1088,6 +1090,7 @@ async function runCommand(config, command, message) {
         processInstanceId: wfId,
         instName: inst?.name || "",
         tasks: eligible,
+        projectCode,
         uiUrl: buildProcessInstanceUiUrl({
           apiUrl: env.apiUrl,
           projectCode,
@@ -1114,8 +1117,12 @@ async function runCommand(config, command, message) {
   return "Unknown command. Try /help.";
 }
 
-async function handleLog(config, taskInstanceId, message = null) {
-  const projectCode = getEffectiveProjectCode(message?.chatId, null, config);
+async function handleLog(config, taskInstanceId, message = null, projectCodeOverride = null) {
+  const projectCode = getEffectiveProjectCode(
+    message?.chatId,
+    projectCodeOverride || message?.projectCode || null,
+    config,
+  );
   const ds = getDsClient(config, projectCode);
   const logText = await ds.getTaskLogChunks(taskInstanceId);
   const highlight = extractLogHighlights(logText);
@@ -1131,8 +1138,12 @@ async function handleLog(config, taskInstanceId, message = null) {
   );
 }
 
-async function handleDiagnose(config, processInstanceId, message) {
-  const projectCode = getEffectiveProjectCode(message?.chatId, null, config);
+async function handleDiagnose(config, processInstanceId, message, projectCodeOverride = null) {
+  const projectCode = getEffectiveProjectCode(
+    message?.chatId,
+    projectCodeOverride || message?.projectCode || null,
+    config,
+  );
   const ds = getDsClient(config, projectCode);
   let instId = processInstanceId;
   if (!instId) {
@@ -1240,7 +1251,7 @@ async function handleDiagnose(config, processInstanceId, message) {
   const env = loadDsEnv();
   const uiUrl = buildProcessInstanceUiUrl({
     apiUrl: env.apiUrl,
-    projectCode: getEffectiveProjectCode(message?.chatId, null, config),
+    projectCode,
     processInstanceId: instId,
     processDefinitionCode: inst?.processDefinitionCode,
   });
@@ -1274,6 +1285,7 @@ async function handleDiagnose(config, processInstanceId, message) {
       extraFailed: failed.slice(1, 6).map((t) => ({ id: t.id, name: t.name })),
       uiUrl,
       dsReadonly: config.dsReadonly,
+      projectCode,
     }),
     text,
   };
@@ -2346,7 +2358,7 @@ async function handleCardAction(action) {
         senderId: action.openId,
         messageId: action.messageId,
       };
-      const result = await handleDiagnose(config, id, fakeMsg);
+      const result = await handleDiagnose(config, id, fakeMsg, v.projectCode);
       if (chatId && result?.card) {
         await sendCard({ chatId, card: result.card });
       } else if (action.openId && result?.card) {
@@ -2363,7 +2375,7 @@ async function handleCardAction(action) {
         senderId: action.openId,
         messageId: action.messageId,
       };
-      const text = await handleLog(config, taskId, fakeMsg);
+      const text = await handleLog(config, taskId, fakeMsg, v.projectCode);
       if (chatId) await sendText({ chatId, text });
       else if (action.openId) await sendText({ userId: action.openId, text });
       return { toast: { type: "success", content: `日志 #${taskId}` } };
@@ -2378,18 +2390,23 @@ async function handleCardAction(action) {
       const executeType = v.executeType || "START_FAILURE_TASK_PROCESS";
       const key = chatId || `user:${action.openId}`;
       if (chatId) lastFailureByChat.set(chatId, id);
+      const projectCode = getEffectiveProjectCode(
+        chatId,
+        v.projectCode || null,
+        config,
+      );
       const pending = pendingConfirms.set(key, {
         kind: "execute",
         processInstanceId: id,
         executeType,
-        projectCode: v.projectCode || getEffectiveProjectCode(chatId, null, config),
+        projectCode,
         openId: action.openId,
         summary: `实例 #${id}`,
       });
       const env = loadDsEnv();
       const uiUrl = buildProcessInstanceUiUrl({
         apiUrl: env.apiUrl,
-        projectCode: getEffectiveProjectCode(chatId, null, config),
+        projectCode,
         processInstanceId: id,
       });
       const card = confirmCard({
@@ -2420,11 +2437,16 @@ async function handleCardAction(action) {
       const key = chatId || `user:${action.openId}`;
       if (chatId && processInstanceId) lastFailureByChat.set(chatId, processInstanceId);
       if (chatId) lastTaskByChat.set(chatId, taskId);
+      const projectCode = getEffectiveProjectCode(
+        chatId,
+        v.projectCode || null,
+        config,
+      );
       const pending = pendingConfirms.set(key, {
         kind: "force-success",
         taskInstanceId: taskId,
         processInstanceId,
-        projectCode: v.projectCode || getEffectiveProjectCode(chatId, null, config),
+        projectCode,
         openId: action.openId,
         summary: `强制成功任务 #${taskId}`,
       });
@@ -2432,7 +2454,7 @@ async function handleCardAction(action) {
       const uiUrl = processInstanceId
         ? buildProcessInstanceUiUrl({
             apiUrl: env.apiUrl,
-            projectCode: getEffectiveProjectCode(chatId, null, config),
+            projectCode,
             processInstanceId,
           })
         : "";

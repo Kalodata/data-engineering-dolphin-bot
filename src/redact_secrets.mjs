@@ -4,6 +4,9 @@
 
 const REDACT = "[REDACTED]";
 
+const SECRET_KEY =
+  "password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|client[_-]?secret";
+
 /**
  * Scrub common credential patterns from free text (DS logs, JDBC URLs, headers).
  */
@@ -17,10 +20,34 @@ export function redactSecrets(text) {
     `jdbc:$1://$2:${REDACT}@`,
   );
 
-  // password/passwd/pwd/secret/token/api_key/access_key = value
+  // JSON / quoted keys: "password":"secret" or 'token':'abc'
   s = s.replace(
-    /\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|client[_-]?secret)\b\s*[=:]\s*([^\s&;,'"]+)/gi,
-    `$1=${REDACT}`,
+    new RegExp(
+      `(["'])(${SECRET_KEY})\\1\\s*:\\s*(["'])(?:\\\\.|(?!\\3).)*\\3`,
+      "gi",
+    ),
+    (_, q1, key, q2) => `${q1}${key}${q1}:${q2}${REDACT}${q2}`,
+  );
+
+  // Unquoted JSON-ish: password: "secret" / password: 'secret'
+  s = s.replace(
+    new RegExp(`\\b(${SECRET_KEY})\\b\\s*:\\s*(["'])(?:\\\\.|(?!\\2).)*\\2`, "gi"),
+    (_, key, q) => `${key}:${q}${REDACT}${q}`,
+  );
+
+  // Shell / props: password='secret' password="secret" password=secret
+  s = s.replace(
+    new RegExp(
+      `\\b(${SECRET_KEY})\\b(\\s*[=:]\\s*)(["']?)([^\\s&;,'"}]+)\\3`,
+      "gi",
+    ),
+    (_, key, sep, q) => `${key}${sep}${q}${REDACT}${q}`,
+  );
+
+  // URL query variants: ?Password=xxx&Token=yyy (case-insensitive keys)
+  s = s.replace(
+    new RegExp(`([?&])(${SECRET_KEY})=([^&#\\s]*)`, "gi"),
+    (_, prefix, key) => `${prefix}${key}=${REDACT}`,
   );
 
   // Authorization: Bearer xxx / Basic xxx
