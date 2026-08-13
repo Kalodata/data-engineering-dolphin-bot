@@ -1243,7 +1243,8 @@ async function handleConfirm(config, message, accepted) {
 
 /** Fetch failed workflows matching country + dataDate, return card 1. */
 async function handleFsCountryDate(config, country, dataDate, message) {
-  const ds = getDsClient(config);
+  const projectCode = getEffectiveProjectCode(message?.chatId, null, config);
+  const ds = getDsClient(config, projectCode);
   // resolveInstanceByCountryDate fetches detail for each candidate (N+1) to read globalParams
   const results = await resolveInstanceByCountryDate(ds, { country, dataDate, stateType: "FAILURE" });
   if (!results.length) {
