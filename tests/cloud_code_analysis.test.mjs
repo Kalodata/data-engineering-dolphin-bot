@@ -29,6 +29,17 @@ test("shouldCloudCodeAnalyze skips when local useful", () => {
   );
 });
 
+test("shouldCloudCodeAnalyze skips engine/cluster flakes", () => {
+  assert.equal(
+    shouldCloudCodeAnalyze({
+      sqlFile: "output/es/ads_creator_info_for_es_tencent_v2.sql",
+      category: "引擎/集群",
+      repoAnalysis: null,
+    }),
+    false,
+  );
+});
+
 test("shouldCloudCodeAnalyze diagnose force on missing local", () => {
   assert.equal(
     shouldCloudCodeAnalyze({
@@ -39,6 +50,18 @@ test("shouldCloudCodeAnalyze diagnose force on missing local", () => {
     }),
     true,
   );
+});
+
+test("buildCloudCodeAnalysisPrompt alert mode asks for short signals", () => {
+  const p = buildCloudCodeAnalysisPrompt({
+    sqlFile: "output/es/x.sql",
+    category: "SQL",
+    mode: "alert",
+    repoUrl: "https://github.com/Kalodata/data-analysis-tiktok",
+  });
+  assert.match(p, /1～2 条/);
+  assert.doesNotMatch(p, /4～8/);
+  assert.match(p, /禁止展开/);
 });
 
 test("cloudAnalysisToLines strips bullets", () => {

@@ -1264,7 +1264,14 @@ async function handleDiagnose(config, processInstanceId, message, projectCodeOve
   });
   let text = textReport;
   if (repoAnalysis?.useful && repoAnalysis.lines?.length) {
-    text += `\n\n【代码/Git/验分区】\n${repoAnalysis.lines.map((l) => `- ${l}`).join("\n")}`;
+    const facing = repoAnalysis.lines
+      .map((l) => String(l || "").trim())
+      .filter(Boolean)
+      .filter((l) => !/^Cloud[：:]/i.test(l))
+      .slice(0, 3);
+    if (facing.length) {
+      text += `\n\n【定责/验数】\n${facing.map((l) => `- ${l}`).join("\n")}`;
+    }
   }
 
   return {
@@ -1792,27 +1799,36 @@ async function maybeAttachCloudCodeAnalysis({
     category: classification.category,
     logText,
     varsMap: classification.varsMap || {},
+    mode,
   });
 
-  const cloudLines = (cloud.lines || []).map((l) =>
-    l.startsWith("Cloud") || l.startsWith("【") ? l : `Cloud：${l}`,
-  );
+  const cloudLines = (cloud.lines || [])
+    .map((l) => String(l || "").replace(/^Cloud：/, "").trim())
+    .filter(Boolean);
   if (!cloudLines.length) return repoAnalysis;
 
   const base = repoAnalysis || {
     found: false,
-    useful: true,
+    useful: false,
     lines: [],
     relativePath: classification.sqlFile,
   };
-  const merged = [
-    ...(base.lines || []).filter((l) => !/仓库未找到脚本/.test(l)),
-    ...cloudLines,
-  ].slice(0, 8);
+  // Alert cards: keep Cloud for internal accuracy only — do not dump into 代码/Git.
+  if (mode === "alert") {
+    return {
+      ...base,
+      cloud: true,
+      cloudLines,
+      relativePath: base.relativePath || classification.sqlFile,
+    };
+  }
+  const localLines = (base.lines || []).filter((l) => !/仓库未找到脚本/.test(l));
+  const merged = [...localLines, ...cloudLines.map((l) => `定责：${l}`)].slice(0, 4);
   return {
     ...base,
-    useful: true,
+    useful: merged.length > 0,
     cloud: true,
+    cloudLines,
     lines: merged,
   };
 }

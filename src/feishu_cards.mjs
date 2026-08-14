@@ -149,15 +149,20 @@ export function alertCard({
 
   const body = [md(lines.join("\n"))];
   if (repoLines?.length) {
-    body.push(
-      md(
-        "**代码/Git：**\n" +
-          repoLines
-            .slice(0, 4)
-            .map((l) => `· ${clip(l, 120)}`)
-            .join("\n"),
-      ),
-    );
+    const facing = repoLines
+      .map((l) => String(l || "").trim())
+      .filter(Boolean)
+      .filter((l) => !/^Cloud[：:]/i.test(l) && !/^定责[：:]/i.test(l))
+      .filter((l) => /验分区|相关 PR|^PR[：:]/i.test(l))
+      .slice(0, 2);
+    if (facing.length) {
+      body.push(
+        md(
+          "**验数：**\n" +
+            facing.map((l) => `· ${clip(l, 120)}`).join("\n"),
+        ),
+      );
+    }
   }
   if (fixes?.length) {
     body.push(
@@ -269,15 +274,19 @@ export function diagnoseCard({
     );
   }
   if (repoLines.length) {
-    els.push(
-      md(
-        "**代码/Git/验分区：**\n" +
-          repoLines
-            .slice(0, 5)
-            .map((l) => `· ${clip(l, 140)}`)
-            .join("\n"),
-      ),
-    );
+    const facing = repoLines
+      .map((l) => String(l || "").trim())
+      .filter(Boolean)
+      .filter((l) => !/^Cloud[：:]/i.test(l))
+      .slice(0, 3);
+    if (facing.length) {
+      els.push(
+        md(
+          "**定责/验数：**\n" +
+            facing.map((l) => `· ${clip(l, 140)}`).join("\n"),
+        ),
+      );
+    }
   }
   if (fixes.length) {
     els.push(
@@ -932,7 +941,15 @@ export function buildAlertCardFromReportFields(fields = {}) {
     scriptLabel: repoAnalysis?.relativePath || classification?.sqlFile || null,
     when: task?.endTime || task?.startTime,
     evidence: rawEvidence ? String(rawEvidence).trim() : "",
-    repoLines: repoAnalysis?.useful ? repoAnalysis.lines || [] : [],
+    repoLines: (() => {
+      const lines = repoAnalysis?.lines || [];
+      return lines
+        .map((l) => String(l || "").trim())
+        .filter(Boolean)
+        .filter((l) => !/^Cloud[：:]/i.test(l) && !/^定责[：:]/i.test(l))
+        .filter((l) => /验分区|相关 PR|^PR[：:]/i.test(l))
+        .slice(0, 2);
+    })(),
     fixes: classification?.fixes || [],
     dsReadonly: Boolean(dsReadonly),
     projectCode,

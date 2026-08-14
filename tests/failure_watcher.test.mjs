@@ -8,6 +8,7 @@ import {
   collectNewFailureAlerts,
   evaluateSelfHeal,
   formatAlertReport,
+  alertFacingRepoLines,
   isMeaningfulFailure,
   withinLookback,
 } from "../src/failure_watcher.mjs";
@@ -359,7 +360,20 @@ test("format alert report is short and actionable", () => {
     /位置：https:\/\/ds-offline\.kalowave\.com\/dolphinscheduler\/ui\/projects\/9892432515424\/workflow\/instances\/42\?code=17954605828064/,
   );
   assert.doesNotMatch(text, /Map 1:/);
+  assert.doesNotMatch(text, /代码\/Git/);
   assert.ok(text.split("\n").length <= 24);
+});
+
+test("alertFacingRepoLines drops Cloud dumps", () => {
+  const facing = alertFacingRepoLines({
+    lines: [
+      "Cloud：脚本存在：output/es/x.sql（Hive→ES）",
+      "Cloud：写入目标：临时外表 ads_x",
+      "验分区：kalo_data_online.ads_x country=us day=2026-08-12 → 存在",
+    ],
+  });
+  assert.equal(facing.length, 1);
+  assert.match(facing[0], /验分区/);
 });
 
 test("evaluateSelfHeal holds while retry attempt is RUNNING", () => {
