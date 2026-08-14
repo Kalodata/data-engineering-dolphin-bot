@@ -11,8 +11,21 @@ let cloudAnalyzeInFlight = 0;
 export const CLOUD_CODE_MAX_CONCURRENT = 2;
 
 /**
+ * Positive allow: only spend Cloud when disposition may depend on SQL/script.
+ * Prefer this over per-error blacklists (Tez/YARN/OOM/…).
+ */
+export function isSqlCodeAnalysisSignal(category = "", logText = "") {
+  const cat = String(category || "");
+  const log = String(logText || "");
+  if (/SQL|分区|JDBC|表不存在|语义|解析|字段/i.test(cat)) return true;
+  return /No rows selected|AnalysisException|SemanticException|ParseException|InvalidInputException|Partition.+not found|Path does not exist|Table or view not found|cannot resolve|Unknown column|COLUMN_NOT_FOUND/i.test(
+    log,
+  );
+}
+
+/**
  * Necessary conditions to spend a Cloud Agent run on code reading.
- * @param {{ sqlFile?: string, category?: string, logText?: string, repoAnalysis?: object|null, force?: boolean }} p
+ * Default deny; allow only SQL/partition-class signals (or explicit force).
  */
 export function shouldCloudCodeAnalyze({
   sqlFile,
@@ -26,30 +39,10 @@ export function shouldCloudCodeAnalyze({
 
   const localFound = repoAnalysis?.found === true;
   const localUseful = Boolean(repoAnalysis?.useful && repoAnalysis?.lines?.length);
-  const missLine = String(repoAnalysis?.lines?.[0] || "");
-  const localMiss =
-    !repoAnalysis ||
-    !localFound ||
-    /仓库未找到脚本|未找到脚本/i.test(missLine);
-
-  const cat = String(category || "");
-  const log = String(logText || "");
-
-  // Engine/YARN flakes: reading SQL repo does not change disposition — skip Cloud.
-  if (/引擎\/集群|YARN|Tez.?TaskAttempt|集群\/引擎抖动/i.test(cat) && !force) {
-    return false;
-  }
-
-  const sqlish =
-    /SQL|分区\/路径|JDBC|资源/.test(cat) ||
-    /No rows selected|AnalysisException|SemanticException|ParseException|InvalidInputException|Partition.+not found|Path does not exist|Table or view not found|cannot resolve/i.test(
-      log,
-    );
-
   // Local hit with useful lines → skip Cloud (already have code context).
-  if (localFound && localUseful && !force) return false;
-  // Need Cloud when disk miss, or SQL-class failure without useful local enrich.
-  return localMiss || sqlish;
+  if (localFound && localUseful) return false;
+
+  return isSqlCodeAnalysisSignal(category, logText);
 }
 
 export function buildCloudCodeAnalysisPrompt({

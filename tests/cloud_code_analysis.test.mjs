@@ -3,11 +3,12 @@ import test from "node:test";
 
 import {
   shouldCloudCodeAnalyze,
+  isSqlCodeAnalysisSignal,
   cloudAnalysisToLines,
   buildCloudCodeAnalysisPrompt,
 } from "../src/cloud_code_analysis.mjs";
 
-test("shouldCloudCodeAnalyze when local miss", () => {
+test("shouldCloudCodeAnalyze when local miss and SQL category", () => {
   assert.equal(
     shouldCloudCodeAnalyze({
       sqlFile: "output/boost/x.sql",
@@ -29,18 +30,44 @@ test("shouldCloudCodeAnalyze skips when local useful", () => {
   );
 });
 
-test("shouldCloudCodeAnalyze skips engine/cluster flakes", () => {
+test("whitelist: engine/cluster without SQL signal → no Cloud", () => {
+  assert.equal(isSqlCodeAnalysisSignal("引擎/集群", "Tez TaskAttempt failed"), false);
   assert.equal(
     shouldCloudCodeAnalyze({
       sqlFile: "output/es/ads_creator_info_for_es_tencent_v2.sql",
       category: "引擎/集群",
+      logText: "return code 1 from TezTask",
       repoAnalysis: null,
     }),
     false,
   );
 });
 
-test("shouldCloudCodeAnalyze diagnose force on missing local", () => {
+test("whitelist: local miss alone is not enough", () => {
+  assert.equal(
+    shouldCloudCodeAnalyze({
+      sqlFile: "output/boost/x.sql",
+      category: "未知",
+      logText: "something failed",
+      repoAnalysis: null,
+    }),
+    false,
+  );
+});
+
+test("whitelist: SQL log signal allows Cloud even if category vague", () => {
+  assert.equal(
+    shouldCloudCodeAnalyze({
+      sqlFile: "output/boost/x.sql",
+      category: "?",
+      logText: "AnalysisException: Table or view not found: ads_x",
+      repoAnalysis: null,
+    }),
+    true,
+  );
+});
+
+test("force still overrides whitelist", () => {
   assert.equal(
     shouldCloudCodeAnalyze({
       sqlFile: "output/boost/x.sql",

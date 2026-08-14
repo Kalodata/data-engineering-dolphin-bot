@@ -1772,8 +1772,7 @@ async function maybeAttachCloudCodeAnalysis({
     category: classification?.category,
     logText,
     repoAnalysis,
-    // Diagnose: if we have a script path, prefer Cloud when local empty/miss.
-    force: mode === "diagnose" && Boolean(classification?.sqlFile) && !repoAnalysis?.found,
+    // No per-category force: whitelist (SQL/分区/…) decides; force only if caller sets it.
   });
   if (!need) return repoAnalysis;
 
