@@ -147,10 +147,12 @@ export function formatAlertReport({
     lines.push(`报错：${clipAlert(err, 100)}`);
   }
 
-  if (repoAnalysis?.useful && repoAnalysis?.lines?.length) {
-    lines.push("代码/Git：");
-    for (const l of repoAnalysis.lines.slice(0, 4)) {
-      lines.push(`· ${clipAlert(l, 140)}`);
+  // Alert 只展示可执行验数/PR，不 dump Cloud 脚本结构说明（读仓用于定责，不写进卡）。
+  const repoFacing = alertFacingRepoLines(repoAnalysis);
+  if (repoFacing.length) {
+    lines.push("验数：");
+    for (const l of repoFacing) {
+      lines.push(`· ${clipAlert(l, 120)}`);
     }
   }
 
@@ -186,6 +188,16 @@ function clipAlert(s, maxLen = 100) {
   const t = String(s || "").trim();
   if (!t) return "";
   return t.length > maxLen ? `${t.slice(0, maxLen - 1)}…` : t;
+}
+
+/** Alert-facing only: partition probe / PR — never Cloud script dumps. */
+export function alertFacingRepoLines(repoAnalysis) {
+  return (repoAnalysis?.lines || [])
+    .map((l) => String(l || "").trim())
+    .filter(Boolean)
+    .filter((l) => !/^Cloud[：:]/i.test(l) && !/^定责[：:]/i.test(l))
+    .filter((l) => /验分区|相关 PR|^PR[：:]/i.test(l))
+    .slice(0, 2);
 }
 
 function sameAlertText(a, b) {
