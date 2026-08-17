@@ -265,11 +265,9 @@ function loadConfig(configPath) {
       };
     })(),
     /**
-     * Chat / Alert Agent runtime (backward compatible default: local).
-     * ECS has no pipeline checkout — set agent_chat_runtime: "cloud" explicitly.
-     * - cloud: Cursor Cloud clones GitHub
-     * - local: Agent.prompt({ local: { cwd } }) against projects.remote / alert_cwd
-     * Planner always stays local (cheap intent JSON).
+     * Legacy flag (default local). Feishu Chat Agent always runs local + MCP;
+     * Cloud is only for diagnose/alert pipeline SQL via cloud_code_on_*.
+     * Keeping this mainly affects default for cloud_code_on_* when those keys are omitted.
      */
     agentChatRuntime: String(raw.agent_chat_runtime || "local").toLowerCase() === "cloud"
       ? "cloud"
@@ -281,8 +279,9 @@ function loadConfig(configPath) {
       raw.default_cloud_repo_key || raw.default_ds_project || "tiktok",
     ),
     /**
-     * Cloud code analysis for diagnose/alert.
+     * Cloud code analysis for diagnose/alert (GitHub pipeline repos).
      * Default ON only when agent_chat_runtime=cloud; otherwise OFF unless explicitly true.
+     * Prefer setting cloud_code_on_diagnose / cloud_code_on_alert explicitly.
      */
     cloudCodeOnDiagnose: (() => {
       const runtimeCloud =
@@ -671,10 +670,10 @@ async function runCommand(config, command, message) {
     const cloudKey = normalizeCloudRepoKey(key);
     const cloud = config.cloudRepos?.[cloudKey] || config.cloudRepos?.tiktok;
     const cloudLine =
-      config.agentChatRuntime === "cloud" && cloud?.url
-        ? `\nChat/Alert 代码仓（Cloud）：${cloud.url}@${cloud.startingRef || "main"}`
+      (config.cloudCodeOnDiagnose || config.cloudCodeOnAlert) && cloud?.url
+        ? `\n诊断/告警代码仓（Cloud）：${cloud.url}@${cloud.startingRef || "main"}`
         : "";
-    return `已切换到 **${p.label}**（project: ${p.code}）\n本群后续指令均使用此项目。${cloudLine}\n恢复默认：/use tiktok`;
+    return `已切换到 **${p.label}**（project: ${p.code}）\n本群后续指令均使用此项目（Chat=local+MCP）。${cloudLine}\n恢复默认：/use tiktok`;
   }
   if (name === "board" || name === "countries" || name === "country-board") {
     const projectOverride = KNOWN_PROJECTS[String(command[1] || "").toLowerCase()] ? command[1] : null;
