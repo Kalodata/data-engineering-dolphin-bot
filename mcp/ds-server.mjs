@@ -15,10 +15,14 @@ import {
   buildActionPlaybook,
   classifyFailure,
   extractLogHighlights,
+  formatCountryDailyBoard,
   formatFailedList,
   formatPracticalDiagnosis,
+  formatProgressReport,
   formatSlowStageJobs,
   formatTaskList,
+  listCountryDailyBoard,
+  listRunningProgress,
   loadDsEnv,
 } from "../src/ds32_client.mjs";
 
@@ -305,22 +309,74 @@ server.registerTool(
   },
 );
 
+server.registerTool(
+  "ds_progress",
+  {
+    title: "List running workflow progress",
+    description:
+      "List RUNNING process instances with current stage dig. Optional country_code filter (e.g. id, vn).",
+    inputSchema: {
+      country: z.string().optional().describe("e.g. id, th — globalParams country_code"),
+      page_size: z.number().int().min(1).max(40).optional(),
+      project_code: z.string().optional(),
+    },
+  },
+  async ({ country, page_size, project_code }) => {
+    try {
+      const ds = getClient(project_code);
+      const result = await listRunningProgress(ds, {
+        country: country || null,
+        pageSize: page_size ?? 15,
+      });
+      return ok(formatProgressReport(result));
+    } catch (error) {
+      return fail(error);
+    }
+  },
+);
+
+server.registerTool(
+  "ds_board",
+  {
+    title: "Country daily progress board",
+    description:
+      "Multi-country TikTok daily board (which countries started / running / done for the schedule day).",
+    inputSchema: {
+      project_code: z.string().optional(),
+    },
+  },
+  async ({ project_code }) => {
+    try {
+      const ds = getClient(project_code);
+      const board = await listCountryDailyBoard(ds, {});
+      return ok(formatCountryDailyBoard(board));
+    } catch (error) {
+      return fail(error);
+    }
+  },
+);
+
 if (ALLOW_WRITE) {
   server.registerTool(
     "ds_rerun",
     {
       title: "Rerun / recover process instance (WRITE)",
       description:
-        "Execute DS process instance action. Dangerous. Requires DS_MCP_ALLOW_WRITE=1. Prefer REPEAT_RUNNING (from failure) over START / RECOVER.",
+        "Dangerous write. Requires DS_MCP_ALLOW_WRITE=1. Feishu Chat must NOT enable this — use host confirm cards. Prefer START_FAILURE_TASK_PROCESS (resume failed tasks) over REPEAT_RUNNING (full instance rerun).",
       inputSchema: {
         process_instance_id: z.number().int().positive(),
         execute_type: z
-          .enum(["REPEAT_RUNNING", "START", "RECOVER_SUSPENDED_PROCESS", "STOP"])
-          .describe("REPEAT_RUNNING = resume from failed tasks (common)"),
+          .enum([
+            "START_FAILURE_TASK_PROCESS",
+            "REPEAT_RUNNING",
+            "STOP",
+            "RECOVER_SUSPENDED_PROCESS",
+          ])
+          .describe(
+            "START_FAILURE_TASK_PROCESS = resume from failed tasks (common); REPEAT_RUNNING = rerun entire instance; STOP = stop",
+          ),
         project_code: z.string().optional(),
-        confirm: z
-          .literal(true)
-          .describe("Must be true to actually execute"),
+        confirm: z.literal(true).describe("Must be true to actually execute"),
       },
     },
     async ({ process_instance_id, execute_type, project_code, confirm }) => {

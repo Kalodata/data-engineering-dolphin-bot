@@ -40,6 +40,7 @@ import {
   planToSlashCommand,
 } from "./ds_adaptive.mjs";
 import { resolveCountryCode } from "./country_code.mjs";
+import { parseNlHostCommand } from "./nl_host_route.mjs";
 import {
   buildAgentPromptOptions,
   buildDsOfflineMcpServers,
@@ -435,7 +436,7 @@ export async function formatMcpArchitectureStatus(config) {
   const mcpServers = buildDsOfflineMcpServers({
     projectCode: config.dsProjectCode || env.projectCode,
     repoRoot,
-    allowWrite: config.dsReadonly === false,
+    allowWrite: false,
   });
 
   let dsLine = "未配置（缺 DS_API_URL / TOKEN）";
@@ -460,11 +461,12 @@ export async function formatMcpArchitectureStatus(config) {
     "",
     `DS 连通：${dsLine}`,
     `项目：${config.dsProjectCode || env.projectCode || "(unset)"}`,
-    `只读：${config.dsReadonly ? "是" : "否（可 /rerun）"}`,
-    `Chat Agent MCP：${config.agentMcpDs === false ? "关（agent_mcp_ds=false）" : mcpServers ? "开（stdio ds-offline）" : "未挂载（缺凭证或 mcp/ds-server.mjs）"}`,
+    `只读：${config.dsReadonly ? "是" : "否（可 /rerun，经确认卡）"}`,
+    `Chat Agent MCP：${config.agentMcpDs === false ? "关（agent_mcp_ds=false）" : mcpServers ? "开（stdio ds-offline，只读）" : "未挂载（缺凭证或 mcp/ds-server.mjs）"}`,
     `mcp/ds-server.mjs：${mcpFile ? "有" : "无"}`,
     "",
-    "自然语言 Chat：local Agent + MCP ds_* 查调度",
+    "自然语言 Chat：local Agent + 只读 MCP ds_*",
+    "写操作：宿主确认卡 / YES（Chat MCP 永不挂 ds_rerun）",
     "Cloud 读 pipeline SQL：仅 /diagnose / 告警 cloud_code（与 Chat 分离）",
     "IDE Cursor MCP（~/.cursor/mcp.json）与飞书会话相互独立",
   ].join("\n");
@@ -1634,15 +1636,15 @@ async function handleChat(config, message) {
   const repoHint = `本地 bot 工作区可读；调度数据请用 MCP「ds-offline」工具（已挂载：${mcpNames}）`;
 
   const prompt = `你是通过飞书接入的 Cursor Agent（体验尽量接近 IDE 里对话）。
-用户说法不固定：自行理解意图，用已有 MCP 工具组合完成，不要假设固定句式，也不要只推「请用 /xxx」。
+用户说法不固定：自行理解意图，用已有只读 MCP 工具组合完成，不要假设固定句式，也不要只推「请用 /xxx」。
 查 DolphinScheduler 必须优先调用 MCP 工具 ds_*（ds-offline），不要声称没有 DS 工具。
 用中文简洁回答。
 
-【MCP / DS — 核心能力】
-- 已挂载 MCP：${mcpNames}
-- 原子工具：ds_status、ds_list_failed、ds_list_tasks、ds_get_log、ds_diagnose、ds_slow
-- 自行组合上述工具回答任意运维问题（进度、失败、日志、耗时、对比等）；缺证据就继续查，不要编造
-- 写操作（重跑）不要自己调写接口；引导用户点确认卡或发「重跑 <实例id>」→ YES
+【MCP / DS — 只读核心能力】
+- 已挂载 MCP：${mcpNames}（只读；没有 ds_rerun）
+- 原子工具：ds_status、ds_list_failed、ds_list_tasks、ds_get_log、ds_diagnose、ds_slow、ds_progress、ds_board
+- 自行组合上述工具回答任意运维只读问题；缺证据就继续查，不要编造
+- 写操作（重跑 / 整实例重跑 / 强制成功 / STOP）：本会话无写工具。引导用户发「重跑 <实例id>」或「强制成功 任务 #<id>」（宿主会弹确认卡），或点告警/诊断卡按钮；不要假装已提交
 - 当前项目 code=${projectCode}
 
 【代码上下文】
@@ -1655,11 +1657,9 @@ async function handleChat(config, message) {
 - 少用粗体堆砌；回复宜短
 
 【架构】
-- 飞书 bot Agent 通过 SDK 挂载 ds-offline MCP → Ds32Client → DS REST
-- IDE 里的 Cursor MCP 配置与飞书会话是两套；本会话以工具列表为准
+- 飞书 bot Agent 通过 SDK 挂载只读 ds-offline MCP → Ds32Client → DS REST
+- 写操作只走宿主确认卡 + 审计日志；与 IDE MCP 配置相互独立
 - 用户问 mcp/MCP 状态：先调 ds_status，再简短说明
-
-若适合重跑：引导点告警/诊断卡「重跑」或发「重跑 <实例id>」；不要假装已经提交重跑。
 
 约束：
 - 不要 commit/push/删数据/开 PR
@@ -1731,8 +1731,9 @@ function projectPathFor(config, projectName) {
 }
 
 /**
- * Feishu Chat Agent: local + ds-offline MCP (DS is core).
- * Pipeline SQL GitHub read stays on cloud_code_on_diagnose/alert, not Chat Cloud.
+ * Feishu Chat Agent: local + read-only ds-offline MCP (DS is core).
+ * Writes never via Agent MCP — host confirm cards only.
+ * Pipeline SQL GitHub read stays on cloud_code_on_diagnose/alert.
  */
 function agentRuntimeForChat(config, chatId) {
   const localCwd =
@@ -1746,7 +1747,7 @@ function agentRuntimeForChat(config, chatId) {
       : buildDsOfflineMcpServers({
           projectCode,
           repoRoot: localCwd,
-          allowWrite: config.dsReadonly === false,
+          allowWrite: false,
         });
   return {
     runtime: "local",
@@ -2296,7 +2297,14 @@ async function handleMessage(config, message) {
   }
 
   let command = parseCommand(message.text);
-  // Slash → runCommand. Natural language → Chat Agent directly.
+  // Slash → runCommand. Deterministic NL host routes (writes + a few reads) → runCommand.
+  // Other natural language → Chat Agent (read-only MCP).
+  if (!command) {
+    command = parseNlHostCommand(message.text);
+    if (command) {
+      console.error(`[nl-host] → ${command.join(" ")}`);
+    }
+  }
 
   let response;
   let ackId = null;

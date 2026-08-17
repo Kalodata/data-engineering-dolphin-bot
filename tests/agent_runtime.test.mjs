@@ -111,6 +111,14 @@ test("buildDsOfflineMcpServers returns stdio when DS env + server exist", () => 
     assert.equal(servers["ds-offline"].type, "stdio");
     assert.equal(servers["ds-offline"].env.DS_PROJECT_CODE, "123");
     assert.equal(servers["ds-offline"].env.DS_API_TOKEN, "tok");
+    assert.equal(servers["ds-offline"].env.DS_MCP_ALLOW_WRITE, undefined);
+
+    const writable = buildDsOfflineMcpServers({
+      projectCode: "123",
+      repoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."),
+      allowWrite: true,
+    });
+    assert.equal(writable["ds-offline"].env.DS_MCP_ALLOW_WRITE, "1");
   } finally {
     if (prevUrl == null) delete process.env.DS_API_URL;
     else process.env.DS_API_URL = prevUrl;

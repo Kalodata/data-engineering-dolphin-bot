@@ -4,8 +4,9 @@ stdio MCP wrapping `Ds32Client` (classic REST). Credentials: `DS_API_*` env or `
 
 ## Feishu bot (SDK)
 
-飞书自然语言 Chat Agent 通过 `@cursor/sdk` **inline `mcpServers`** 挂载本服务（local stdio）。  
-`agent_mcp_ds: true`（默认）时自动挂载；Chat 固定 **local**，以便 MCP 子进程用到 ECS 上的 DS token。
+飞书自然语言 Chat Agent 通过 `@cursor/sdk` **inline `mcpServers`** 挂载本服务（local stdio，**只读**）。  
+`agent_mcp_ds: true`（默认）时自动挂载；**永不**对 Chat 设置 `DS_MCP_ALLOW_WRITE`。  
+写操作（重跑 / 强制成功）只走宿主确认卡 + 审计日志。
 
 Cloud 读 pipeline SQL 仍走 `cloud_code_on_diagnose` / `cloud_code_on_alert`（与 Chat 分离）。
 
@@ -19,8 +20,11 @@ Cloud 读 pipeline SQL 仍走 `cloud_code_on_diagnose` / `cloud_code_on_alert`�
 | `ds_get_log` | Task log highlights |
 | `ds_diagnose` | Classify + playbook for newest/given FAILURE |
 | `ds_slow` | Slow SUB_PROCESS / nested jobs |
+| `ds_progress` | RUNNING instances + stage dig (optional country) |
+| `ds_board` | Multi-country daily board |
 
-Write: set `DS_MCP_ALLOW_WRITE=1`（bot 在 `ds_readonly: false` 时会对 Chat MCP 打开写工具；prompt 仍要求走确认卡）。
+Write (IDE only): set `DS_MCP_ALLOW_WRITE=1` to expose `ds_rerun`.  
+`START_FAILURE_TASK_PROCESS` = resume failed tasks; `REPEAT_RUNNING` = full instance rerun.
 
 ## IDE
 

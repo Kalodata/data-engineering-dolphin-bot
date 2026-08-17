@@ -123,6 +123,9 @@ function defaultRepoRoot() {
 /**
  * Inline ds-offline MCP for SDK Agent (stdio on the machine running the bot).
  * Cloud Chat VMs cannot see this path — Feishu NL Chat must use local + this MCP.
+ *
+ * Feishu Chat MUST pass allowWrite=false (default). Write ops go through host
+ * confirm cards + audit — never via Agent MCP. DS_MCP_ALLOW_WRITE is for IDE only.
  * @returns {Record<string, object>|null}
  */
 export function buildDsOfflineMcpServers({
@@ -142,7 +145,8 @@ export function buildDsOfflineMcpServers({
     DS_API_TOKEN: env.apiToken,
     DS_PROJECT_CODE: String(projectCode || env.projectCode || "").trim(),
   };
-  if (allowWrite) mcpEnv.DS_MCP_ALLOW_WRITE = "1";
+  // Explicit opt-in only; never infer from ds_readonly.
+  if (allowWrite === true) mcpEnv.DS_MCP_ALLOW_WRITE = "1";
   if (process.env.DS_ENV_FILE) mcpEnv.DS_ENV_FILE = process.env.DS_ENV_FILE;
 
   return {
