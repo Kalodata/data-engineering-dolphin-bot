@@ -47,6 +47,7 @@
     "remote": "/path/to/dolphin-feishu-bot"
   },
   "agent_chat_runtime": "local",
+  "agent_mcp_ds": true,
   "default_cloud_repo_key": "tiktok",
   "cloud_code_on_diagnose": false,
   "cloud_code_on_alert": false,

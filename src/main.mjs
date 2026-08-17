@@ -42,6 +42,7 @@ import {
 import { resolveCountryCode } from "./country_code.mjs";
 import {
   buildAgentPromptOptions,
+  buildDsOfflineMcpServers,
   loadCloudReposMap,
   normalizeCloudRepoKey,
   resolveCloudReposForSession,
@@ -298,6 +299,8 @@ function loadConfig(configPath) {
       return runtimeCloud;
     })(),
     cloudCodeTimeoutMs: Number(raw.cloud_code_timeout_ms ?? 120_000),
+    /** Attach ds-offline MCP to Feishu Chat Agent (local stdio). Default on. */
+    agentMcpDs: raw.agent_mcp_ds !== false,
   };
   // Merge allowlist.json (committed to git) into allowed_users / notify_user_ids
   const allowlistPath = path.resolve(path.dirname(resolvedConfigPath), "allowlist.json");
@@ -420,7 +423,7 @@ export function looksLikeBotStatus(text) {
 }
 
 /**
- * Feishu bot does NOT use Cursor MCP. Explain architecture + probe DS REST.
+ * Feishu Chat Agent uses SDK-mounted ds-offline MCP. Probe DS REST + MCP file.
  */
 export async function formatMcpArchitectureStatus(config) {
   const env = loadDsEnv();
@@ -430,6 +433,11 @@ export async function formatMcpArchitectureStatus(config) {
     path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const mcpPath = path.join(repoRoot, "mcp/ds-server.mjs");
   const mcpFile = fs.existsSync(mcpPath);
+  const mcpServers = buildDsOfflineMcpServers({
+    projectCode: config.dsProjectCode || env.projectCode,
+    repoRoot,
+    allowWrite: config.dsReadonly === false,
+  });
 
   let dsLine = "未配置（缺 DS_API_URL / TOKEN）";
   if (env.apiUrl && env.apiToken) {
@@ -449,21 +457,17 @@ export async function formatMcpArchitectureStatus(config) {
   }
 
   return [
-    "【说明】飞书 Dolphin bot 不走 Cursor MCP",
+    "【飞书 Agent ↔ DS】",
     "",
-    "本 bot 查 DS：内嵌 Ds32Client → classic REST",
     `DS 连通：${dsLine}`,
     `项目：${config.dsProjectCode || env.projectCode || "(unset)"}`,
     `只读：${config.dsReadonly ? "是" : "否（可 /rerun）"}`,
-    `告警轮询：${config.alertWatch?.enabled ? "开" : "关"}`,
+    `Chat Agent MCP：${config.agentMcpDs === false ? "关（agent_mcp_ds=false）" : mcpServers ? "开（stdio ds-offline）" : "未挂载（缺凭证或 mcp/ds-server.mjs）"}`,
+    `mcp/ds-server.mjs：${mcpFile ? "有" : "无"}`,
     "",
-    "Cursor IDE 的 ds-offline MCP：只给 IDE Agent 用",
-    `仓库 mcp/ds-server.mjs：${mcpFile ? "有" : "无"}`,
-    "配置：~/.cursor/mcp.json → ds-offline",
-    "",
-    "所以在飞书问「MCP 连上了吗」会得到「本会话无 MCP」——那是 Agent 误判，不是 bot 坏了。",
-    "飞书请用：/failed /diagnose /status",
-    "验 IDE MCP：Cursor 对话里调 ds_status",
+    "自然语言 Chat：local Agent + MCP ds_* 查调度",
+    "Cloud 读 pipeline SQL：仅 /diagnose / 告警 cloud_code（与 Chat 分离）",
+    "IDE Cursor MCP（~/.cursor/mcp.json）与飞书会话相互独立",
   ].join("\n");
 }
 
@@ -634,11 +638,10 @@ async function runCommand(config, command, message) {
       `\nalert_mode: ${describeAlertMode(config)}` +
       `\nds_push: ${config.dsAlertWebhook?.enabled ? `on :${config.dsAlertWebhook.port}${config.dsAlertWebhook.path}` : "off"}` +
       `\ncard_callback: ${config.feishuCardCallback?.enabled ? `on :${config.feishuCardCallback.port}${config.feishuCardCallback.path}` : "off"}` +
-      `\nagent_chat: ${config.agentChatRuntime}` +
-      (config.agentChatRuntime === "cloud"
-        ? ` default=${config.defaultCloudRepoKey} (${config.cloudRepos?.[config.defaultCloudRepoKey]?.url || "?"})`
-        : "") +
-      `\nmcp: 飞书bot不走Cursor MCP；详询 /mcp`
+      `\nagent_chat: local+mcp` +
+      (config.agentMcpDs === false ? " (mcp off)" : "") +
+      `\ncloud_code: diagnose=${config.cloudCodeOnDiagnose ? "on" : "off"} alert=${config.cloudCodeOnAlert ? "on" : "off"}` +
+      `\nmcp: 飞书 Chat 挂 ds-offline；详询 /mcp`
     );
   }
   if (name === "help") {
@@ -1626,46 +1629,43 @@ async function handleChat(config, message) {
     env.projectCode ||
     "(unset)";
   const runtimeOpts = agentRuntimeForChat(config, message.chatId);
-  const repoHint =
-    runtimeOpts.runtime === "cloud" && runtimeOpts.cloudRepos?.[0]?.url
-      ? `当前可阅读的 GitHub 仓：${runtimeOpts.cloudRepos[0].url}@${runtimeOpts.cloudRepos[0].startingRef || "main"}（只读；禁止开 PR/改代码提交）`
-      : `当前本地工作目录可读代码（只读）`;
+  const mcpNames = runtimeOpts.mcpServers
+    ? Object.keys(runtimeOpts.mcpServers).join(", ")
+    : "(none)";
+  const repoHint = `本地 bot 工作区可读；调度数据请用 MCP「ds-offline」工具（已挂载：${mcpNames}）`;
 
   const prompt = `你是通过飞书接入的 Cursor Agent（体验尽量接近 IDE 里对话）。
-用户自然语言由你直接处理，不要先推「请用 /xxx」敷衍；能答就答，需要调度数据时主动查或说明怎么查。
-用中文简洁回答。可以查代码、解释报错、给修复步骤、对比任务耗时思路。
+用户自然语言由你直接处理。查 DolphinScheduler 必须优先调用 MCP 工具 ds_*（ds-offline），不要声称没有 DS 工具。
+用中文简洁回答。
+
+【MCP / DS — 核心能力】
+- 已挂载 MCP：${mcpNames}
+- 常用：ds_status、ds_list_failed、ds_list_tasks、ds_get_log、ds_diagnose、ds_slow
+- 对比某国两天某任务耗时：先定位对应数据日的工作流实例，再 ds_list_tasks 看节点 duration，最后对比给出结论
+- 写操作（重跑）不要自己调写接口；引导用户点确认卡或发「重跑 <实例id>」→ YES
+- 当前项目 code=${projectCode}
 
 【代码上下文】
 - ${repoHint}
-- 用 /use tiktok|amz|shopee 切换调度项目与对应代码仓
+- 用 /use tiktok|amz|shopee 切换调度项目（影响 DS project + MCP 默认项目）
+- 深挖 pipeline SQL：可建议 /diagnose（会走 Cloud 读 GitHub 仓）；本会话以 DS MCP 为主
 
 【飞书排版硬约束】
 - 禁止 Markdown 表格（不要用 | 列 |）；改用短行或「· 项 — 值」
 - 少用粗体堆砌；回复宜短
 
-【架构勿混淆】
-- 飞书 bot 查 DolphinScheduler：内嵌 Ds32Client，不经过 Cursor MCP
-- Cursor IDE 的 ds-offline MCP 只服务 IDE Agent；飞书会话里 MCP 工具列表为空是正常的，不要据此说「未连上 / 配置失败 / 没有 DS 查询工具」
-- 用户问任务/工作流/调度状态、耗时对比：尽量直接给结论；若当前环境读不到 DS 实例数据，再引导「/progress id」「/board」「/slow wh id」或「/tasks <实例id>」
-- 用户问 mcp/MCP 状态：直接说明上述分工，并建议发 /mcp 或 /status，不要猜 Reload
+【架构】
+- 飞书 bot Agent 通过 SDK 挂载 ds-offline MCP → Ds32Client → DS REST
+- IDE 里的 Cursor MCP 配置与飞书会话是两套；本会话以工具列表为准
+- 用户问 mcp/MCP 状态：先调 ds_status，再简短说明
 
-用户若在追问「怎么修复」且上文已有诊断卡：不要再复读同一张卡，而是基于上文给出更具体的修复顺序、要核对的表/分区/参数。
-若适合重跑：引导用户点告警/诊断卡「重跑」或发「重跑 <实例id>」，bot 会弹确认卡；不要假装已经提交重跑。
-若日志已清理、缺少 Exception 原文：明确说还缺什么证据，并给出在 UI 复制日志或复跑 SQL 的具体动作。
-
-DolphinScheduler（offline，经典 REST；dsctl /v2 暂不可用）：
-- 环境文件：~/.config/dsctl/offline.env（DS_API_URL / DS_API_TOKEN / DS_PROJECT_CODE）
-- 默认项目：kalo_data_online:daily，code=${projectCode}
-- 写操作：${config.dsReadonly ? "关（ds_readonly，禁止重跑）" : "开（可重跑/强制成功，确认卡或 YES；仍禁改工作流定义）"}
-- 本仓库客户端：src/ds32_client.mjs
-- 快捷命令：/diagnose /failed /slow /tasks /log /mcp /rerun /rerun-all /force-success
+若适合重跑：引导点告警/诊断卡「重跑」或发「重跑 <实例id>」；不要假装已经提交重跑。
 
 约束：
 - 不要 commit/push/删数据/开 PR
-- 不要直接调用会改生产的 DS 写接口；让用户走确认卡 / YES
 - 禁止建议改工作流定义
 - 不输出 token、密码、完整 JDBC 连接串
-- 飞书回复宜短；长内容给要点 + 下一步
+- 飞书回复宜短
 
 ${historyBlock ? `## 近期对话\n${historyBlock}\n` : ""}
 ## 用户本轮
@@ -1730,23 +1730,30 @@ function projectPathFor(config, projectName) {
   return projectPath;
 }
 
-/** Chat/Alert: cloud.repos by /use session, or local cwd fallback. */
+/**
+ * Feishu Chat Agent: local + ds-offline MCP (DS is core).
+ * Pipeline SQL GitHub read stays on cloud_code_on_diagnose/alert, not Chat Cloud.
+ */
 function agentRuntimeForChat(config, chatId) {
-  const sessionKey =
-    (chatId && sessionProjectByChat.get(chatId)) || config.defaultCloudRepoKey || "tiktok";
-  if (config.agentChatRuntime === "cloud") {
-    const cloudRepos = resolveCloudReposForSession({
-      cloudRepos: config.cloudRepos,
-      sessionProjectKey: sessionKey,
-      defaultKey: config.defaultCloudRepoKey,
-    });
-    return { runtime: "cloud", cloudRepos };
-  }
   const localCwd =
     config.projects.remote ||
     config.alertCwd ||
     path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  return { runtime: "local", localCwd };
+  const projectCode = getEffectiveProjectCode(chatId, null, config);
+  const mcpServers =
+    config.agentMcpDs === false
+      ? null
+      : buildDsOfflineMcpServers({
+          projectCode,
+          repoRoot: localCwd,
+          allowWrite: config.dsReadonly === false,
+        });
+  return {
+    runtime: "local",
+    localCwd,
+    mcpServers,
+    projectCode,
+  };
 }
 
 /**
@@ -1835,7 +1842,7 @@ async function maybeAttachCloudCodeAnalysis({
 
 /**
  * @param {string} prompt
- * @param {{ model?: string, timeoutMs?: number, runtime?: "cloud"|"local", localCwd?: string, cloudRepos?: Array<{url:string,startingRef?:string}>, cancellable?: boolean }} opts
+ * @param {{ model?: string, timeoutMs?: number, runtime?: "cloud"|"local", localCwd?: string, cloudRepos?: Array<{url:string,startingRef?:string}>, mcpServers?: object|null, cancellable?: boolean }} opts
  */
 async function runCursor(prompt, opts = {}) {
   const {
@@ -1844,6 +1851,7 @@ async function runCursor(prompt, opts = {}) {
     runtime = "local",
     localCwd = null,
     cloudRepos = [],
+    mcpServers = null,
     cancellable = false,
   } = opts;
   if (!process.env.CURSOR_API_KEY) {
@@ -1856,9 +1864,11 @@ async function runCursor(prompt, opts = {}) {
     localCwd,
     cloudRepos,
     autoCreatePR: false,
+    mcpServers,
   });
+  const mcpLabel = mcpServers ? Object.keys(mcpServers).join(",") : "none";
   console.error(
-    `[cursor] runtime=${runtime}` +
+    `[cursor] runtime=${runtime} mcp=${mcpLabel}` +
       (runtime === "cloud"
         ? ` repos=${(cloudRepos || []).map((r) => r.url).join(",") || "(none)"}`
         : ` cwd=${localCwd}`),

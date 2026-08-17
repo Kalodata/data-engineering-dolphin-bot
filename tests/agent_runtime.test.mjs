@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   buildAgentPromptOptions,
+  buildDsOfflineMcpServers,
   cloudRepoKeyFromProjectCode,
   loadCloudReposMap,
   normalizeCloudRepoKey,
@@ -79,4 +82,39 @@ test("buildAgentPromptOptions local requires cwd", () => {
   });
   assert.equal(opts.local.cwd, "/tmp");
   assert.equal(opts.cloud, undefined);
+});
+
+test("buildAgentPromptOptions attaches mcpServers", () => {
+  const opts = buildAgentPromptOptions({
+    apiKey: "k",
+    model: "auto",
+    runtime: "local",
+    localCwd: "/tmp",
+    mcpServers: {
+      "ds-offline": { type: "stdio", command: "node", args: ["mcp/ds-server.mjs"] },
+    },
+  });
+  assert.equal(opts.mcpServers["ds-offline"].type, "stdio");
+});
+
+test("buildDsOfflineMcpServers returns stdio when DS env + server exist", () => {
+  const prevUrl = process.env.DS_API_URL;
+  const prevToken = process.env.DS_API_TOKEN;
+  process.env.DS_API_URL = "https://ds.example/dolphinscheduler";
+  process.env.DS_API_TOKEN = "tok";
+  try {
+    const servers = buildDsOfflineMcpServers({
+      projectCode: "123",
+      repoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."),
+    });
+    assert.ok(servers);
+    assert.equal(servers["ds-offline"].type, "stdio");
+    assert.equal(servers["ds-offline"].env.DS_PROJECT_CODE, "123");
+    assert.equal(servers["ds-offline"].env.DS_API_TOKEN, "tok");
+  } finally {
+    if (prevUrl == null) delete process.env.DS_API_URL;
+    else process.env.DS_API_URL = prevUrl;
+    if (prevToken == null) delete process.env.DS_API_TOKEN;
+    else process.env.DS_API_TOKEN = prevToken;
+  }
 });
