@@ -21,7 +21,7 @@ Cloud 读 pipeline SQL 仍走 `cloud_code_on_diagnose` / `cloud_code_on_alert`�
 | `ds_diagnose` | Classify + playbook for newest/given FAILURE |
 | `ds_slow` | Slow SUB_PROCESS / nested jobs |
 | `ds_progress` | RUNNING instances + stage dig (optional country) |
-| `ds_board` | Multi-country daily board |
+| `ds_board` | TikTok daily → country board; other projects → simple board |
 
 Write (IDE only): set `DS_MCP_ALLOW_WRITE=1` to expose `ds_rerun`.  
 `START_FAILURE_TASK_PROCESS` = resume failed tasks; `REPEAT_RUNNING` = full instance rerun.

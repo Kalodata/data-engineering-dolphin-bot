@@ -520,10 +520,10 @@ function getDsClient(config, projectCode = null) {
 
 /**
  * Parse [project] [country] [YYYY-MM-DD] [nodeName] from command args.
- * If command[1] is a plain number, returns it as instanceId (legacy).
+ * If command[1] is a plain number or #id, returns it as instanceId (legacy).
  * Returns { projectCode, country, dataDate, instanceId, nodeName }.
  */
-function parseInstanceLookupArgs(command, chatId, config) {
+export function parseInstanceLookupArgs(command, chatId, config) {
   const args = command.slice(1);
   let idx = 0;
 
@@ -531,8 +531,15 @@ function parseInstanceLookupArgs(command, chatId, config) {
   if (!first) {
     return { projectCode: getEffectiveProjectCode(chatId, null, config), country: null, dataDate: null, instanceId: null, nodeName: null };
   }
-  if (/^\d+$/.test(first)) {
-    return { projectCode: getEffectiveProjectCode(chatId, null, config), country: null, dataDate: null, instanceId: Number(first), nodeName: null };
+  const asId = parseNumericIdToken(first);
+  if (asId != null) {
+    return {
+      projectCode: getEffectiveProjectCode(chatId, null, config),
+      country: null,
+      dataDate: null,
+      instanceId: asId,
+      nodeName: null,
+    };
   }
 
   let projectOverride = null;
@@ -568,6 +575,14 @@ function parseInstanceLookupArgs(command, chatId, config) {
     instanceId: null,
     nodeName,
   };
+}
+
+/** Accept `123` or `#123` as a numeric instance/task id. */
+export function parseNumericIdToken(token) {
+  const s = String(token || "").trim();
+  if (!/^#?\d+$/.test(s)) return null;
+  const n = Number(s.replace(/^#/, ""));
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 /**
@@ -967,13 +982,12 @@ async function runCommand(config, command, message) {
       }
     }
 
-    // command[1] is a plain number → treat as taskId (existing behavior)
+    // command[1] is a plain number or #id → treat as taskId (existing behavior)
     const firstArg = String(command[1] || "").toLowerCase();
-    const isTaskId = /^\d+$/.test(firstArg) && firstArg;
+    const taskId = parseNumericIdToken(firstArg);
 
-    if (isTaskId) {
+    if (taskId != null) {
       // --- Legacy: explicit taskId path ---
-      const taskId = Number(firstArg);
       const ds = getDsClient(config);
       const task = await ds.resolveTaskInstance(taskId, {
         processInstanceId: lastFailureByChat.get(message.chatId) || null,

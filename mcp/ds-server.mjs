@@ -19,12 +19,17 @@ import {
   formatFailedList,
   formatPracticalDiagnosis,
   formatProgressReport,
+  formatSimpleBoard,
   formatSlowStageJobs,
   formatTaskList,
   listCountryDailyBoard,
   listRunningProgress,
+  listSimpleBoard,
   loadDsEnv,
 } from "../src/ds32_client.mjs";
+
+/** Same as host KNOWN_PROJECTS.tiktok /daily — country board is TikTok天级 only. */
+const TIKTOK_DAILY_PROJECT_CODE = "9892432515424";
 
 const ALLOW_WRITE = process.env.DS_MCP_ALLOW_WRITE === "1";
 
@@ -338,18 +343,24 @@ server.registerTool(
 server.registerTool(
   "ds_board",
   {
-    title: "Country daily progress board",
+    title: "Daily / project progress board",
     description:
-      "Multi-country TikTok daily board (which countries started / running / done for the schedule day).",
+      "Board for the effective DS project: TikTok daily (9892432515424) → multi-country board; Amazon/Shopee/other → simple board. Pass project_code to override DS_PROJECT_CODE.",
     inputSchema: {
       project_code: z.string().optional(),
     },
   },
   async ({ project_code }) => {
     try {
-      const ds = getClient(project_code);
-      const board = await listCountryDailyBoard(ds, {});
-      return ok(formatCountryDailyBoard(board));
+      const env = loadDsEnv();
+      const code = String(project_code || env.projectCode || "").trim();
+      const ds = getClient(code || undefined);
+      if (code === TIKTOK_DAILY_PROJECT_CODE) {
+        const board = await listCountryDailyBoard(ds, {});
+        return ok(formatCountryDailyBoard(board));
+      }
+      const board = await listSimpleBoard(ds, {});
+      return ok(formatSimpleBoard(board));
     } catch (error) {
       return fail(error);
     }

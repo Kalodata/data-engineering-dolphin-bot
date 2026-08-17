@@ -5,9 +5,12 @@ import { parseNlHostCommand } from "../src/nl_host_route.mjs";
 
 test("parseNlHostCommand maps write intents to slash", () => {
   assert.deepEqual(parseNlHostCommand("重跑 123"), ["/rerun", "123"]);
+  assert.deepEqual(parseNlHostCommand("重跑 #123"), ["/rerun", "123"]);
   assert.deepEqual(parseNlHostCommand("重跑"), ["/rerun"]);
   assert.deepEqual(parseNlHostCommand("整实例重跑 456"), ["/rerun-all", "456"]);
+  assert.deepEqual(parseNlHostCommand("整实例重跑 #456"), ["/rerun-all", "456"]);
   assert.deepEqual(parseNlHostCommand("从失败处恢复 789"), ["/rerun", "789"]);
+  assert.deepEqual(parseNlHostCommand("从失败处恢复 #789"), ["/rerun", "789"]);
   assert.deepEqual(parseNlHostCommand("强制成功 任务 #42"), ["/force-success", "42"]);
   assert.deepEqual(parseNlHostCommand("强制成功"), ["/force-success"]);
   assert.deepEqual(parseNlHostCommand("rerun 11"), ["/rerun", "11"]);

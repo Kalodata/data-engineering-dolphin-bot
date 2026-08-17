@@ -13,9 +13,12 @@ function stripMention(text) {
 
 function tokenize(rest) {
   if (!rest) return [];
-  return (rest.match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map((p) =>
-    p.replace(/^(['"])(.*)\1$/, "$2"),
-  );
+  return (rest.match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map((part) => {
+    const p = part.replace(/^(['"])(.*)\1$/, "$2");
+    // Normalize #123 → 123 so host parseInstanceLookupArgs never misses the id
+    if (/^#\d+$/.test(p)) return p.slice(1);
+    return p;
+  });
 }
 
 /** Rest must look like command args (ids / country / date), not a free-form question. */
@@ -29,8 +32,7 @@ function argsLookSafe(rest) {
   if (!toks.length) return true;
   return toks.every(
     (tok) =>
-      /^\d+$/.test(tok) ||
-      /^#\d+$/.test(tok) ||
+      /^#?\d+$/.test(tok) ||
       /^\d{4}-\d{2}-\d{2}$/.test(tok) ||
       /^[a-z]{2}$/i.test(tok) ||
       /^(tiktok|daily|amazon|amz|shopee|hourly|tiered|test)$/i.test(tok),
