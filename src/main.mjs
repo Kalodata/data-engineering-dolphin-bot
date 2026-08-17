@@ -101,11 +101,11 @@ const DEFAULT_ALERT_PROMPT_PATH = path.join(
   os.homedir(),
   ".cursor/agents/alert/PROMPT.md",
 );
-const HELP_TEXT = `可以直接打字，自然语言交给 Agent 回答（斜杠命令仍可用）。
+const HELP_TEXT = `可以直接打字，自然语言交给 Agent（不固定句式；斜杠仍可用）。
 
-自然语言示例：
+示例（任意说法均可）：
 「最近失败」「诊断 1939974」「重跑」「强制成功」
-「id分区进度」「各国天级进度」「对比某任务两天耗时」
+「id 分区进度」「各国天级进度」
 
 写操作弹确认卡（点按钮或回 YES）；仍禁止改工作流定义。
 告警卡可点：诊断 / 重跑 / 看日志。
@@ -1634,13 +1634,14 @@ async function handleChat(config, message) {
   const repoHint = `本地 bot 工作区可读；调度数据请用 MCP「ds-offline」工具（已挂载：${mcpNames}）`;
 
   const prompt = `你是通过飞书接入的 Cursor Agent（体验尽量接近 IDE 里对话）。
-用户自然语言由你直接处理。查 DolphinScheduler 必须优先调用 MCP 工具 ds_*（ds-offline），不要声称没有 DS 工具。
+用户说法不固定：自行理解意图，用已有 MCP 工具组合完成，不要假设固定句式，也不要只推「请用 /xxx」。
+查 DolphinScheduler 必须优先调用 MCP 工具 ds_*（ds-offline），不要声称没有 DS 工具。
 用中文简洁回答。
 
 【MCP / DS — 核心能力】
 - 已挂载 MCP：${mcpNames}
-- 常用：ds_status、ds_list_failed、ds_list_tasks、ds_get_log、ds_diagnose、ds_slow
-- 对比某国两天某任务耗时：先定位对应数据日的工作流实例，再 ds_list_tasks 看节点 duration，最后对比给出结论
+- 原子工具：ds_status、ds_list_failed、ds_list_tasks、ds_get_log、ds_diagnose、ds_slow
+- 自行组合上述工具回答任意运维问题（进度、失败、日志、耗时、对比等）；缺证据就继续查，不要编造
 - 写操作（重跑）不要自己调写接口；引导用户点确认卡或发「重跑 <实例id>」→ YES
 - 当前项目 code=${projectCode}
 
