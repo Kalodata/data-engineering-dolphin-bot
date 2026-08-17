@@ -1,7 +1,13 @@
 /**
  * Cursor Agent runtime helpers: local cwd vs cloud.repos.
- * Chat/Alert can run on Cursor Cloud against GitHub; Planner stays local/no-repo.
+ * Chat uses local + ds-offline MCP (DS access). Cloud repos stay for code analysis.
  */
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { loadDsEnv } from "./ds32_client.mjs";
 
 /** DS project codes → cloud_repos key (alert watcher has no /use session). */
 export const DS_PROJECT_CODE_TO_CLOUD_KEY = {
@@ -110,8 +116,53 @@ export function resolveCloudReposForSession({
   return [{ url: entry.url, startingRef: entry.startingRef || "main" }];
 }
 
+function defaultRepoRoot() {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+}
+
+/**
+ * Inline ds-offline MCP for SDK Agent (stdio on the machine running the bot).
+ * Cloud Chat VMs cannot see this path — Feishu NL Chat must use local + this MCP.
+ *
+ * Feishu Chat MUST pass allowWrite=false (default). Write ops go through host
+ * confirm cards + audit — never via Agent MCP. DS_MCP_ALLOW_WRITE is for IDE only.
+ * @returns {Record<string, object>|null}
+ */
+export function buildDsOfflineMcpServers({
+  projectCode = "",
+  repoRoot = null,
+  allowWrite = false,
+} = {}) {
+  const env = loadDsEnv();
+  if (!env.apiUrl || !env.apiToken) return null;
+
+  const root = repoRoot || defaultRepoRoot();
+  const serverJs = path.join(root, "mcp", "ds-server.mjs");
+  if (!fs.existsSync(serverJs)) return null;
+
+  const mcpEnv = {
+    DS_API_URL: env.apiUrl,
+    DS_API_TOKEN: env.apiToken,
+    DS_PROJECT_CODE: String(projectCode || env.projectCode || "").trim(),
+  };
+  // Explicit opt-in only; never infer from ds_readonly.
+  if (allowWrite === true) mcpEnv.DS_MCP_ALLOW_WRITE = "1";
+  if (process.env.DS_ENV_FILE) mcpEnv.DS_ENV_FILE = process.env.DS_ENV_FILE;
+
+  return {
+    "ds-offline": {
+      type: "stdio",
+      command: process.execPath,
+      args: [serverJs],
+      cwd: root,
+      env: mcpEnv,
+    },
+  };
+}
+
 /**
  * Build Agent.prompt options: either cloud.repos or local.cwd (never both).
+ * mcpServers attach on either runtime (stdio only reliable for local Feishu bot).
  */
 export function buildAgentPromptOptions({
   apiKey,
@@ -120,11 +171,15 @@ export function buildAgentPromptOptions({
   localCwd = null,
   cloudRepos = [],
   autoCreatePR = false,
+  mcpServers = null,
 } = {}) {
   const base = {
     apiKey,
     model: { id: model || "auto" },
   };
+  if (mcpServers && typeof mcpServers === "object" && Object.keys(mcpServers).length) {
+    base.mcpServers = mcpServers;
+  }
   if (runtime === "cloud") {
     return {
       ...base,

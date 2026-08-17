@@ -31,20 +31,13 @@ import {
 } from "./ds32_client.mjs";
 import { enrichFailureContext } from "./deep_enrich.mjs";
 import { analyzeSqlAgainstFailure } from "./sql_repo_analysis.mjs";
-import {
-  buildPlannerPrompt,
-  executeDsPlan,
-  formatClarifyReply,
-  needsClarify,
-  parsePlannerJson,
-  planToSlashCommand,
-} from "./ds_adaptive.mjs";
 import { resolveCountryCode } from "./country_code.mjs";
+import { parseNlHostCommand } from "./nl_host_route.mjs";
 import {
   buildAgentPromptOptions,
+  buildDsOfflineMcpServers,
   loadCloudReposMap,
   normalizeCloudRepoKey,
-  resolveCloudReposForSession,
 } from "./agent_runtime.mjs";
 import {
   shouldCloudCodeAnalyze,
@@ -100,11 +93,11 @@ const DEFAULT_ALERT_PROMPT_PATH = path.join(
   os.homedir(),
   ".cursor/agents/alert/PROMPT.md",
 );
-const HELP_TEXT = `可以像 Cursor 一样直接打字（复杂 DS 排查会自动规划并查数）。
+const HELP_TEXT = `可以直接打字，自然语言交给 Agent（不固定句式；斜杠仍可用）。
 
-自然语言示例：
+示例（任意说法均可）：
 「最近失败」「诊断 1939974」「重跑」「强制成功」
-「id分区进度」「各国天级进度」「只看数仓层、印尼、stage>15m 的慢 job」
+「id 分区进度」「各国天级进度」
 
 写操作弹确认卡（点按钮或回 YES）；仍禁止改工作流定义。
 告警卡可点：诊断 / 重跑 / 看日志。
@@ -263,41 +256,18 @@ function loadConfig(configPath) {
         minute: Number(bp.minute ?? 0),
       };
     })(),
-    /**
-     * Chat / Alert Agent runtime (backward compatible default: local).
-     * ECS has no pipeline checkout — set agent_chat_runtime: "cloud" explicitly.
-     * - cloud: Cursor Cloud clones GitHub
-     * - local: Agent.prompt({ local: { cwd } }) against projects.remote / alert_cwd
-     * Planner always stays local (cheap intent JSON).
-     */
-    agentChatRuntime: String(raw.agent_chat_runtime || "local").toLowerCase() === "cloud"
-      ? "cloud"
-      : "local",
     cloudRepos: loadCloudReposMap(
       Object.prototype.hasOwnProperty.call(raw, "cloud_repos") ? raw.cloud_repos : {},
     ),
     defaultCloudRepoKey: normalizeCloudRepoKey(
       raw.default_cloud_repo_key || raw.default_ds_project || "tiktok",
     ),
-    /**
-     * Cloud code analysis for diagnose/alert.
-     * Default ON only when agent_chat_runtime=cloud; otherwise OFF unless explicitly true.
-     */
-    cloudCodeOnDiagnose: (() => {
-      const runtimeCloud =
-        String(raw.agent_chat_runtime || "local").toLowerCase() === "cloud";
-      if (raw.cloud_code_on_diagnose === true) return true;
-      if (raw.cloud_code_on_diagnose === false) return false;
-      return runtimeCloud;
-    })(),
-    cloudCodeOnAlert: (() => {
-      const runtimeCloud =
-        String(raw.agent_chat_runtime || "local").toLowerCase() === "cloud";
-      if (raw.cloud_code_on_alert === true) return true;
-      if (raw.cloud_code_on_alert === false) return false;
-      return runtimeCloud;
-    })(),
+    /** Cloud code analysis for diagnose/alert. Default off unless explicitly true. */
+    cloudCodeOnDiagnose: raw.cloud_code_on_diagnose === true,
+    cloudCodeOnAlert: raw.cloud_code_on_alert === true,
     cloudCodeTimeoutMs: Number(raw.cloud_code_timeout_ms ?? 120_000),
+    /** Attach read-only ds-offline MCP to Feishu Chat Agent. Default on. */
+    agentMcpDs: raw.agent_mcp_ds !== false,
   };
   // Merge allowlist.json (committed to git) into allowed_users / notify_user_ids
   const allowlistPath = path.resolve(path.dirname(resolvedConfigPath), "allowlist.json");
@@ -420,7 +390,7 @@ export function looksLikeBotStatus(text) {
 }
 
 /**
- * Feishu bot does NOT use Cursor MCP. Explain architecture + probe DS REST.
+ * Feishu Chat Agent uses SDK-mounted ds-offline MCP. Probe DS REST + MCP file.
  */
 export async function formatMcpArchitectureStatus(config) {
   const env = loadDsEnv();
@@ -430,6 +400,11 @@ export async function formatMcpArchitectureStatus(config) {
     path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const mcpPath = path.join(repoRoot, "mcp/ds-server.mjs");
   const mcpFile = fs.existsSync(mcpPath);
+  const mcpServers = buildDsOfflineMcpServers({
+    projectCode: config.dsProjectCode || env.projectCode,
+    repoRoot,
+    allowWrite: false,
+  });
 
   let dsLine = "未配置（缺 DS_API_URL / TOKEN）";
   if (env.apiUrl && env.apiToken) {
@@ -449,21 +424,18 @@ export async function formatMcpArchitectureStatus(config) {
   }
 
   return [
-    "【说明】飞书 Dolphin bot 不走 Cursor MCP",
+    "【飞书 Agent ↔ DS】",
     "",
-    "本 bot 查 DS：内嵌 Ds32Client → classic REST",
     `DS 连通：${dsLine}`,
     `项目：${config.dsProjectCode || env.projectCode || "(unset)"}`,
-    `只读：${config.dsReadonly ? "是" : "否（可 /rerun）"}`,
-    `告警轮询：${config.alertWatch?.enabled ? "开" : "关"}`,
+    `只读：${config.dsReadonly ? "是" : "否（可 /rerun，经确认卡）"}`,
+    `Chat Agent MCP：${config.agentMcpDs === false ? "关（agent_mcp_ds=false）" : mcpServers ? "开（stdio ds-offline，只读）" : "未挂载（缺凭证或 mcp/ds-server.mjs）"}`,
+    `mcp/ds-server.mjs：${mcpFile ? "有" : "无"}`,
     "",
-    "Cursor IDE 的 ds-offline MCP：只给 IDE Agent 用",
-    `仓库 mcp/ds-server.mjs：${mcpFile ? "有" : "无"}`,
-    "配置：~/.cursor/mcp.json → ds-offline",
-    "",
-    "所以在飞书问「MCP 连上了吗」会得到「本会话无 MCP」——那是 Agent 误判，不是 bot 坏了。",
-    "飞书请用：/failed /diagnose /status",
-    "验 IDE MCP：Cursor 对话里调 ds_status",
+    "自然语言 Chat：local Agent + 只读 MCP ds_*",
+    "写操作：宿主确认卡 / YES（Chat MCP 永不挂 ds_rerun）",
+    "Cloud 读 pipeline SQL：仅 /diagnose / 告警 cloud_code（与 Chat 分离）",
+    "IDE Cursor MCP（~/.cursor/mcp.json）与飞书会话相互独立",
   ].join("\n");
 }
 
@@ -515,10 +487,10 @@ function getDsClient(config, projectCode = null) {
 
 /**
  * Parse [project] [country] [YYYY-MM-DD] [nodeName] from command args.
- * If command[1] is a plain number, returns it as instanceId (legacy).
+ * If command[1] is a plain number or #id, returns it as instanceId (legacy).
  * Returns { projectCode, country, dataDate, instanceId, nodeName }.
  */
-function parseInstanceLookupArgs(command, chatId, config) {
+export function parseInstanceLookupArgs(command, chatId, config) {
   const args = command.slice(1);
   let idx = 0;
 
@@ -526,8 +498,15 @@ function parseInstanceLookupArgs(command, chatId, config) {
   if (!first) {
     return { projectCode: getEffectiveProjectCode(chatId, null, config), country: null, dataDate: null, instanceId: null, nodeName: null };
   }
-  if (/^\d+$/.test(first)) {
-    return { projectCode: getEffectiveProjectCode(chatId, null, config), country: null, dataDate: null, instanceId: Number(first), nodeName: null };
+  const asId = parseNumericIdToken(first);
+  if (asId != null) {
+    return {
+      projectCode: getEffectiveProjectCode(chatId, null, config),
+      country: null,
+      dataDate: null,
+      instanceId: asId,
+      nodeName: null,
+    };
   }
 
   let projectOverride = null;
@@ -563,6 +542,14 @@ function parseInstanceLookupArgs(command, chatId, config) {
     instanceId: null,
     nodeName,
   };
+}
+
+/** Accept `123` or `#123` as a numeric instance/task id. */
+export function parseNumericIdToken(token) {
+  const s = String(token || "").trim();
+  if (!/^#?\d+$/.test(s)) return null;
+  const n = Number(s.replace(/^#/, ""));
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 /**
@@ -634,11 +621,10 @@ async function runCommand(config, command, message) {
       `\nalert_mode: ${describeAlertMode(config)}` +
       `\nds_push: ${config.dsAlertWebhook?.enabled ? `on :${config.dsAlertWebhook.port}${config.dsAlertWebhook.path}` : "off"}` +
       `\ncard_callback: ${config.feishuCardCallback?.enabled ? `on :${config.feishuCardCallback.port}${config.feishuCardCallback.path}` : "off"}` +
-      `\nagent_chat: ${config.agentChatRuntime}` +
-      (config.agentChatRuntime === "cloud"
-        ? ` default=${config.defaultCloudRepoKey} (${config.cloudRepos?.[config.defaultCloudRepoKey]?.url || "?"})`
-        : "") +
-      `\nmcp: 飞书bot不走Cursor MCP；详询 /mcp`
+      `\nagent_chat: local+mcp` +
+      (config.agentMcpDs === false ? " (mcp off)" : "") +
+      `\ncloud_code: diagnose=${config.cloudCodeOnDiagnose ? "on" : "off"} alert=${config.cloudCodeOnAlert ? "on" : "off"}` +
+      `\nmcp: 飞书 Chat 挂 ds-offline；详询 /mcp`
     );
   }
   if (name === "help") {
@@ -668,10 +654,10 @@ async function runCommand(config, command, message) {
     const cloudKey = normalizeCloudRepoKey(key);
     const cloud = config.cloudRepos?.[cloudKey] || config.cloudRepos?.tiktok;
     const cloudLine =
-      config.agentChatRuntime === "cloud" && cloud?.url
-        ? `\nChat/Alert 代码仓（Cloud）：${cloud.url}@${cloud.startingRef || "main"}`
+      (config.cloudCodeOnDiagnose || config.cloudCodeOnAlert) && cloud?.url
+        ? `\n诊断/告警代码仓（Cloud）：${cloud.url}@${cloud.startingRef || "main"}`
         : "";
-    return `已切换到 **${p.label}**（project: ${p.code}）\n本群后续指令均使用此项目。${cloudLine}\n恢复默认：/use tiktok`;
+    return `已切换到 **${p.label}**（project: ${p.code}）\n本群后续指令均使用此项目（Chat=local+MCP）。${cloudLine}\n恢复默认：/use tiktok`;
   }
   if (name === "board" || name === "countries" || name === "country-board") {
     const projectOverride = KNOWN_PROJECTS[String(command[1] || "").toLowerCase()] ? command[1] : null;
@@ -963,13 +949,12 @@ async function runCommand(config, command, message) {
       }
     }
 
-    // command[1] is a plain number → treat as taskId (existing behavior)
+    // command[1] is a plain number or #id → treat as taskId (existing behavior)
     const firstArg = String(command[1] || "").toLowerCase();
-    const isTaskId = /^\d+$/.test(firstArg) && firstArg;
+    const taskId = parseNumericIdToken(firstArg);
 
-    if (isTaskId) {
+    if (taskId != null) {
       // --- Legacy: explicit taskId path ---
-      const taskId = Number(firstArg);
       const ds = getDsClient(config);
       const task = await ds.resolveTaskInstance(taskId, {
         processInstanceId: lastFailureByChat.get(message.chatId) || null,
@@ -1529,90 +1514,6 @@ async function runAlertLocal(config, alertText, evidenceBlock = "", message = nu
   });
 }
 
-async function handleNlIntent(config, message) {
-  const history = chatHistories.get(message.chatId) || [];
-  const historyBlock = history
-    .slice(-CHAT_HISTORY_MAX)
-    .map((m) => `${m.role}: ${m.text}`)
-    .join("\n");
-  const env = loadDsEnv();
-  const projectCode =
-    getEffectiveProjectCode(message.chatId, null, config) ||
-    config.dsProjectCode ||
-    env.projectCode ||
-    "";
-  const plannerCwd =
-    config.projects.remote ||
-    config.alertCwd ||
-    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-
-  let plan = null;
-  try {
-    // Planner: always local + bot cwd — do not clone pipeline repos for intent JSON.
-    const plannerRaw = await runCursor(
-      buildPlannerPrompt(message.text, historyBlock, projectCode),
-      {
-        model: config.model,
-        timeoutMs: 45_000,
-        runtime: "local",
-        localCwd: plannerCwd,
-      },
-    );
-    plan = parsePlannerJson(plannerRaw);
-  } catch (error) {
-    console.error(`[nl-intent] planner failed: ${error.message}`);
-    const text =
-      formatClarifyReply(null) +
-      `\n（意图解析失败：${error.message}；可改用 /failed /progress /diagnose）`;
-    pushChat(message.chatId, "user", message.text);
-    pushChat(message.chatId, "assistant", text);
-    return text;
-  }
-
-  if (!plan?.tool) {
-    const text = formatClarifyReply(plan);
-    pushChat(message.chatId, "user", message.text);
-    pushChat(message.chatId, "assistant", text);
-    return text;
-  }
-
-  // Keep country if model omitted it but text has a clear alias.
-  if (!plan.country && resolveCountryCode(message.text)) {
-    plan.country = resolveCountryCode(message.text);
-  }
-  if (!plan.projectCode) plan.projectCode = projectCode;
-
-  if (needsClarify(plan)) {
-    const text = formatClarifyReply(plan);
-    console.error(`[nl-intent] clarify ${JSON.stringify(plan)}`);
-    pushChat(message.chatId, "user", message.text);
-    pushChat(message.chatId, "assistant", text);
-    return text;
-  }
-
-  if (plan.tool === "chat") {
-    return handleChat(config, message);
-  }
-
-  const command = planToSlashCommand(plan);
-  if (command) {
-    console.error(`[nl-intent] → ${command.join(" ")} from ${JSON.stringify(plan)}`);
-    const response = await runCommand(config, command, message);
-    pushChat(message.chatId, "user", message.text);
-    pushChat(message.chatId, "assistant", replyToHistoryText(response));
-    return response;
-  }
-
-  console.error(`[nl-intent] executeDsPlan ${JSON.stringify(plan)}`);
-  const executed = await executeDsPlan(config, plan);
-  if (executed.kind === "chat" || !executed.text) {
-    return handleChat(config, message);
-  }
-  pushChat(message.chatId, "user", message.text);
-  pushChat(message.chatId, "assistant", executed.text);
-  return executed.text;
-}
-
 async function handleChat(config, message) {
   const history = chatHistories.get(message.chatId) || [];
   const historyBlock = history
@@ -1626,45 +1527,42 @@ async function handleChat(config, message) {
     env.projectCode ||
     "(unset)";
   const runtimeOpts = agentRuntimeForChat(config, message.chatId);
-  const repoHint =
-    runtimeOpts.runtime === "cloud" && runtimeOpts.cloudRepos?.[0]?.url
-      ? `当前可阅读的 GitHub 仓：${runtimeOpts.cloudRepos[0].url}@${runtimeOpts.cloudRepos[0].startingRef || "main"}（只读；禁止开 PR/改代码提交）`
-      : `当前本地工作目录可读代码（只读）`;
+  const mcpNames = runtimeOpts.mcpServers
+    ? Object.keys(runtimeOpts.mcpServers).join(", ")
+    : "(none)";
+  const repoHint = `本地 bot 工作区可读；调度数据请用 MCP「ds-offline」工具（已挂载：${mcpNames}）`;
 
-  const prompt = `你是通过飞书私聊接入的 Cursor Agent（体验尽量接近 IDE 里对话）。
-用中文简洁回答。可以查代码、解释报错、给修复步骤。
+  const prompt = `你是通过飞书接入的 Cursor Agent（体验尽量接近 IDE 里对话）。
+用户说法不固定：自行理解意图，用已有只读 MCP 工具组合完成，不要假设固定句式，也不要只推「请用 /xxx」。
+查 DolphinScheduler 必须优先调用 MCP 工具 ds_*（ds-offline），不要声称没有 DS 工具。
+用中文简洁回答。
+
+【MCP / DS — 只读核心能力】
+- 已挂载 MCP：${mcpNames}（只读；没有 ds_rerun）
+- 原子工具：ds_status、ds_list_failed、ds_list_tasks、ds_get_log、ds_diagnose、ds_slow、ds_progress、ds_board
+- 自行组合上述工具回答任意运维只读问题；缺证据就继续查，不要编造
+- 写操作（重跑 / 整实例重跑 / 强制成功 / STOP）：本会话无写工具。引导用户发「重跑 <实例id>」或「强制成功 任务 #<id>」（宿主会弹确认卡），或点告警/诊断卡按钮；不要假装已提交
+- 当前项目 code=${projectCode}
 
 【代码上下文】
 - ${repoHint}
-- 用 /use tiktok|amz|shopee 切换调度项目与对应代码仓
+- 用 /use tiktok|amz|shopee 切换调度项目（影响 DS project + MCP 默认项目）
+- 深挖 pipeline SQL：可建议 /diagnose（会走 Cloud 读 GitHub 仓）；本会话以 DS MCP 为主
 
 【飞书排版硬约束】
 - 禁止 Markdown 表格（不要用 | 列 |）；改用短行或「· 项 — 值」
 - 少用粗体堆砌；回复宜短
 
-【架构勿混淆】
-- 飞书 bot 查 DolphinScheduler：内嵌 Ds32Client，不经过 Cursor MCP
-- Cursor IDE 的 ds-offline MCP 只服务 IDE Agent；飞书会话里 MCP 工具列表为空是正常的，不要据此说「未连上 / 配置失败 / 没有 DS 查询工具」
-- 用户问任务/工作流/调度状态：应引导发「检查任务状态」「最近失败」「在跑什么」或 /failed /status，不要假装缺工具
-- 用户问 mcp/MCP 状态：直接说明上述分工，并建议发 /mcp 或 /status，不要猜 Reload
-
-用户若在追问「怎么修复」且上文已有诊断卡：不要再复读同一张卡，而是基于上文给出更具体的修复顺序、要核对的表/分区/参数。
-若适合重跑：引导用户点告警/诊断卡「重跑」或发「重跑 <实例id>」，bot 会弹确认卡；不要假装已经提交重跑。
-若日志已清理、缺少 Exception 原文：明确说还缺什么证据，并给出在 UI 复制日志或复跑 SQL 的具体动作。
-
-DolphinScheduler（offline，经典 REST；dsctl /v2 暂不可用）：
-- 环境文件：~/.config/dsctl/offline.env（DS_API_URL / DS_API_TOKEN / DS_PROJECT_CODE）
-- 默认项目：kalo_data_online:daily，code=${projectCode}
-- 写操作：${config.dsReadonly ? "关（ds_readonly，禁止重跑）" : "开（可重跑/强制成功，确认卡或 YES；仍禁改工作流定义）"}
-- 本仓库客户端：src/ds32_client.mjs
-- 快捷命令：/diagnose /failed /slow /tasks /log /mcp /rerun /rerun-all /force-success
+【架构】
+- 飞书 bot Agent 通过 SDK 挂载只读 ds-offline MCP → Ds32Client → DS REST
+- 写操作只走宿主确认卡 + 审计日志；与 IDE MCP 配置相互独立
+- 用户问 mcp/MCP 状态：先调 ds_status，再简短说明
 
 约束：
 - 不要 commit/push/删数据/开 PR
-- 不要直接调用 DS API；让用户走确认卡 / YES
 - 禁止建议改工作流定义
 - 不输出 token、密码、完整 JDBC 连接串
-- 飞书回复宜短；长内容给要点 + 下一步
+- 飞书回复宜短
 
 ${historyBlock ? `## 近期对话\n${historyBlock}\n` : ""}
 ## 用户本轮
@@ -1729,23 +1627,31 @@ function projectPathFor(config, projectName) {
   return projectPath;
 }
 
-/** Chat/Alert: cloud.repos by /use session, or local cwd fallback. */
+/**
+ * Feishu Chat Agent: local + read-only ds-offline MCP (DS is core).
+ * Writes never via Agent MCP — host confirm cards only.
+ * Pipeline SQL GitHub read stays on cloud_code_on_diagnose/alert.
+ */
 function agentRuntimeForChat(config, chatId) {
-  const sessionKey =
-    (chatId && sessionProjectByChat.get(chatId)) || config.defaultCloudRepoKey || "tiktok";
-  if (config.agentChatRuntime === "cloud") {
-    const cloudRepos = resolveCloudReposForSession({
-      cloudRepos: config.cloudRepos,
-      sessionProjectKey: sessionKey,
-      defaultKey: config.defaultCloudRepoKey,
-    });
-    return { runtime: "cloud", cloudRepos };
-  }
   const localCwd =
     config.projects.remote ||
     config.alertCwd ||
     path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  return { runtime: "local", localCwd };
+  const projectCode = getEffectiveProjectCode(chatId, null, config);
+  const mcpServers =
+    config.agentMcpDs === false
+      ? null
+      : buildDsOfflineMcpServers({
+          projectCode,
+          repoRoot: localCwd,
+          allowWrite: false,
+        });
+  return {
+    runtime: "local",
+    localCwd,
+    mcpServers,
+    projectCode,
+  };
 }
 
 /**
@@ -1834,7 +1740,7 @@ async function maybeAttachCloudCodeAnalysis({
 
 /**
  * @param {string} prompt
- * @param {{ model?: string, timeoutMs?: number, runtime?: "cloud"|"local", localCwd?: string, cloudRepos?: Array<{url:string,startingRef?:string}>, cancellable?: boolean }} opts
+ * @param {{ model?: string, timeoutMs?: number, runtime?: "cloud"|"local", localCwd?: string, cloudRepos?: Array<{url:string,startingRef?:string}>, mcpServers?: object|null, cancellable?: boolean }} opts
  */
 async function runCursor(prompt, opts = {}) {
   const {
@@ -1843,6 +1749,7 @@ async function runCursor(prompt, opts = {}) {
     runtime = "local",
     localCwd = null,
     cloudRepos = [],
+    mcpServers = null,
     cancellable = false,
   } = opts;
   if (!process.env.CURSOR_API_KEY) {
@@ -1855,9 +1762,11 @@ async function runCursor(prompt, opts = {}) {
     localCwd,
     cloudRepos,
     autoCreatePR: false,
+    mcpServers,
   });
+  const mcpLabel = mcpServers ? Object.keys(mcpServers).join(",") : "none";
   console.error(
-    `[cursor] runtime=${runtime}` +
+    `[cursor] runtime=${runtime} mcp=${mcpLabel}` +
       (runtime === "cloud"
         ? ` repos=${(cloudRepos || []).map((r) => r.url).join(",") || "(none)"}`
         : ` cwd=${localCwd}`),
@@ -2285,7 +2194,14 @@ async function handleMessage(config, message) {
   }
 
   let command = parseCommand(message.text);
-  // Slash commands only here. Natural language → Agent intent JSON → program execute.
+  // Slash → runCommand. Deterministic NL host routes (writes + a few reads) → runCommand.
+  // Other natural language → Chat Agent (read-only MCP).
+  if (!command) {
+    command = parseNlHostCommand(message.text);
+    if (command) {
+      console.error(`[nl-host] → ${command.join(" ")}`);
+    }
+  }
 
   let response;
   let ackId = null;
@@ -2321,7 +2237,8 @@ async function handleMessage(config, message) {
       } catch {
         // ignore
       }
-      response = await handleNlIntent(config, message);
+      // Open NL → Chat Agent (read-only MCP).
+      response = await handleChat(config, message);
     } else {
       return;
     }

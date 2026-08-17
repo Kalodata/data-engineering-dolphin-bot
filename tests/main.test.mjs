@@ -7,7 +7,9 @@ import {
   looksLikeMcpQuestion,
   parseCommand,
   parseContent,
+  parseInstanceLookupArgs,
   parseMessage,
+  parseNumericIdToken,
   sanitizeFeishuReply,
   stripBotMention,
 } from "../src/main.mjs";
@@ -90,4 +92,18 @@ test("sanitizeFeishuReply flattens markdown tables", () => {
   assert.match(out, /· 项 — 状态/);
   assert.match(out, /mcp\.json.*已配/);
   assert.match(out, /下一步：Reload/);
+});
+
+test("parseNumericIdToken accepts #id", () => {
+  assert.equal(parseNumericIdToken("123"), 123);
+  assert.equal(parseNumericIdToken("#123"), 123);
+  assert.equal(parseNumericIdToken("# 123"), null);
+  assert.equal(parseNumericIdToken("id"), null);
+});
+
+test("parseInstanceLookupArgs accepts #instanceId", () => {
+  const cfg = { dsProjectCode: "9892432515424" };
+  assert.equal(parseInstanceLookupArgs(["/rerun", "#123"], "c1", cfg).instanceId, 123);
+  assert.equal(parseInstanceLookupArgs(["/rerun-all", "#456"], "c1", cfg).instanceId, 456);
+  assert.equal(parseInstanceLookupArgs(["/rerun", "789"], "c1", cfg).instanceId, 789);
 });

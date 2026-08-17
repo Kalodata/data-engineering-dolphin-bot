@@ -22,10 +22,12 @@ test("ds-offline MCP lists readonly tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     assert.deepEqual(names, [
+      "ds_board",
       "ds_diagnose",
       "ds_get_log",
       "ds_list_failed",
       "ds_list_tasks",
+      "ds_progress",
       "ds_slow",
       "ds_status",
     ]);
