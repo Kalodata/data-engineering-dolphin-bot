@@ -6,12 +6,14 @@
 
 ## 文件职责
 
-- `src/main.mjs` — 入口+全部指令路由，所有 `/cmd` handler 都在这里
+- `src/main.mjs` — 入口+指令路由；NL → 宿主窄路由或 Chat Agent + 只读 MCP
 - `src/ds32_client.mjs` — DS API 客户端 + 数据格式化工具函数
+- `src/nl_host_route.mjs` — 高置信 NL（重跑/进度等）→ 斜杠，写操作进确认卡
+- `src/agent_runtime.mjs` — Cursor Agent local/cloud 选项 + ds-offline MCP 挂载
+- `mcp/ds-server.mjs` — DS 只读 MCP（飞书 Chat / IDE）
 - `src/feishu_cards.mjs` — 飞书交互卡片构建（Nova 风格）
 - `src/card_callback.mjs` — HTTP 服务器，接收飞书卡片按钮回调
 - `src/failure_watcher.mjs` — 后台轮询新失败实例并推送告警
-- `src/ds_adaptive.mjs` — 自然语言 → DS 操作的启发式 + LLM 规划
 - `src/deep_enrich.mjs` — SQL 仓库分析，丰富失败诊断上下文
 - `src/alert_evidence.mjs` — 告警取证（拉日志、分类失败）
 - `src/audit_log.mjs` — 写操作审计日志（重跑/强制成功）

@@ -31,14 +31,6 @@ import {
 } from "./ds32_client.mjs";
 import { enrichFailureContext } from "./deep_enrich.mjs";
 import { analyzeSqlAgainstFailure } from "./sql_repo_analysis.mjs";
-import {
-  buildPlannerPrompt,
-  executeDsPlan,
-  formatClarifyReply,
-  needsClarify,
-  parsePlannerJson,
-  planToSlashCommand,
-} from "./ds_adaptive.mjs";
 import { resolveCountryCode } from "./country_code.mjs";
 import { parseNlHostCommand } from "./nl_host_route.mjs";
 import {
@@ -46,7 +38,6 @@ import {
   buildDsOfflineMcpServers,
   loadCloudReposMap,
   normalizeCloudRepoKey,
-  resolveCloudReposForSession,
 } from "./agent_runtime.mjs";
 import {
   shouldCloudCodeAnalyze,
@@ -265,41 +256,17 @@ function loadConfig(configPath) {
         minute: Number(bp.minute ?? 0),
       };
     })(),
-    /**
-     * Legacy flag (default local). Feishu Chat Agent always runs local + MCP;
-     * Cloud is only for diagnose/alert pipeline SQL via cloud_code_on_*.
-     * Keeping this mainly affects default for cloud_code_on_* when those keys are omitted.
-     */
-    agentChatRuntime: String(raw.agent_chat_runtime || "local").toLowerCase() === "cloud"
-      ? "cloud"
-      : "local",
     cloudRepos: loadCloudReposMap(
       Object.prototype.hasOwnProperty.call(raw, "cloud_repos") ? raw.cloud_repos : {},
     ),
     defaultCloudRepoKey: normalizeCloudRepoKey(
       raw.default_cloud_repo_key || raw.default_ds_project || "tiktok",
     ),
-    /**
-     * Cloud code analysis for diagnose/alert (GitHub pipeline repos).
-     * Default ON only when agent_chat_runtime=cloud; otherwise OFF unless explicitly true.
-     * Prefer setting cloud_code_on_diagnose / cloud_code_on_alert explicitly.
-     */
-    cloudCodeOnDiagnose: (() => {
-      const runtimeCloud =
-        String(raw.agent_chat_runtime || "local").toLowerCase() === "cloud";
-      if (raw.cloud_code_on_diagnose === true) return true;
-      if (raw.cloud_code_on_diagnose === false) return false;
-      return runtimeCloud;
-    })(),
-    cloudCodeOnAlert: (() => {
-      const runtimeCloud =
-        String(raw.agent_chat_runtime || "local").toLowerCase() === "cloud";
-      if (raw.cloud_code_on_alert === true) return true;
-      if (raw.cloud_code_on_alert === false) return false;
-      return runtimeCloud;
-    })(),
+    /** Cloud code analysis for diagnose/alert. Default off unless explicitly true. */
+    cloudCodeOnDiagnose: raw.cloud_code_on_diagnose === true,
+    cloudCodeOnAlert: raw.cloud_code_on_alert === true,
     cloudCodeTimeoutMs: Number(raw.cloud_code_timeout_ms ?? 120_000),
-    /** Attach ds-offline MCP to Feishu Chat Agent (local stdio). Default on. */
+    /** Attach read-only ds-offline MCP to Feishu Chat Agent. Default on. */
     agentMcpDs: raw.agent_mcp_ds !== false,
   };
   // Merge allowlist.json (committed to git) into allowed_users / notify_user_ids
@@ -1547,90 +1514,6 @@ async function runAlertLocal(config, alertText, evidenceBlock = "", message = nu
   });
 }
 
-async function handleNlIntent(config, message) {
-  const history = chatHistories.get(message.chatId) || [];
-  const historyBlock = history
-    .slice(-CHAT_HISTORY_MAX)
-    .map((m) => `${m.role}: ${m.text}`)
-    .join("\n");
-  const env = loadDsEnv();
-  const projectCode =
-    getEffectiveProjectCode(message.chatId, null, config) ||
-    config.dsProjectCode ||
-    env.projectCode ||
-    "";
-  const plannerCwd =
-    config.projects.remote ||
-    config.alertCwd ||
-    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-
-  let plan = null;
-  try {
-    // Planner: always local + bot cwd — do not clone pipeline repos for intent JSON.
-    const plannerRaw = await runCursor(
-      buildPlannerPrompt(message.text, historyBlock, projectCode),
-      {
-        model: config.model,
-        timeoutMs: 45_000,
-        runtime: "local",
-        localCwd: plannerCwd,
-      },
-    );
-    plan = parsePlannerJson(plannerRaw);
-  } catch (error) {
-    console.error(`[nl-intent] planner failed: ${error.message}`);
-    const text =
-      formatClarifyReply(null) +
-      `\n（意图解析失败：${error.message}；可改用 /failed /progress /diagnose）`;
-    pushChat(message.chatId, "user", message.text);
-    pushChat(message.chatId, "assistant", text);
-    return text;
-  }
-
-  if (!plan?.tool) {
-    const text = formatClarifyReply(plan);
-    pushChat(message.chatId, "user", message.text);
-    pushChat(message.chatId, "assistant", text);
-    return text;
-  }
-
-  // Keep country if model omitted it but text has a clear alias.
-  if (!plan.country && resolveCountryCode(message.text)) {
-    plan.country = resolveCountryCode(message.text);
-  }
-  if (!plan.projectCode) plan.projectCode = projectCode;
-
-  if (needsClarify(plan)) {
-    const text = formatClarifyReply(plan);
-    console.error(`[nl-intent] clarify ${JSON.stringify(plan)}`);
-    pushChat(message.chatId, "user", message.text);
-    pushChat(message.chatId, "assistant", text);
-    return text;
-  }
-
-  if (plan.tool === "chat") {
-    return handleChat(config, message);
-  }
-
-  const command = planToSlashCommand(plan);
-  if (command) {
-    console.error(`[nl-intent] → ${command.join(" ")} from ${JSON.stringify(plan)}`);
-    const response = await runCommand(config, command, message);
-    pushChat(message.chatId, "user", message.text);
-    pushChat(message.chatId, "assistant", replyToHistoryText(response));
-    return response;
-  }
-
-  console.error(`[nl-intent] executeDsPlan ${JSON.stringify(plan)}`);
-  const executed = await executeDsPlan(config, plan);
-  if (executed.kind === "chat" || !executed.text) {
-    return handleChat(config, message);
-  }
-  pushChat(message.chatId, "user", message.text);
-  pushChat(message.chatId, "assistant", executed.text);
-  return executed.text;
-}
-
 async function handleChat(config, message) {
   const history = chatHistories.get(message.chatId) || [];
   const historyBlock = history
@@ -2354,7 +2237,7 @@ async function handleMessage(config, message) {
       } catch {
         // ignore
       }
-      // Natural language → Chat Agent directly (no Planner intent JSON).
+      // Open NL → Chat Agent (read-only MCP).
       response = await handleChat(config, message);
     } else {
       return;

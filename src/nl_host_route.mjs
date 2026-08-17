@@ -1,7 +1,7 @@
 /**
  * Deterministic NL → slash command for the Feishu host.
  * Write intents MUST hit this path (confirm card + audit), never Chat MCP.
- * A few high-confidence read shortcuts keep card UX without Planner.
+ * A few high-confidence read shortcuts keep card UX without a Planner hop.
  */
 import { resolveCountryCode } from "./country_code.mjs";
 
