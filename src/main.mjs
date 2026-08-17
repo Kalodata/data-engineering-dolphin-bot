@@ -100,11 +100,11 @@ const DEFAULT_ALERT_PROMPT_PATH = path.join(
   os.homedir(),
   ".cursor/agents/alert/PROMPT.md",
 );
-const HELP_TEXT = `可以像 Cursor 一样直接打字（复杂 DS 排查会自动规划并查数）。
+const HELP_TEXT = `可以直接打字，自然语言交给 Agent 回答（斜杠命令仍可用）。
 
 自然语言示例：
 「最近失败」「诊断 1939974」「重跑」「强制成功」
-「id分区进度」「各国天级进度」「只看数仓层、印尼、stage>15m 的慢 job」
+「id分区进度」「各国天级进度」「对比某任务两天耗时」
 
 写操作弹确认卡（点按钮或回 YES）；仍禁止改工作流定义。
 告警卡可点：诊断 / 重跑 / 看日志。
@@ -1631,8 +1631,9 @@ async function handleChat(config, message) {
       ? `当前可阅读的 GitHub 仓：${runtimeOpts.cloudRepos[0].url}@${runtimeOpts.cloudRepos[0].startingRef || "main"}（只读；禁止开 PR/改代码提交）`
       : `当前本地工作目录可读代码（只读）`;
 
-  const prompt = `你是通过飞书私聊接入的 Cursor Agent（体验尽量接近 IDE 里对话）。
-用中文简洁回答。可以查代码、解释报错、给修复步骤。
+  const prompt = `你是通过飞书接入的 Cursor Agent（体验尽量接近 IDE 里对话）。
+用户自然语言由你直接处理，不要先推「请用 /xxx」敷衍；能答就答，需要调度数据时主动查或说明怎么查。
+用中文简洁回答。可以查代码、解释报错、给修复步骤、对比任务耗时思路。
 
 【代码上下文】
 - ${repoHint}
@@ -1645,7 +1646,7 @@ async function handleChat(config, message) {
 【架构勿混淆】
 - 飞书 bot 查 DolphinScheduler：内嵌 Ds32Client，不经过 Cursor MCP
 - Cursor IDE 的 ds-offline MCP 只服务 IDE Agent；飞书会话里 MCP 工具列表为空是正常的，不要据此说「未连上 / 配置失败 / 没有 DS 查询工具」
-- 用户问任务/工作流/调度状态：应引导发「检查任务状态」「最近失败」「在跑什么」或 /failed /status，不要假装缺工具
+- 用户问任务/工作流/调度状态、耗时对比：尽量直接给结论；若当前环境读不到 DS 实例数据，再引导「/progress id」「/board」「/slow wh id」或「/tasks <实例id>」
 - 用户问 mcp/MCP 状态：直接说明上述分工，并建议发 /mcp 或 /status，不要猜 Reload
 
 用户若在追问「怎么修复」且上文已有诊断卡：不要再复读同一张卡，而是基于上文给出更具体的修复顺序、要核对的表/分区/参数。
@@ -1661,7 +1662,7 @@ DolphinScheduler（offline，经典 REST；dsctl /v2 暂不可用）：
 
 约束：
 - 不要 commit/push/删数据/开 PR
-- 不要直接调用 DS API；让用户走确认卡 / YES
+- 不要直接调用会改生产的 DS 写接口；让用户走确认卡 / YES
 - 禁止建议改工作流定义
 - 不输出 token、密码、完整 JDBC 连接串
 - 飞书回复宜短；长内容给要点 + 下一步
@@ -2285,7 +2286,7 @@ async function handleMessage(config, message) {
   }
 
   let command = parseCommand(message.text);
-  // Slash commands only here. Natural language → Agent intent JSON → program execute.
+  // Slash → runCommand. Natural language → Chat Agent directly.
 
   let response;
   let ackId = null;
@@ -2321,7 +2322,8 @@ async function handleMessage(config, message) {
       } catch {
         // ignore
       }
-      response = await handleNlIntent(config, message);
+      // Natural language → Chat Agent directly (no Planner intent JSON).
+      response = await handleChat(config, message);
     } else {
       return;
     }
