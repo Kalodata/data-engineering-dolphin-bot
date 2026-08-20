@@ -1645,6 +1645,19 @@ export function todayYmdShanghai(now = new Date()) {
   return fmt.format(now).replace(/-/g, "");
 }
 
+/** YYYY-MM-DD for yesterday in Asia/Shanghai — matches globalParams data_date format. */
+function yesterdayYmdDashShanghai(now = new Date()) {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const todayStr = fmt.format(now); // YYYY-MM-DD
+  const yesterday = new Date(Date.parse(`${todayStr}T00:00:00Z`) - 86400000);
+  return fmt.format(yesterday);
+}
+
 /**
  * Multi-country daily board for TikTok天级任务-37 (or searchVal).
  * Answers「哪些国家在跑 / 各国到哪了」— not just RUNNING list.
@@ -1749,7 +1762,9 @@ export async function listCountryDailyBoard(
   ];
 
   const now = new Date();
+  const targetDate = yesterdayYmdDashShanghai(now);
   const groups = [...latestByDateCountry.entries()]
+    .filter(([dataDate]) => dataDate === targetDate)
     .sort(([a], [b]) => b.localeCompare(a)) // newest dataDate first
     .map(([dataDate, byCountry]) => {
       const rows = [...byCountry.values()].sort((a, b) =>
