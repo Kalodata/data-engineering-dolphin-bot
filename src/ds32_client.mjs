@@ -1658,6 +1658,29 @@ function yesterdayYmdDashShanghai(now = new Date()) {
   return fmt.format(yesterday);
 }
 
+/** YYYY-MM-DD for 2 days ago in Asia/Shanghai — T-2 data date for tiered board. */
+function twoDaysAgoYmdDashShanghai(now = new Date()) {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const todayStr = fmt.format(now);
+  const t2 = new Date(Date.parse(`${todayStr}T00:00:00Z`) - 2 * 86400000);
+  return fmt.format(t2);
+}
+
+/** Beijing hour >= 15 → tiered board overdue window. */
+function isTieredOverdueTime(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    hour: "numeric",
+    hour12: false,
+  }).formatToParts(now);
+  return Number(parts.find((p) => p.type === "hour")?.value ?? 0) >= 15;
+}
+
 /**
  * Multi-country daily board for TikTok天级任务-37 (or searchVal).
  * Answers「哪些国家在跑 / 各国到哪了」— not just RUNNING list.
@@ -1857,6 +1880,139 @@ export function formatCountryDailyBoard({ dayToken, groups = [] } = {}) {
   }
   if (!groups.length) lines.push("暂无数据");
   lines.push("单国深挖：说「id分区进度」或 /tasks <实例id>");
+  return lines.join("\n");
+}
+
+/**
+ * Per-country daily board for 分级任务 project (TikTok - 分级任务-15-*).
+ * Target date is T-2 (Shanghai). Overdue = Beijing time >= 15:00 and country not SUCCESS.
+ */
+export async function listTieredBoard(
+  ds,
+  {
+    searchVal = "TikTok - 分级任务-15",
+    knownCountries = null,
+    maxPages = 3,
+    pageSize = 50,
+    now = new Date(),
+  } = {},
+) {
+  const targetDate = twoDaysAgoYmdDashShanghai(now);
+
+  const pages = [];
+  for (let pageNo = 1; pageNo <= maxPages; pageNo++) {
+    const page = await ds.listProcessInstances({ pageNo, pageSize, searchVal });
+    const rows = page?.totalList || [];
+    pages.push(...rows);
+    if (!rows.length || rows.length < pageSize) break;
+  }
+
+  const latestByCountry = new Map();
+  for (const row of pages) {
+    const full = await ds.getProcessInstance(row.id);
+    const inst = full || row;
+    const country = getGlobalParam(inst, "country_code").toLowerCase() || "?";
+    const rawDate = getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || "";
+    const dataDate = /^\d{8}$/.test(rawDate)
+      ? `${rawDate.slice(0, 4)}-${rawDate.slice(4, 6)}-${rawDate.slice(6, 8)}`
+      : rawDate;
+    if (dataDate !== targetDate) continue;
+
+    const prev = latestByCountry.get(country);
+    const start = String(inst.startTime || row.startTime || "");
+    if (prev && String(prev.startTime || "") >= start) continue;
+
+    const state = String(inst.state || row.state || "");
+    let currentPath = null;
+    if (/RUNNING/i.test(state)) {
+      const info = await enrichInstanceProgress(ds, row.id);
+      currentPath = info?.currentPath || null;
+    } else if (/SUCCESS/i.test(state)) {
+      currentPath = "已跑完";
+    } else if (/FAIL|KILL|STOP/i.test(state)) {
+      currentPath = state;
+    }
+
+    latestByCountry.set(country, {
+      id: row.id,
+      name: inst.name || row.name,
+      state,
+      startTime: inst.startTime || row.startTime,
+      endTime: inst.endTime || row.endTime,
+      country,
+      dataDate,
+      currentPath,
+      stageStart: null,
+      runningNodes: [],
+      doneStages: [],
+    });
+  }
+
+  const known = knownCountries || [
+    "id", "vn", "th", "my", "ph", "sg", "mx", "us", "gb", "de", "jp", "br", "fr", "es", "it",
+  ];
+
+  const rows = [...latestByCountry.values()].sort((a, b) =>
+    String(a.country).localeCompare(String(b.country)),
+  );
+  const missing = known.filter((c) => !latestByCountry.has(c));
+
+  // Overdue: after 15:00 Beijing time, any non-SUCCESS country (including missing ones)
+  const overdueTime = isTieredOverdueTime(now);
+  const overdue = overdueTime
+    ? [
+        ...rows
+          .filter((r) => !/SUCCESS/i.test(r.state))
+          .map((r) => ({
+            country: r.country,
+            message: `${r.country.toUpperCase()}　北京时间 15:00 未完成（状态：${r.state || "?"}）`,
+          })),
+        ...missing.map((c) => ({
+          country: c,
+          message: `${c.toUpperCase()}　北京时间 15:00 未完成（未见实例）`,
+        })),
+      ]
+    : [];
+
+  return {
+    targetDate,
+    dayToken: targetDate.replace(/-/g, ""),
+    groups: [{ dataDate: targetDate, rows, missing, overdue }],
+  };
+}
+
+export function formatTieredBoard({ targetDate, groups = [] } = {}) {
+  const lines = [`【分级看板】数据日 T-2 ${targetDate || "?"}`, ""];
+  for (const { dataDate, rows, missing, overdue } of groups) {
+    const running = rows.filter((r) => /RUNNING/i.test(String(r.state || "")));
+    const success = rows.filter((r) => /SUCCESS/i.test(String(r.state || "")));
+    const other = rows.filter((r) => !/RUNNING|SUCCESS/i.test(String(r.state || "")));
+
+    lines.push(`=== 数据日 ${dataDate} ===`);
+    if (running.length) {
+      lines.push(`在跑（${running.length}）：`);
+      for (const r of running) {
+        lines.push(`· ${r.country}  #${r.id}  开始 ${r.startTime || "-"}`);
+        if (r.currentPath) lines.push(`  当前：${r.currentPath}`);
+      }
+    }
+    if (success.length) {
+      lines.push(`已完成（${success.length}）：`);
+      lines.push(success.map((r) => `${r.country}(${String(r.endTime || "").slice(11, 16)})`).join(" · "));
+    }
+    if (other.length) {
+      lines.push(`异常（${other.length}）：`);
+      for (const r of other) lines.push(`· ${r.country}  ${r.state}`);
+    }
+    if (missing.length) lines.push(`未见实例：${missing.join(" · ")}`);
+    if (overdue.length) {
+      lines.push("");
+      lines.push(`⚠️ 北京时间 15:00 未完成（${overdue.length}）：`);
+      for (const o of overdue) lines.push(`· ${o.message || o.country}`);
+    }
+    lines.push("");
+  }
+  if (!groups.length) lines.push("暂无数据");
   return lines.join("\n");
 }
 

@@ -599,7 +599,7 @@ export function failedListCard({
 }
 
 /** Daily board card: summary counts + per-category country lists + overdue alert. */
-export function boardCard({ dayToken, groups = [] } = {}) {
+export function boardCard({ dayToken, groups = [], cardTitle = null, overdueLabel = "超时未开始" } = {}) {
   const hasOverdue = groups.some((g) => g.overdue?.length > 0);
   const els = [];
 
@@ -621,29 +621,29 @@ export function boardCard({ dayToken, groups = [] } = {}) {
     els.push(md(`**数据日 ${dataDate}**　${summaryParts.join(" · ")}`));
 
     if (success.length) {
-      els.push(md(`✅ **已完成（${success.length}）**\n${success.map((r) => r.country.toUpperCase()).join(" · ")}`));
+      els.push(md(`✅ **已完成（${success.length}）**\n${success.map((r) => (r.country || r.name || "?").toUpperCase()).join(" · ")}`));
     }
     if (running.length) {
-      els.push(md(`🔄 **进行中（${running.length}）**\n${running.map((r) => r.country.toUpperCase()).join(" · ")}`));
+      els.push(md(`🔄 **进行中（${running.length}）**\n${running.map((r) => (r.country || r.name || "?").toUpperCase()).join(" · ")}`));
     }
     if (failed.length) {
-      els.push(md(`❌ **异常（${failed.length}）**\n${failed.map((r) => `${r.country.toUpperCase()}（${r.state}）`).join(" · ")}`));
+      els.push(md(`❌ **异常（${failed.length}）**\n${failed.map((r) => `${(r.country || r.name || "?").toUpperCase()}（${r.state}）`).join(" · ")}`));
     }
     if (missing.length) {
       els.push(md(`⏳ **待开始（${missing.length}）**\n${missing.map((c) => c.toUpperCase()).join(" · ")}`));
     }
     if (overdue.length) {
       const lines = overdue
-        .map((o) => `${o.country.toUpperCase()}　本地现在 ${o.localTime}，预计 02:00 已过，仍未见开跑`)
+        .map((o) => o.message || `${(o.country || "?").toUpperCase()}　本地现在 ${o.localTime}，预计 02:00 已过，仍未见开跑`)
         .join("\n");
-      els.push(md(`⚠️ **超时未开始（${overdue.length}）**\n${lines}`));
+      els.push(md(`⚠️ **${overdueLabel}（${overdue.length}）**\n${lines}`));
     }
   }
 
   if (!els.length) els.push(md("暂无数据"));
 
   return card({
-    title: `📊 天级看板 · ${dayToken || "?"}`,
+    title: cardTitle ?? `📊 天级看板 · ${dayToken || "?"}`,
     template: hasOverdue ? "orange" : "blue",
     elements: els,
   });

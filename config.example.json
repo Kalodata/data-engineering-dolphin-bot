@@ -72,5 +72,11 @@
     "enabled": false,
     "chat_id": "oc_xxx",
     "hours": [9, 11, 15, 19]
+  },
+  "tiered_board_push": {
+    "enabled": false,
+    "chat_id": "oc_xxx",
+    "hour": 15,
+    "minute": 0
   }
 }

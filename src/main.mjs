@@ -19,10 +19,12 @@ import {
   formatSimpleBoard,
   formatSlowStageJobs,
   formatTaskList,
+  formatTieredBoard,
   getGlobalParam,
   listCountryDailyBoard,
   listSimpleBoard,
   listRunningProgress,
+  listTieredBoard,
   loadDsEnv,
   resolveInstanceByCountryDate,
   WH_STAGE_NAME_RE,
@@ -84,7 +86,7 @@ import {
   createConfirmStore,
 } from "./card_callback.mjs";
 import { createAuditLog } from "./audit_log.mjs";
-import { startBoardPush } from "./board_push.mjs";
+import { startBoardPush, startTieredBoardPush } from "./board_push.mjs";
 
 loadDotEnv(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.env"));
 
@@ -254,6 +256,15 @@ function loadConfig(configPath) {
         chatId: String(bp.chat_id || ""),
         hours: Array.isArray(bp.hours) ? bp.hours.map(Number) : [9, 11, 15, 19],
         minute: Number(bp.minute ?? 0),
+      };
+    })(),
+    tieredBoardPush: (() => {
+      const tbp = raw.tiered_board_push || {};
+      return {
+        enabled: tbp.enabled === true,
+        chatId: String(tbp.chat_id || ""),
+        hour: Number(tbp.hour ?? 15),
+        minute: Number(tbp.minute ?? 0),
       };
     })(),
     cloudRepos: loadCloudReposMap(
@@ -666,6 +677,13 @@ async function runCommand(config, command, message) {
     if (projectCode === KNOWN_PROJECTS.tiktok.code) {
       const board = await listCountryDailyBoard(ds, {});
       return { card: boardCard(board), text: formatCountryDailyBoard(board) };
+    }
+    if (projectCode === KNOWN_PROJECTS.tiered.code) {
+      const board = await listTieredBoard(ds, {});
+      return {
+        card: boardCard({ ...board, cardTitle: `📊 分级看板 · T-2 ${board.targetDate || "?"}`, overdueLabel: "超时未完成" }),
+        text: formatTieredBoard(board),
+      };
     }
     const board = await listSimpleBoard(ds, {});
     return { card: boardCard(board), text: formatSimpleBoard(board) };
@@ -2658,6 +2676,13 @@ async function main() {
   const boardPusher = startBoardPush({
     config,
     getDs: () => getDsClient(config, KNOWN_PROJECTS.tiktok.code),
+    sendText,
+    log: (line) => console.error(line),
+  });
+
+  const tieredBoardPusher = startTieredBoardPush({
+    config,
+    getDs: () => getDsClient(config, KNOWN_PROJECTS.tiered.code),
     sendText,
     log: (line) => console.error(line),
   });
