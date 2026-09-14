@@ -1592,6 +1592,15 @@ export const COUNTRY_TZ = {
   fr: "Europe/Paris",
   es: "Europe/Madrid",
   it: "Europe/Rome",
+  at: "Europe/Vienna",
+  be: "Europe/Brussels",
+  cz: "Europe/Prague",
+  gr: "Europe/Athens",
+  hu: "Europe/Budapest",
+  ie: "Europe/Dublin",
+  nl: "Europe/Amsterdam",
+  pl: "Europe/Warsaw",
+  pt: "Europe/Lisbon",
 };
 
 /**
@@ -1669,6 +1678,20 @@ function twoDaysAgoYmdDashShanghai(now = new Date()) {
   const todayStr = fmt.format(now);
   const t2 = new Date(Date.parse(`${todayStr}T00:00:00Z`) - 2 * 86400000);
   return fmt.format(t2);
+}
+
+/** EU country codes whose overdue threshold is Beijing 11:00 (not local 02:00). */
+const EU_COUNTRIES = new Set([
+  "at", "be", "cz", "de", "es", "fr", "gb", "gr", "hu", "ie", "it", "nl", "pl", "pt",
+]);
+
+/** Returns UTC Date for Beijing (Asia/Shanghai) 11:00 on (dataDate + 1 day). */
+function getEuOverdueUTC(dataDate) {
+  if (!dataDate) return null;
+  const nextDay = new Date(Date.parse(`${dataDate}T00:00:00.000Z`) + 86400000);
+  const nextDayStr = new Intl.DateTimeFormat("sv-SE", { timeZone: "UTC" }).format(nextDay);
+  // Beijing 11:00 = UTC 03:00
+  return new Date(Date.parse(`${nextDayStr}T03:00:00.000Z`));
 }
 
 /** Beijing hour >= 15 → tiered board overdue window. */
@@ -1767,21 +1790,9 @@ export async function listCountryDailyBoard(
   }
 
   const known = knownCountries || [
-    "id",
-    "vn",
-    "th",
-    "my",
-    "ph",
-    "sg",
-    "mx",
-    "us",
-    "gb",
-    "de",
-    "jp",
-    "br",
-    "fr",
-    "es",
-    "it",
+    "at", "be", "br", "cz", "de", "es", "fr", "gb", "gr", "hu",
+    "id", "ie", "it", "jp", "mx", "my", "nl", "ph", "pl", "pt",
+    "sg", "th", "us", "vn",
   ];
 
   const now = new Date();
@@ -1796,7 +1807,9 @@ export async function listCountryDailyBoard(
       const missing = known.filter((c) => !byCountry.has(c));
       const overdue = missing
         .filter((c) => {
-          const scheduled = getScheduledStartUTC(c, dataDate);
+          const scheduled = EU_COUNTRIES.has(c)
+            ? getEuOverdueUTC(dataDate)
+            : getScheduledStartUTC(c, dataDate);
           return scheduled != null && now.getTime() > scheduled.getTime();
         })
         .map((c) => ({ country: c, localTime: getLocalHHMM(c, now) }));
@@ -1890,7 +1903,7 @@ export function formatCountryDailyBoard({ dayToken, groups = [] } = {}) {
 export async function listTieredBoard(
   ds,
   {
-    searchVal = "TikTok - 分级任务-15",
+    searchVal = "TikTok - 分级任务",
     knownCountries = null,
     maxPages = 3,
     pageSize = 50,
