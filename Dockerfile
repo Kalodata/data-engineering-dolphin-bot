@@ -1,5 +1,5 @@
 # Dolphin Feishu Bot — single-replica ECS/Fargate image
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl tini \
