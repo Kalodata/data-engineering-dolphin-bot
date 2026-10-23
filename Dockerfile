@@ -3,7 +3,7 @@ FROM node:22-bookworm-slim
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-    ca-certificates curl tini openjdk-17-jre-headless \
+    ca-certificates curl tini openjdk-17-jdk-headless \
     python3 make g++ \
   && rm -rf /var/lib/apt/lists/*
 
