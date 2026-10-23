@@ -31,6 +31,7 @@ import {
   formatTaskIdentity,
   formatFailedTasksPickList,
 } from "./ds32_client.mjs";
+import { applyPlaybookToClassification } from "./alert_playbook.mjs";
 import { enrichFailureContext } from "./deep_enrich.mjs";
 import { analyzeSqlAgainstFailure } from "./sql_repo_analysis.mjs";
 import { resolveCountryCode } from "./country_code.mjs";
@@ -190,8 +191,21 @@ function loadConfig(configPath) {
         /** Alerts: default off (SHOW PARTITIONS can be slow). Diagnose: on. */
         onAlert: h.on_alert === true,
         onDiagnose: h.on_diagnose !== false,
-        jdbcUrl: h.jdbc_url || process.env.HIVE_JDBC_URL || "jdbc:hive2://localhost:10001",
-        jdbcJar: h.jdbc_jar || process.env.HIVE_JDBC_JAR || "",
+        jdbcUrl:
+          h.jdbc_url ||
+          process.env.HIVE_JDBC_URL ||
+          "jdbc:hive2://127.0.0.1:10001",
+        jdbcJar: (() => {
+          const fromCfg = h.jdbc_jar || process.env.HIVE_JDBC_JAR || "";
+          if (fromCfg) return fromCfg;
+          const ecsJar = "/app/lib/hive-jdbc-standalone.jar";
+          try {
+            if (fs.existsSync(ecsJar)) return ecsJar;
+          } catch {
+            /* ignore */
+          }
+          return "";
+        })(),
         timeoutMs: Number(h.timeout_ms ?? 90_000),
       };
     })(),
@@ -1186,18 +1200,21 @@ async function handleDiagnose(config, processInstanceId, message, projectCodeOve
     category: classification.category,
     log: logText,
     sqlFile: classification.sqlFile,
-    signal: { cause: classification.cause, evidence: classification.evidence },
+    signal: {
+      cause: classification.cause,
+      evidence: classification.evidence,
+      designedSkip: classification.designedSkip,
+      weakExit: classification.category === "证据不足",
+      quality: classification.quality,
+      livy: classification.livy,
+    },
     task,
     nearbyFailureCount: failed.length,
     workflowState: inst?.state,
     processInstanceId: instId,
     dsReadonly: config.dsReadonly,
   });
-  if (playbook.mechanism) classification.mechanism = playbook.mechanism;
-  if (playbook.verdict) classification.verdict = playbook.verdict;
-  if (playbook.cause) classification.cause = playbook.cause;
-  if (playbook.actions?.length) classification.fixes = playbook.actions;
-  classification.where = playbook.mechanism || classification.where;
+  applyPlaybookToClassification(classification, playbook);
 
   let repoAnalysis = null;
   if (config.sqlRepoPath && classification.sqlFile) {
@@ -2666,6 +2683,15 @@ async function main() {
         mode: args.mode || "alert",
         projectCode: args.projectCode || "",
       }),
+    // Weak-evidence one-shot: local Agent + read-only ds-offline MCP auto-probes.
+    runProbeAgent: async (prompt, { timeoutMs } = {}) => {
+      const runtime = agentRuntimeForChat(config, null);
+      return runCursor(prompt, {
+        model: config.model,
+        timeoutMs: timeoutMs || 120_000,
+        ...runtime,
+      });
+    },
     onAlertSent: ({ chatId, userId, alert }) => {
       if (alert?.taskId != null && config.alertWatch?.statePath) {
         markTaskNotified(config.alertWatch.statePath, alert.taskId);
@@ -2715,7 +2741,19 @@ async function main() {
               mode: args.mode || "alert",
               projectCode: args.projectCode || "",
             }),
+          runProbeAgent: async (prompt, { timeoutMs } = {}) => {
+            const runtime = agentRuntimeForChat(config, null);
+            return runCursor(prompt, {
+              model: config.model,
+              timeoutMs: timeoutMs || 120_000,
+              ...runtime,
+            });
+          },
         });
+        if (alert?.silenced || alert?.category === "分支跳过") {
+          markTaskNotified(config.alertWatch.statePath, alert.taskId);
+          return { skipped: true, reason: "designed_skip" };
+        }
         if (!alert?.text && !alert?.card) return { skipped: true, reason: "no_card" };
         markTaskNotified(config.alertWatch.statePath, alert.taskId);
         const sendResult = await failureWatcher?.notifyAlert?.(alert);

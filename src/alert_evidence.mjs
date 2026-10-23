@@ -166,7 +166,9 @@ export function shouldUseAlertTemplate(evidence) {
   if (!evidence?.useful) return false;
   if (!evidence.classification?.category) return false;
   if (!evidence.taskId && !evidence.processInstanceId) return false;
-  // Log purged with no category signal → still allow if classify gave category
+  // Weak / unknown → Agent auto-probe path, not bare template
+  const cat = String(evidence.classification.category || "");
+  if (cat === "证据不足" || cat === "未知" || cat === "执行失败") return false;
   return true;
 }
 
@@ -178,12 +180,14 @@ export function buildEvidenceAwareAlertPrompt(system, alertText, evidenceBlock) 
         evidenceBlock,
         "```",
         "",
-        "规则：先基于取证写结论；引用 1～3 行原始证据；取证不足时写明「证据不足」并列出还要拉什么。",
+        "规则：先基于取证写结论；引用 1～3 行原始证据。",
+        "若取证偏弱：必须用只读 MCP（ds_get_log 看末尾、ds_list_tasks、ds_diagnose）自己补证，再给 one-shot 处置。",
+        "禁止输出「请你自己去看日志/去 UI 排查」；禁止空话「处理完后再重跑」。",
         "",
       ].join("\n")
     : [
         "## 取证状态",
-        "原文未解析到 DS 实例/任务 id，无法自动拉日志。结论须标注「仅基于粘贴原文」；需要取证时请用户发 /diagnose <实例id>。",
+        "原文未解析到 DS 实例/任务 id。若原文含 id，用 MCP 拉取；否则基于原文给出可执行下一步（要用户回哪条命令），禁止甩锅。",
         "",
       ].join("\n");
 
@@ -191,6 +195,8 @@ export function buildEvidenceAwareAlertPrompt(system, alertText, evidenceBlock) 
     `${system}\n\n---\n\n` +
     evidenceSection +
     `## 本条告警原文\n\n\`\`\`text\n${alertText}\n\`\`\`\n\n` +
-    "按系统指令输出极简处置卡 5 段。禁止自动重跑或改配置。结论必须能被上方取证或原文支撑。"
+    "按系统指令输出处置卡：【原因】【判定】【关键】【现在做】【验收】【升级若】。" +
+    "禁止【不要】；禁止「处理完后再跑」空话。禁止自动重跑或改配置。" +
+    "【现在做】用 [外部]/[Bot] 前缀；可重跑写「点一键重跑」。"
   );
 }

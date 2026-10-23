@@ -116,6 +116,8 @@ export function alertCard({
   verdict,
   category,
   mechanism,
+  severity = "P2",
+  allowRerun = true,
   uiUrl,
   processInstanceId,
   taskId,
@@ -129,12 +131,18 @@ export function alertCard({
   dsReadonly = true,
   projectCode = "",
 } = {}) {
+  const sev = String(severity || "P2").toUpperCase();
+  const template = sev === "P1" ? "red" : sev === "P3" ? "green" : "orange";
+
   const lines = [];
-  if (cause) lines.push(`**原因：** ${clip(cause, 160)}`);
-  if (verdict) lines.push(String(verdict));
+  if (cause) lines.push(`**原因：** ${clip(cause, 180)}`);
+  if (verdict) {
+    const v = String(verdict).replace(/^判定[：:]\s*/, "").trim();
+    lines.push(`**判定：** ${clip(v, 120)}`);
+  }
   if (category) lines.push(`**类别：** ${category}`);
   if (mechanism && !sameText(mechanism, cause)) {
-    lines.push(`**成因：** ${clip(mechanism, 160)}`);
+    lines.push(`**成因：** ${clip(mechanism, 220)}`);
   }
   if (uiUrl) lines.push(uiLinkMd(uiUrl));
   else if (processInstanceId) lines.push(uiLinkMd("", processInstanceId));
@@ -145,7 +153,7 @@ export function alertCard({
   }
   if (scriptLabel) lines.push(`**脚本：** ${scriptLabel}`);
   if (when) lines.push(`**时间：** ${when}`);
-  if (evidence) lines.push(`**报错：** ${clip(evidence, 120)}`);
+  if (evidence) lines.push(`**报错：** ${clip(evidence, 140)}`);
 
   const body = [md(lines.join("\n"))];
   if (repoLines?.length) {
@@ -153,30 +161,51 @@ export function alertCard({
       .map((l) => String(l || "").trim())
       .filter(Boolean)
       .filter((l) => !/^Cloud[：:]/i.test(l) && !/^定责[：:]/i.test(l))
-      .filter((l) => /验分区|相关 PR|^PR[：:]/i.test(l))
-      .slice(0, 2);
+      .filter((l) => /验分区|相关 PR|^PR[：:]|已查/i.test(l))
+      .slice(0, 3);
     if (facing.length) {
       body.push(
         md(
           "**验数：**\n" +
-            facing.map((l) => `· ${clip(l, 120)}`).join("\n"),
+            facing.map((l) => `· ${clip(l, 140)}`).join("\n"),
         ),
       );
     }
   }
-  if (fixes?.length) {
+  const doLines = (fixes || [])
+    .map((f) => String(f || "").trim())
+    .filter((f) => f && !/^处理完后/.test(f))
+    .slice(0, 4);
+  if (doLines.length) {
     body.push(
       md(
         "**现在做：**\n" +
-          fixes
-            .slice(0, 3)
-            .map((f, i) => `${i + 1}. ${clip(f, 120)}`)
-            .join("\n"),
+          doLines.map((f, i) => `${i + 1}. ${clip(f, 160)}`).join("\n"),
       ),
     );
   }
 
+  const forbidRerun =
+    allowRerun === false ||
+    doLines.some((f) => /不要重跑|禁止重跑|勿重跑/i.test(f));
   const actions = [];
+  // Bot one-click first
+  if (processInstanceId && !dsReadonly && !forbidRerun) {
+    actions.push(
+      button({
+        label: "一键重跑",
+        action: "rerun_request",
+        type: "danger",
+        value: withProjectCode(
+          {
+            processInstanceId: String(processInstanceId),
+            executeType: "START_FAILURE_TASK_PROCESS",
+          },
+          projectCode,
+        ),
+      }),
+    );
+  }
   if (processInstanceId) {
     actions.push(
       button({
@@ -192,22 +221,6 @@ export function alertCard({
         ),
       }),
     );
-    if (!dsReadonly) {
-      actions.push(
-        button({
-          label: "重跑",
-          action: "rerun_request",
-          type: "danger",
-          value: withProjectCode(
-            {
-              processInstanceId: String(processInstanceId),
-              executeType: "START_FAILURE_TASK_PROCESS",
-            },
-            projectCode,
-          ),
-        }),
-      );
-    }
   }
   if (taskId) {
     actions.push(
@@ -223,7 +236,7 @@ export function alertCard({
 
   return card({
     title: "🚨 工作流告警",
-    template: "red",
+    template,
     elements: body,
   });
 }
@@ -933,6 +946,8 @@ export function buildAlertCardFromReportFields(fields = {}) {
     verdict: classification?.verdict,
     category: classification?.category,
     mechanism,
+    severity: classification?.severity || "P2",
+    allowRerun: classification?.allowRerun !== false,
     uiUrl,
     processInstanceId: inst?.id ?? task?.processInstanceId,
     taskId: task?.id,
@@ -942,13 +957,16 @@ export function buildAlertCardFromReportFields(fields = {}) {
     when: task?.endTime || task?.startTime,
     evidence: rawEvidence ? String(rawEvidence).trim() : "",
     repoLines: (() => {
-      const lines = repoAnalysis?.lines || [];
+      const lines = [
+        ...(classification?.probeLines || []),
+        ...(repoAnalysis?.lines || []),
+      ];
       return lines
         .map((l) => String(l || "").trim())
         .filter(Boolean)
         .filter((l) => !/^Cloud[：:]/i.test(l) && !/^定责[：:]/i.test(l))
-        .filter((l) => /验分区|相关 PR|^PR[：:]/i.test(l))
-        .slice(0, 2);
+        .filter((l) => /验分区|相关 PR|^PR[：:]|已查/i.test(l))
+        .slice(0, 3);
     })(),
     fixes: classification?.fixes || [],
     dsReadonly: Boolean(dsReadonly),

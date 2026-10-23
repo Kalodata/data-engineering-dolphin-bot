@@ -50,11 +50,50 @@ test("alertCard includes action buttons", () => {
   const blob = JSON.stringify(c);
   assert.match(blob, /diagnose/);
   assert.match(blob, /rerun_request/);
+  assert.match(blob, /一键重跑/);
   assert.match(blob, /看日志|log/);
   assert.doesNotMatch(blob, /feedback/);
   assert.doesNotMatch(blob, /有用|误报|需升级/);
+  assert.doesNotMatch(blob, /【不要】/);
   assert.match(blob, /1939974/);
   assert.match(blob, /15468494076768/);
+});
+
+test("alertCard classic quality-style layout", () => {
+  const c = alertCard({
+    cause: "质量校验未过：货币单位检验 期望[-40,1000] 实际-40.10",
+    verdict: "数据质量阈值未过",
+    category: "数据质量",
+    mechanism:
+      "质量门禁未过：表 kalo_data_online.dwd_product_detail_api 上指标超出设定区间。JDBC/脚本可能已跑成功，是校验任务拦下的。",
+    severity: "P1",
+    evidence: "expected:[-40,1000], actual:-40.10, matched:false",
+    fixes: [
+      "[已查] 分区指标贴近阈值下沿，偏边界波动",
+      "[外部] 业务确认后调阈值下限，或核对当日回刷",
+      "[Bot] 点「一键重跑」→ 确认（QUALITY 叶子）",
+    ],
+    processInstanceId: 2333945,
+    taskId: 11438719,
+    taskName: "QUALITY TASK",
+    duration: "38s",
+    scriptLabel: "dwd_scraper_product_detail.sql",
+    when: "2026-10-23 11:16:35",
+    dsReadonly: false,
+    projectCode: "9892432515424",
+  });
+  const blob = JSON.stringify(c);
+  assert.match(blob, /原因/);
+  assert.match(blob, /判定/);
+  assert.match(blob, /类别/);
+  assert.match(blob, /成因/);
+  assert.match(blob, /报错/);
+  assert.match(blob, /现在做/);
+  assert.match(blob, /已查/);
+  assert.match(blob, /一键重跑/);
+  assert.match(blob, /🚨 工作流告警/);
+  assert.doesNotMatch(blob, /处理完后/);
+  assert.equal(c.header.template, "red");
 });
 
 test("alertCard hides rerun when readonly", () => {
@@ -224,9 +263,13 @@ test("buildAlertCardFromReportFields / formatAlertCard", () => {
   };
   const card = formatAlertCard(fields);
   const text = formatAlertReport(fields);
-  assert.match(text, /工作流告警/);
-  assert.equal(card.header.template, "red");
-  assert.equal(buildAlertCardFromReportFields(fields).header.template, "red");
+  assert.match(text, /原因：/);
+  assert.match(text, /现在做：/);
+  assert.doesNotMatch(text, /【不要】/);
+  // Default severity P2 → orange; P1 uses red
+  assert.equal(card.header.template, "orange");
+  assert.equal(buildAlertCardFromReportFields(fields).header.template, "orange");
+  assert.match(JSON.stringify(card), /🚨 工作流告警/);
   assert.match(JSON.stringify(card), /"projectCode":"123"/);
 });
 

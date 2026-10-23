@@ -7,10 +7,11 @@
   "sql_repo_path": "",
   "enable_pr_lookup": false,
   "hive_probe": {
-    "enabled": false,
-    "on_alert": false,
-    "on_diagnose": false,
+    "enabled": true,
+    "on_alert": true,
+    "on_diagnose": true,
     "jdbc_url": "",
+    "jdbc_jar": "/app/lib/hive-jdbc-standalone.jar",
     "timeout_ms": 90000
   },
   "alert_watch": {
@@ -28,7 +29,7 @@
     "dedupe_path": ".data/alert-dedupe.json"
   },
   "ds_alert_webhook": {
-    "enabled": false,
+    "enabled": true,
     "prefer_push": true,
     "port": 18766,
     "bind": "0.0.0.0",
@@ -49,7 +50,7 @@
   "agent_mcp_ds": true,
   "default_cloud_repo_key": "tiktok",
   "cloud_code_on_diagnose": true,
-  "cloud_code_on_alert": true,
+  "cloud_code_on_alert": false,
   "cloud_code_timeout_ms": 120000,
   "cloud_repos": {
     "tiktok": {

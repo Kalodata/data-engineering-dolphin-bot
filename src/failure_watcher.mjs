@@ -7,10 +7,12 @@ import {
   buildProcessInstanceUiUrl,
   buildActionPlaybook,
 } from "./ds32_client.mjs";
+import { applyPlaybookToClassification } from "./alert_playbook.mjs";
 import { alertDedupeKey, claimAlert } from "./alert_dedupe.mjs";
 import { enrichFailureContext } from "./deep_enrich.mjs";
 import { analyzeSqlAgainstFailure } from "./sql_repo_analysis.mjs";
 import { buildAlertCardFromReportFields } from "./feishu_cards.mjs";
+import { needsAutoProbe, autoProbeAlert } from "./alert_auto_probe.mjs";
 
 /** Noise tasks that fire often but are not real workflow alerts. */
 const NOISE_NAME_RE = /^(ROUTER|CHECK VALID)$/i;
@@ -89,6 +91,16 @@ export function markTaskNotified(statePath, taskId, now = Date.now()) {
   saveNotifyState(statePath, state);
 }
 
+/** Normalize agent disposition for user-facing cards (no 【不要】; legacy titles → 事实/处置). */
+export function stripDontSections(text) {
+  return String(text || "")
+    .replace(/\n*【不要】[\s\S]*?(?=\n【|$)/g, "")
+    .replace(/【证据】/g, "【事实】")
+    .replace(/【立刻做】/g, "【处置】")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 export function formatAlertReport({
   task,
   inst,
@@ -107,12 +119,15 @@ export function formatAlertReport({
     classification?.where ||
     "任务失败（原因未解析到）";
   lines.push(`原因：${cause}`);
-  if (classification?.verdict) lines.push(classification.verdict);
+  if (classification?.verdict) {
+    const v = String(classification.verdict).replace(/^判定[：:]\s*/, "").trim();
+    lines.push(`判定：${v}`);
+  }
   lines.push(`类别：${classification?.category || "?"}`);
 
   const mechanism = classification?.mechanism || classification?.where;
   if (mechanism && !sameAlertText(mechanism, cause)) {
-    lines.push(`成因：${clipAlert(mechanism, 160)}`);
+    lines.push(`成因：${clipAlert(mechanism, 200)}`);
   }
 
   const instId = inst?.id ?? task.processInstanceId;
@@ -122,15 +137,9 @@ export function formatAlertReport({
     processInstanceId: instId,
     processDefinitionCode: inst?.processDefinitionCode,
   });
-  if (uiUrl) {
-    lines.push(`位置：${uiUrl}`);
-  } else {
-    lines.push(
-      `位置：实例 #${instId} ${shortName(inst?.name)} · 任务 #${task.id} ${shortName(task.name)}`,
-    );
-  }
+  if (uiUrl) lines.push(`位置：${uiUrl}`);
   lines.push(
-    `任务：#${task.id} ${shortName(task.name) || "?"}（${task.duration || "?"}）`,
+    `任务：#${task.id} ${shortName(task.name) || "?"}${task.duration ? `（${task.duration}）` : ""}`,
   );
   const scriptLabel =
     repoAnalysis?.relativePath || classification?.sqlFile || null;
@@ -144,32 +153,34 @@ export function formatAlertReport({
     (highlight?.purged ? highlight.summary : null);
   const err = rawEvidence ? String(rawEvidence).trim() : "";
   if (err && !sameAlertText(err, cause)) {
-    lines.push(`报错：${clipAlert(err, 100)}`);
+    lines.push(`报错：${clipAlert(err, 120)}`);
   }
 
-  // Alert 只展示可执行验数/PR，不 dump Cloud 脚本结构说明（读仓用于定责，不写进卡）。
-  const repoFacing = alertFacingRepoLines(repoAnalysis);
+  const repoFacing = [
+    ...(classification?.probeLines || []),
+    ...alertFacingRepoLines(repoAnalysis),
+  ]
+    .map((l) => String(l || "").trim())
+    .filter(Boolean)
+    .slice(0, 3);
   if (repoFacing.length) {
     lines.push("验数：");
-    for (const l of repoFacing) {
-      lines.push(`· ${clipAlert(l, 120)}`);
-    }
+    for (const l of repoFacing) lines.push(`· ${clipAlert(l, 140)}`);
   }
 
   const fixes = (classification?.fixes || [])
     .map((f) => String(f).trim())
-    .filter(Boolean)
-    .slice(0, 3);
+    .filter((f) => f && !/^处理完后/.test(f))
+    .slice(0, 4);
+  lines.push("现在做：");
   if (fixes.length) {
-    lines.push("现在做：");
-    fixes.forEach((f, i) => lines.push(`${i + 1}. ${clipAlert(f, 120)}`));
-  } else if (!dsReadonly && instId) {
-    lines.push("现在做：");
-    lines.push(`1. 飞书回「重跑 ${instId}」→ YES（或点告警卡「重跑」）`);
+    fixes.forEach((f, i) => lines.push(`${i + 1}. ${clipAlert(f, 160)}`));
+  } else if (!dsReadonly && instId && classification?.allowRerun !== false) {
+    lines.push(`1. [Bot] 点「一键重跑」→ 确认`);
+  } else {
+    lines.push("1. [Bot] 点「诊断」补证后再处置");
   }
 
-  lines.push("");
-  lines.push(`深挖：点告警卡「诊断」或 /diagnose ${instId}  /log ${task.id}`);
   return lines.join("\n");
 }
 
@@ -196,8 +207,8 @@ export function alertFacingRepoLines(repoAnalysis) {
     .map((l) => String(l || "").trim())
     .filter(Boolean)
     .filter((l) => !/^Cloud[：:]/i.test(l) && !/^定责[：:]/i.test(l))
-    .filter((l) => /验分区|相关 PR|^PR[：:]/i.test(l))
-    .slice(0, 2);
+    .filter((l) => /验分区|已查|行数|相关 PR|^PR[：:]/i.test(l))
+    .slice(0, 3);
 }
 
 function sameAlertText(a, b) {
@@ -421,6 +432,7 @@ export async function collectNewFailureAlerts(ds, options = {}) {
   const fresh = candidates.filter((t) => !state.notified[String(t.id)]);
   const alerts = [];
   let skippedHealed = 0;
+  let skippedDesigned = 0;
   let held = 0;
   let dirty = false;
 
@@ -495,11 +507,58 @@ export async function collectNewFailureAlerts(ds, options = {}) {
       }
     }
 
-    const classification = classifyFailure({
+    let classification = classifyFailure({
       task,
       logText,
       purged: highlight.purged,
     });
+    // Designed country/scope gate: FAILURE is routing, not a real outage — silence.
+    if (classification.category === "分支跳过") {
+      state.notified[String(task.id)] = now;
+      skippedDesigned += 1;
+      dirty = true;
+      console.error(
+        `[alert-watch] designed-skip silenced task#${task.id} name=${task.name || "?"} wf#${task.processInstanceId}`,
+      );
+      continue;
+    }
+
+    let agentText = null;
+    // Weak evidence → Bot/Agent auto-probe for one-shot disposition (never "go look yourself").
+    if (needsAutoProbe(classification, logText)) {
+      try {
+        const probe = await autoProbeAlert(ds, {
+          task,
+          inst,
+          siblings,
+          logText,
+          purged: highlight.purged,
+          dsReadonly: Boolean(options.dsReadonly),
+          runProbeAgent: options.runProbeAgent || null,
+          timeoutMs: options.probeTimeoutMs || 120_000,
+        });
+        classification = probe.classification;
+        highlight = probe.highlight || highlight;
+        logText = probe.logText || logText;
+        agentText = probe.agentText;
+        if (probe.notes?.length) {
+          console.error(
+            `[alert-watch] auto-probe task#${task.id}: ${probe.notes.join("; ")}`,
+          );
+        }
+      } catch (error) {
+        console.error(`[alert-watch] auto-probe failed task#${task.id}: ${error.message}`);
+      }
+    }
+
+    // Branch-skip may appear only after deepen — silence then.
+    if (classification.category === "分支跳过") {
+      state.notified[String(task.id)] = now;
+      skippedDesigned += 1;
+      dirty = true;
+      continue;
+    }
+
     const nearbyFailureCount = countNearbyFailures(task, candidates, 30);
     const retryRunning = (siblings || []).some(
       (t) =>
@@ -514,6 +573,12 @@ export async function collectNewFailureAlerts(ds, options = {}) {
       signal: {
         cause: classification.cause,
         evidence: classification.evidence,
+        designedSkip: classification.designedSkip,
+        weakExit: classification.category === "证据不足",
+        quality: classification.quality,
+        qualityProbe: classification.qualityProbe,
+        livy: classification.livy,
+        http: classification.http,
       },
       task,
       nearbyFailureCount,
@@ -522,37 +587,55 @@ export async function collectNewFailureAlerts(ds, options = {}) {
       processInstanceId: task.processInstanceId,
       dsReadonly: Boolean(options.dsReadonly),
     });
-    if (playbook.mechanism) classification.mechanism = playbook.mechanism;
-    if (playbook.verdict) classification.verdict = playbook.verdict;
-    if (playbook.cause) classification.cause = playbook.cause;
-    if (playbook.actions?.length) classification.fixes = playbook.actions;
-    classification.where = playbook.mechanism || classification.where;
+    // Keep upstream/agent classification if already one-shot; only fill gaps from playbook.
+    if (classification.category !== "上游失败") {
+      // Always merge playbook; quality [已查] comes from qualityProbe on signal
+      if (!classification.probeSource || classification.probeSource === "quality_boundary") {
+        applyPlaybookToClassification(classification, playbook);
+      } else if (playbook.severity && !classification.severity) {
+        classification.severity = playbook.severity;
+      }
+    }
+    if (agentText) agentText = stripDontSections(agentText);
 
     let repoAnalysis = null;
-    if (sqlRepoPath && classification.sqlFile) {
+    const wantEnrich =
+      (sqlRepoPath && classification.sqlFile) ||
+      (classification.category === "数据质量" && classification.quality?.table);
+    if (wantEnrich) {
       try {
         repoAnalysis = await enrichFailureContext({
-          repoRoot: sqlRepoPath,
-          sqlFile: classification.sqlFile,
+          repoRoot: sqlRepoPath || "",
+          sqlFile: classification.sqlFile || null,
           logText,
           category: classification.category,
           varsMap: classification.varsMap || {},
           hiveProbe: options.hiveProbe || null,
           enablePrLookup: options.enablePrLookup !== false,
+          quality: classification.quality || null,
         });
       } catch {
-        try {
-          repoAnalysis = analyzeSqlAgainstFailure({
-            repoRoot: sqlRepoPath,
-            sqlFile: classification.sqlFile,
-            logText,
-            category: classification.category,
-            varsMap: classification.varsMap || {},
-          });
-        } catch {
-          repoAnalysis = null;
+        if (sqlRepoPath && classification.sqlFile) {
+          try {
+            repoAnalysis = analyzeSqlAgainstFailure({
+              repoRoot: sqlRepoPath,
+              sqlFile: classification.sqlFile,
+              logText,
+              category: classification.category,
+              varsMap: classification.varsMap || {},
+            });
+          } catch {
+            repoAnalysis = null;
+          }
         }
       }
+    }
+    // Merge Hive 验数 into probeLines for classic card 验数 section
+    if (repoAnalysis?.qualityHive?.lines?.length) {
+      classification.probeLines = [
+        ...(classification.probeLines || []),
+        ...repoAnalysis.qualityHive.lines,
+      ].slice(0, 4);
     }
     if (typeof options.cloudCodeAnalyze === "function" && classification.sqlFile) {
       try {
@@ -577,6 +660,7 @@ export async function collectNewFailureAlerts(ds, options = {}) {
       repoAnalysis,
       dsReadonly: Boolean(options.dsReadonly),
     };
+    // Classic card always; Agent findings already merged into classification.fixes
     const text = formatAlertReport(reportFields);
     const card = formatAlertCard(reportFields);
     alerts.push({
@@ -585,6 +669,7 @@ export async function collectNewFailureAlerts(ds, options = {}) {
       text,
       card,
       category: classification.category,
+      probed: Boolean(agentText) || classification.probeSource === "agent",
     });
     state.notified[String(task.id)] = now;
     dirty = true;
@@ -596,8 +681,12 @@ export async function collectNewFailureAlerts(ds, options = {}) {
     alerts,
     scanned: rows.length,
     candidates: candidates.length,
-    pending: Math.max(0, fresh.length - alerts.length - skippedHealed - held),
+    pending: Math.max(
+      0,
+      fresh.length - alerts.length - skippedHealed - skippedDesigned - held,
+    ),
     skippedHealed,
+    skippedDesigned,
     held,
   };
 }
@@ -653,43 +742,101 @@ export async function materializeTaskAlert(ds, event = {}, options = {}) {
     }
   }
 
-  const classification = classifyFailure({
+  let classification = classifyFailure({
     task,
     logText,
     purged: highlight.purged,
   });
+  if (classification.category === "分支跳过") {
+    return {
+      taskId,
+      processInstanceId: processInstanceId || task.processInstanceId,
+      category: "分支跳过",
+      silenced: true,
+      text: null,
+      card: null,
+    };
+  }
+
+  let agentText = null;
+  if (needsAutoProbe(classification, logText)) {
+    try {
+      const probe = await autoProbeAlert(ds, {
+        task,
+        inst,
+        siblings,
+        logText,
+        purged: highlight.purged,
+        dsReadonly: Boolean(options.dsReadonly),
+        runProbeAgent: options.runProbeAgent || null,
+        timeoutMs: options.probeTimeoutMs || 120_000,
+      });
+      classification = probe.classification;
+      highlight = probe.highlight || highlight;
+      logText = probe.logText || logText;
+      agentText = probe.agentText;
+    } catch {
+      // keep initial classification
+    }
+  }
+  if (classification.category === "分支跳过") {
+    return {
+      taskId,
+      processInstanceId: processInstanceId || task.processInstanceId,
+      category: "分支跳过",
+      silenced: true,
+      text: null,
+      card: null,
+    };
+  }
+
   const playbook = buildActionPlaybook({
     category: classification.category,
     log: logText,
     sqlFile: classification.sqlFile,
-    signal: { cause: classification.cause, evidence: classification.evidence },
+    signal: {
+      cause: classification.cause,
+      evidence: classification.evidence,
+      designedSkip: classification.designedSkip,
+      weakExit: classification.category === "证据不足",
+      quality: classification.quality,
+      livy: classification.livy,
+    },
     task,
     nearbyFailureCount: 1,
     workflowState: inst?.state,
     processInstanceId: processInstanceId || task.processInstanceId,
     dsReadonly: Boolean(options.dsReadonly),
   });
-  if (playbook.mechanism) classification.mechanism = playbook.mechanism;
-  if (playbook.verdict) classification.verdict = playbook.verdict;
-  if (playbook.cause) classification.cause = playbook.cause;
-  if (playbook.actions?.length) classification.fixes = playbook.actions;
-  classification.where = playbook.mechanism || classification.where;
+  if (!agentText && classification.category !== "上游失败") {
+    applyPlaybookToClassification(classification, playbook);
+  }
 
   let repoAnalysis = null;
-  if (options.sqlRepoPath && classification.sqlFile) {
+  const wantEnrich =
+    (options.sqlRepoPath && classification.sqlFile) ||
+    (classification.category === "数据质量" && classification.quality?.table);
+  if (wantEnrich) {
     try {
       repoAnalysis = await enrichFailureContext({
-        repoRoot: options.sqlRepoPath,
-        sqlFile: classification.sqlFile,
+        repoRoot: options.sqlRepoPath || "",
+        sqlFile: classification.sqlFile || null,
         logText,
         category: classification.category,
         varsMap: classification.varsMap || {},
         hiveProbe: options.hiveProbe || null,
         enablePrLookup: options.enablePrLookup !== false,
+        quality: classification.quality || null,
       });
     } catch {
       repoAnalysis = null;
     }
+  }
+  if (repoAnalysis?.qualityHive?.lines?.length) {
+    classification.probeLines = [
+      ...(classification.probeLines || []),
+      ...repoAnalysis.qualityHive.lines,
+    ].slice(0, 4);
   }
   if (typeof options.cloudCodeAnalyze === "function" && classification.sqlFile) {
     try {
@@ -723,6 +870,7 @@ export async function materializeTaskAlert(ds, event = {}, options = {}) {
     text,
     card,
     category: classification.category,
+    probed: Boolean(agentText) || classification.probeSource === "agent",
   };
 }
 
@@ -746,6 +894,7 @@ export function startFailureWatcher({
   log = console.error,
   onAlertSent = null,
   cloudCodeAnalyze = null,
+  runProbeAgent = null,
 }) {
   const watch = config.alertWatch;
   if (!watch?.enabled) {
@@ -834,6 +983,8 @@ export function startFailureWatcher({
           : null,
         enablePrLookup: config.enablePrLookup !== false,
         cloudCodeAnalyze: cloudCodeAnalyze || null,
+        runProbeAgent: runProbeAgent || null,
+        probeTimeoutMs: Number(config.alertWatch?.probe_timeout_ms || 120_000),
       });
       if (result.seeded) {
         log(
@@ -841,9 +992,9 @@ export function startFailureWatcher({
         );
         return;
       }
-      if (result.skippedHealed || result.held) {
+      if (result.skippedHealed || result.skippedDesigned || result.held) {
         log(
-          `[alert-watch] self-heal filter: skipped=${result.skippedHealed || 0} held=${result.held || 0}`,
+          `[alert-watch] self-heal filter: skipped=${result.skippedHealed || 0} designed=${result.skippedDesigned || 0} held=${result.held || 0}`,
         );
       }
       for (const alert of result.alerts) {

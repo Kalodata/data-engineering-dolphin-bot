@@ -233,3 +233,120 @@ export async function verifyPartitionExists({
 function escapeSql(v) {
   return String(v).replace(/'/g, "''");
 }
+
+/**
+ * Extract country / partition_day from task vars or quality log snippets.
+ */
+export function resolveQualityProbeKeys({ varsMap = {}, logText = "" } = {}) {
+  const fromVars = resolvePartitionKeys(varsMap);
+  let country = fromVars.country;
+  let day = fromVars.partition_day;
+  const log = String(logText || "");
+  if (!country) {
+    const m =
+      log.match(
+        /"prop"\s*:\s*"country(?:Code|_code)"[\s\S]{0,160}?"value"\s*:\s*"([a-zA-Z]{2})"/i,
+      ) ||
+      log.match(
+        /"country_code"\s*:\s*\{[\s\S]{0,160}?"value"\s*:\s*"([a-zA-Z]{2})"/i,
+      ) ||
+      log.match(/\bcountry_code['"]?\s*[:=]\s*['"]([a-zA-Z]{2})['"]/i);
+    if (m) country = m[1];
+  }
+  if (!day) {
+    const m =
+      log.match(
+        /"prop"\s*:\s*"(?:dataDate|partition_day|data_date)"[\s\S]{0,160}?"value"\s*:\s*"(\d{4}-\d{2}-\d{2})"/i,
+      ) ||
+      log.match(
+        /"partition_day"\s*:\s*\{[\s\S]{0,160}?"value"\s*:\s*"(\d{4}-\d{2}-\d{2})"/i,
+      ) ||
+      log.match(/\bpartition_day['"]?\s*[:=]\s*['"](\d{4}-\d{2}-\d{2})['"]/i);
+    if (m) day = m[1];
+  }
+  // Skip unresolved DS placeholders
+  if (/\$\{/.test(country || "")) country = "";
+  if (/\$\{/.test(day || "")) day = "";
+  return {
+    country: String(country || "").trim(),
+    partition_day: String(day || "").trim(),
+  };
+}
+
+/**
+ * Quality alert Hive probe: partition existence + rough row count (partition-pruned).
+ * Used so 现在做/[已查] can cite live table state, not only expected/actual math.
+ */
+export async function probeQualityTable({
+  quality = {},
+  varsMap = {},
+  logText = "",
+  hiveOptions = {},
+  countryColumn = "country_code",
+} = {}) {
+  const table = String(quality.table || "").trim();
+  if (!table) {
+    return { probed: false, reason: "no_table", lines: [] };
+  }
+  if (hiveOptions?.enabled === false) {
+    return { probed: false, reason: "disabled", lines: [] };
+  }
+
+  const keys = resolveQualityProbeKeys({ varsMap, logText });
+  if (!keys.country || !keys.partition_day) {
+    return {
+      probed: false,
+      reason: "missing_partition_keys",
+      table,
+      keys,
+      lines: [
+        `验数跳过：缺 country/partition_day（table=${table}）— 边界结论仍以 expected/actual 为准`,
+      ],
+    };
+  }
+
+  const qualified = table.includes(".") ? table : `kalo_data_online.${table}`;
+  const part = await verifyPartitionExists({
+    struct: { sources: [qualified], targets: [] },
+    varsMap: {
+      country_code: keys.country,
+      partition_day: keys.partition_day,
+    },
+    hiveOptions,
+    countryColumn,
+  });
+
+  const lines = [...(part.lines || [])];
+  let rowCount = null;
+  if (part.exists) {
+    const sql = `SELECT COUNT(*) AS cnt FROM ${qualified} WHERE ${countryColumn}='${escapeSql(keys.country)}' AND partition_day='${escapeSql(keys.partition_day)}'`;
+    const counted = await runHiveSql(sql, {
+      ...hiveOptions,
+      timeoutMs: Math.min(Number(hiveOptions.timeoutMs) || 90_000, 60_000),
+    });
+    if (counted.ok) {
+      const raw =
+        counted.rows?.[0]?.cnt ??
+        counted.rows?.[0]?._cols?.[0] ??
+        "";
+      const n = Number(String(raw).replace(/,/g, ""));
+      if (Number.isFinite(n)) {
+        rowCount = n;
+        lines.push(
+          `已查：${qualified} ${countryColumn}=${keys.country} day=${keys.partition_day} 行数≈${n}`,
+        );
+      }
+    } else if (counted.error) {
+      lines.push(`验数 COUNT 失败：${String(counted.error).slice(0, 120)}`);
+    }
+  }
+
+  return {
+    probed: true,
+    table: qualified,
+    keys,
+    exists: part.exists,
+    rowCount,
+    lines: lines.slice(0, 4),
+  };
+}

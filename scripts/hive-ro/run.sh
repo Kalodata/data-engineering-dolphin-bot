@@ -6,6 +6,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 JAR="${HIVE_JDBC_JAR:-}"
 if [[ -z "$JAR" ]]; then
   for cand in \
+    "/app/lib/hive-jdbc-standalone.jar" \
+    "$ROOT/lib/hive-jdbc-standalone.jar" \
     "$HOME/Library/Application Support/JetBrains/DataGrip2026.1/jdbc-drivers/Apache Spark/3.1.2/hive-jdbc-3.1.2-standalone.jar" \
     "$HOME/Library/Application Support/JetBrains/DataGrip2025.3/jdbc-drivers/Apache Spark/3.1.2/hive-jdbc-3.1.2-standalone.jar"
   do
