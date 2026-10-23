@@ -14,6 +14,65 @@ export function alertDedupeKey({ taskId, processInstanceId = null, state = "FAIL
   return pid ? `task:${tid}|wf:${pid}|${st}` : `task:${tid}|${st}`;
 }
 
+/** Normalize DS node name so retries of the same node share one logical key. */
+export function normalizeAlertNodeName(name = "") {
+  return String(name || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 120)
+    .toLowerCase();
+}
+
+/**
+ * Logical dedupe across DS auto-retries: same wf instance + same node name
+ * (task instance id changes on each retry — task-only keys would re-alert).
+ */
+export function alertLogicalDedupeKey({
+  processInstanceId = null,
+  taskName = "",
+  state = "FAILURE",
+} = {}) {
+  const pid = processInstanceId != null ? String(processInstanceId) : "";
+  const node = normalizeAlertNodeName(taskName);
+  if (!pid || !node) return "";
+  const st = String(state || "FAILURE").toUpperCase();
+  return `wf:${pid}|node:${node}|${st}`;
+}
+
+/**
+ * Claim task key + logical node key. If either is a recent duplicate → not claimed.
+ * @returns {{ claimed: boolean, reason: string, keys: string[] }}
+ */
+export function claimAlertWithLogical(
+  statePath,
+  { taskId, processInstanceId, taskName, state = "FAILURE" } = {},
+  { now = Date.now(), taskTtlMs = 7 * 24 * 3600_000, logicalTtlMs = 24 * 3600_000 } = {},
+) {
+  const taskKey = alertDedupeKey({ taskId, processInstanceId, state });
+  const logicalKey = alertLogicalDedupeKey({
+    processInstanceId,
+    taskName,
+    state,
+  });
+  const keys = [logicalKey, taskKey].filter(Boolean);
+  if (!keys.length) return { claimed: false, reason: "missing_key", keys: [] };
+
+  // Logical first: suppress same-node retries within 24h
+  if (logicalKey) {
+    const logic = claimAlert(statePath, logicalKey, { now, ttlMs: logicalTtlMs });
+    if (!logic.claimed) {
+      return { claimed: false, reason: "logical_duplicate", keys };
+    }
+  }
+  if (taskKey) {
+    const task = claimAlert(statePath, taskKey, { now, ttlMs: taskTtlMs });
+    if (!task.claimed) {
+      return { claimed: false, reason: "task_duplicate", keys };
+    }
+  }
+  return { claimed: true, reason: "first", keys };
+}
+
 function loadState(statePath) {
   try {
     if (!fs.existsSync(statePath)) return { claimed: {} };

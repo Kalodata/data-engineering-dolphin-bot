@@ -1,6 +1,6 @@
 import http from "node:http";
 
-import { alertDedupeKey, claimAlert } from "./alert_dedupe.mjs";
+import { claimAlertWithLogical } from "./alert_dedupe.mjs";
 
 /**
  * Extract task / process instance ids from flexible DS alert payloads.
@@ -108,10 +108,19 @@ export function startDsAlertIngress({
         return;
       }
 
-      const key = alertDedupeKey({ taskId, processInstanceId, state: "FAILURE" });
-      const claim = claimAlert(dedupePath, key);
+      const claim = claimAlertWithLogical(dedupePath, {
+        taskId,
+        processInstanceId,
+        taskName: name,
+        state: "FAILURE",
+      });
       if (!claim.claimed) {
-        json(res, 200, { ok: true, deduped: true, key });
+        json(res, 200, {
+          ok: true,
+          deduped: true,
+          reason: claim.reason,
+          keys: claim.keys,
+        });
         return;
       }
 
@@ -122,9 +131,15 @@ export function startDsAlertIngress({
         state,
         name,
         raw: body,
-        dedupeKey: key,
+        dedupeKey: claim.keys?.[0] || "",
+        dedupeKeys: claim.keys,
       });
-      json(res, 200, { ok: true, claimed: true, key, result: result || null });
+      json(res, 200, {
+        ok: true,
+        claimed: true,
+        keys: claim.keys,
+        result: result || null,
+      });
     } catch (error) {
       log(`[ds-alert-ingress] error: ${error.message}`);
       json(res, 500, { ok: false, error: error.message });

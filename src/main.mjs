@@ -2728,6 +2728,7 @@ async function main() {
           fetchLog: config.alertWatch.fetchLog !== false,
           sqlRepoPath: config.sqlRepoPath,
           dsReadonly: config.dsReadonly,
+          dedupePath: config.alertWatch.dedupePath,
           hiveProbe: config.hiveProbe
             ? { ...config.hiveProbe, onAlert: config.hiveProbe.onAlert === true }
             : null,
@@ -2752,7 +2753,13 @@ async function main() {
         });
         if (alert?.silenced || alert?.category === "分支跳过") {
           markTaskNotified(config.alertWatch.statePath, alert.taskId);
-          return { skipped: true, reason: "designed_skip" };
+          return {
+            skipped: true,
+            reason:
+              alert.reason === "logical_dedupe"
+                ? "logical_dedupe"
+                : "designed_skip",
+          };
         }
         if (!alert?.text && !alert?.card) return { skipped: true, reason: "no_card" };
         markTaskNotified(config.alertWatch.statePath, alert.taskId);

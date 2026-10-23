@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { alertDedupeKey, claimAlert } from "../src/alert_dedupe.mjs";
+import {
+  alertDedupeKey,
+  alertLogicalDedupeKey,
+  claimAlert,
+  claimAlertWithLogical,
+} from "../src/alert_dedupe.mjs";
 import {
   buildEvidenceAwareAlertPrompt,
   extractDsIdsFromText,
@@ -74,4 +79,31 @@ test("claimAlert dedupes same key", () => {
   assert.equal(claimAlert(statePath, key).claimed, true);
   assert.equal(claimAlert(statePath, key).claimed, false);
   assert.equal(claimAlert(statePath, key, { ttlMs: 0 }).claimed, true);
+});
+
+test("claimAlertWithLogical suppresses same wf+node retries with new taskId", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "alert-logical-"));
+  const statePath = path.join(dir, "dedupe.json");
+  const name = "为游客模式功能生成数据（1h ）";
+  const first = claimAlertWithLogical(statePath, {
+    taskId: 11440661,
+    processInstanceId: 2334079,
+    taskName: name,
+  });
+  assert.equal(first.claimed, true);
+  assert.ok(
+    first.keys.includes(
+      alertLogicalDedupeKey({
+        processInstanceId: 2334079,
+        taskName: name,
+      }),
+    ),
+  );
+  const retry = claimAlertWithLogical(statePath, {
+    taskId: 11445272,
+    processInstanceId: 2334079,
+    taskName: name,
+  });
+  assert.equal(retry.claimed, false);
+  assert.equal(retry.reason, "logical_duplicate");
 });
