@@ -8,7 +8,11 @@ import {
   buildActionPlaybook,
 } from "./ds32_client.mjs";
 import { applyPlaybookToClassification } from "./alert_playbook.mjs";
-import { alertDedupeKey, claimAlert } from "./alert_dedupe.mjs";
+import {
+  alertLogicalDedupeKey,
+  claimAlert,
+  claimAlertWithLogical,
+} from "./alert_dedupe.mjs";
 import { enrichFailureContext } from "./deep_enrich.mjs";
 import { analyzeSqlAgainstFailure } from "./sql_repo_analysis.mjs";
 import { buildAlertCardFromReportFields } from "./feishu_cards.mjs";
@@ -480,15 +484,24 @@ export async function collectNewFailureAlerts(ds, options = {}) {
       continue;
     }
 
-    const dedupeKey = alertDedupeKey({
-      taskId: task.id,
-      processInstanceId: task.processInstanceId,
-      state: "FAILURE",
-    });
-    const claim = claimAlert(unifiedDedupePath, dedupeKey, { now });
+    const claim = claimAlertWithLogical(
+      unifiedDedupePath,
+      {
+        taskId: task.id,
+        processInstanceId: task.processInstanceId,
+        taskName: task.name,
+        state: "FAILURE",
+      },
+      { now },
+    );
     if (!claim.claimed) {
       state.notified[String(task.id)] = now;
       dirty = true;
+      if (claim.reason === "logical_duplicate") {
+        console.error(
+          `[alert-watch] logical-dedupe skip task#${task.id} name=${task.name || "?"} wf#${task.processInstanceId}`,
+        );
+      }
       continue;
     }
 
@@ -725,6 +738,38 @@ export async function materializeTaskAlert(ds, event = {}, options = {}) {
       state: "FAILURE",
       endTime: event.endTime || null,
     };
+  }
+
+  // Webhook may claim with empty name → only task key. Resolve node name from DS,
+  // then claim logical wf+node key so retries with a new taskId do not re-alert.
+  const dedupePath = options.dedupePath || null;
+  const resolvedPid = processInstanceId || task.processInstanceId || null;
+  const resolvedName = String(task.name || event.name || "").trim();
+  if (dedupePath && resolvedPid && resolvedName && resolvedName !== "?") {
+    const logicalKey = alertLogicalDedupeKey({
+      processInstanceId: resolvedPid,
+      taskName: resolvedName,
+      state: "FAILURE",
+    });
+    const priorKeys = new Set(
+      Array.isArray(event.dedupeKeys) ? event.dedupeKeys.filter(Boolean) : [],
+    );
+    if (logicalKey && !priorKeys.has(logicalKey)) {
+      const logic = claimAlert(dedupePath, logicalKey, {
+        ttlMs: 24 * 3600_000,
+      });
+      if (!logic.claimed) {
+        return {
+          taskId,
+          processInstanceId: resolvedPid,
+          category: "逻辑去重",
+          silenced: true,
+          reason: "logical_dedupe",
+          text: null,
+          card: null,
+        };
+      }
+    }
   }
 
   let logText = "";

@@ -4,7 +4,7 @@
 
 
 function strongLog(log = "") {
-  return /Error while processing statement|AnalysisException|SemanticException|ParseException|TTransportException|MetadataFetchFailed|FetchFailedException|OutOfMemoryError|Java heap space|InvalidInputException|Partition.+not found|Permission denied|matched:\s*false|状态:\s*dead|任务执行失败|FAILED:\s*Execution Error|Caused by:/i.test(
+  return /Error while processing statement|AnalysisException|SemanticException|ParseException|TTransportException|MetadataFetchFailed|FetchFailedException|OutOfMemoryError|Java heap space|InvalidInputException|Partition.+not found|Permission denied|matched:\s*false|状态:\s*dead|任务执行失败|FAILED:\s*Execution Error|Caused by:|->\s*Timed out:|Timed out:\s*taskId=|exitStatusCode:\s*124\b|processExitValue:\s*124\b/i.test(
     String(log || ""),
   );
 }
@@ -365,7 +365,29 @@ export function buildActionPlaybook({
     });
   }
 
-  if (cat === "SQL/JDBC" || cat === "超时" || cat === "执行失败") {
+  if (cat === "超时") {
+    const elapsed = String(log || "").match(/elapsed=(\d+)s/i)?.[1];
+    return pack({
+      mechanism: elapsed
+        ? `任务跑满 ${elapsed}s 后被杀掉（exit 124），不是分区缺失`
+        : "任务超时退出（exit 124 / Timed out），不是分区缺失",
+      cause:
+        cause0 ||
+        (elapsed ? `任务超时（${elapsed}s / exit 124）` : "任务超时（exit 124）"),
+      verdict: "任务超时",
+      severity: "P1",
+      do: [
+        "查下游是否卡住或单次墙钟过大（HTTP 轮询满超时很常见）",
+        "可加大超时、拆批，或查日志 Timed out 行里的 backend taskId",
+        `原因消除后再 ${rerun}`,
+      ],
+      dont: ["不要当成分区缺失去改 partition 参数"],
+      verify: ["任务在超时内 SUCCESS"],
+      escalate: "反复超时 → 查下游接口/扩容",
+    });
+  }
+
+  if (cat === "SQL/JDBC" || cat === "执行失败") {
     const strong = strongLog(log);
     const empty = !String(log || "").trim();
     if (strong) {
@@ -378,7 +400,7 @@ export function buildActionPlaybook({
             : "执行失败",
         cause: cause0 || (tip ? String(tip).slice(0, 80) : null),
         verdict: tip ? `按报错处理：${String(tip).slice(0, 60)}` : "按日志报错处理后重跑",
-        severity: cat === "超时" ? "P1" : "P2",
+        severity: "P2",
         do: [
           tip
             ? `[外部] 先消掉该报错：${String(tip).slice(0, 80)}`

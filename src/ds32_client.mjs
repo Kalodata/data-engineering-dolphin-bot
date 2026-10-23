@@ -626,15 +626,29 @@ export function isRealTimeoutFailure(text = "") {
     /\b(?:socket|connect|connection|read|write)?Timeout\s*[:=]\s*\d+/gi,
     "",
   );
-  return /SocketTimeoutException|ConnectTimeoutException|Read timed out|Connection timed out|query timed out|执行超时|任务超时|超时失败|Timed out|TimeoutException/i.test(
+  // Shell/DS: exit 124 + "Timed out: ... elapsed=3600s" (not script source alone)
+  return /SocketTimeoutException|ConnectTimeoutException|Read timed out|Connection timed out|query timed out|执行超时|任务超时|超时失败|TimeoutException/i.test(
     scrubbed,
-  );
+  ) ||
+    /->\s*Timed out:|Timed out:\s*taskId=|elapsed=\d+s.*not cancelled/i.test(scrubbed) ||
+    /exitStatusCode:\s*124\b|processExitValue:\s*124\b/i.test(scrubbed);
+}
+
+/** Script-source noise that must never become alert 原因 (printed templates in rawScript dump). */
+export function isScriptTemplateNoiseLine(line = "") {
+  const s = String(line || "").trim();
+  if (!s) return true;
+  if (/^\s*echo\s+["']ERROR:\s*\$/i.test(s)) return true;
+  if (/^\s*echo\s+["'].*\$\{?(country|lastDay|taskId|SECONDS)/i.test(s)) return true;
+  if (/Skipped old partition:/i.test(s) && /echo\s+/i.test(s)) return true;
+  if (/^\s*(function\s+\w+|die\s*\(|usage\s*\()/i.test(s)) return true;
+  return false;
 }
 
 /** Real failure signal (not bare exit code / framework INFO). */
 export function hasStrongFailureSignal(logText = "") {
   const log = String(logText || "");
-  return /Error while processing statement|AnalysisException|SemanticException|ParseException|TTransportException|MetadataFetchFailed|FetchFailedException|OutOfMemoryError|Java heap space|InvalidInputException|Partition.+not found|Permission denied|matched:\s*false|状态:\s*dead|任务执行失败|FAILED:\s*Execution Error|Caused by:|statusCode\s*[:=]\s*[45]\d{2}|HTTP Status\s*[45]\d{2}|Must be:\s*200/i.test(
+  return /Error while processing statement|AnalysisException|SemanticException|ParseException|TTransportException|MetadataFetchFailed|FetchFailedException|OutOfMemoryError|Java heap space|InvalidInputException|Partition.+not found|Permission denied|matched:\s*false|状态:\s*dead|任务执行失败|FAILED:\s*Execution Error|Caused by:|statusCode\s*[:=]\s*[45]\d{2}|HTTP Status\s*[45]\d{2}|Must be:\s*200|->\s*Timed out:|Timed out:\s*taskId=|exitStatusCode:\s*124\b|processExitValue:\s*124\b/i.test(
     log,
   );
 }
@@ -666,15 +680,21 @@ export function extractAlertEvidence(logText, { maxEvidence = 1, maxLen = 100 } 
   for (const line of all) {
     // Never surface DS TaskLogLogger / taskAppId INFO as the alert "原因"
     if (DS_FRAMEWORK_NOISE_RE.test(line)) continue;
+    if (isScriptTemplateNoiseLine(line)) continue;
     if (
       /TaskLogLogger/i.test(line) &&
-      !/Exception|Error while|matched:\s*false|状态:\s*dead|任务执行失败/i.test(line)
+      !/Exception|Error while|matched:\s*false|状态:\s*dead|任务执行失败|Timed out:/i.test(
+        line,
+      )
     ) {
       continue;
     }
     let score = 0;
+    // Shell/DS wall-clock timeout (exit 124) — ahead of vague ERROR:/partition script text
+    if (/->\s*Timed out:|Timed out:\s*taskId=/i.test(line)) score = 116;
+    else if (/exitStatusCode:\s*124\b|processExitValue:\s*124\b/i.test(line)) score = 115;
     // Data quality checker (kalo quality) — prefer over JSON "level":"ERROR" noise
-    if (/expected:\s*\[[^\]]+\].*actual:\s*[\d.]+.*matched:\s*false/i.test(line)) score = 110;
+    else if (/expected:\s*\[[^\]]+\].*actual:\s*[\d.]+.*matched:\s*false/i.test(line)) score = 110;
     else if (/Checking val's value.*matched:\s*false/i.test(line)) score = 108;
     else if (/RuntimeException:.*Test [Cc]ase:/i.test(line)) score = 106;
     else if (/Error executing quality check/i.test(line)) score = 104;
@@ -714,8 +734,14 @@ export function extractAlertEvidence(logText, { maxEvidence = 1, maxLen = 100 } 
     // JSON log fragments are useless as "原因"
     if (/^\s*"level"\s*:\s*"ERROR"/i.test(line) || /"level"\s*:\s*"ERROR"/i.test(line)) continue;
     if (/^\s*"driverLogUrl"\s*:|^\s*"sparkUiUrl"\s*:/i.test(line)) continue;
-    if (/TaskLogLogger|FINALIZE_SESSION|^\[INFO\]/i.test(line) && !/Error:|Exception|expected:|quality|状态:\s*dead|任务执行失败/i.test(line))
+    if (
+      /TaskLogLogger|FINALIZE_SESSION|^\[INFO\]/i.test(line) &&
+      !/Error:|Exception|expected:|quality|状态:\s*dead|任务执行失败|Timed out:|exitStatusCode:\s*124|processExitValue:\s*124/i.test(
+        line,
+      )
+    ) {
       score -= 25;
+    }
     if (/Error while processing statement/i.test(line)) score += 10;
     if (/NodeId\.getHost|TA_OUTPUT_FAILED/i.test(line)) score -= 15;
     if (/避免.*OOM|prevent.*OOM|减少后续/i.test(line)) continue;
@@ -759,6 +785,9 @@ export function extractAlertEvidence(logText, { maxEvidence = 1, maxLen = 100 } 
     cause = "Spark stage 多次失败后中止";
   } else if (/NodeId\.getHost|TA_OUTPUT_FAILED|TezTask/i.test(blob)) {
     cause = "Hive Tez/YARN TaskAttempt 异常";
+  } else if (isRealTimeoutFailure(blob)) {
+    const elapsed = blob.match(/elapsed=(\d+)s/i)?.[1];
+    cause = elapsed ? `任务超时（${elapsed}s / exit 124）` : "任务超时（exit 124）";
   } else if (/InvalidInputException|Partition.+not found|cannot find partition/i.test(blob)) {
     cause = "分区/路径不存在";
   } else if (/Permission denied|AccessDenied/i.test(blob)) {
@@ -994,7 +1023,7 @@ export function compactErrorLine(line, maxLen = 100) {
   if (!s) return "";
   s = s
     .replace(
-      /^\[INFO\]\s+\d{4}-\d{2}-\d{2}[^]]*\]\s+TaskLogLogger-[^:]+:\[\d+\]\s*-\s*(?:->\s*)?/i,
+      /^\[INFO\]\s+\d{4}-\d{2}-\d{2}[^]]*\]\s+TaskLogLogger[^:]*:[^\]]*\]\s*-\s*(?:->\s*)?/i,
       "",
     )
     .replace(/^Error:\s*/i, "")
@@ -1218,6 +1247,17 @@ export function classifyFailure({ task, logText = "", purged = false } = {}) {
     fixes.push("先看同时间段其他 JDBC 是否大面积失败（集群抖动）");
     fixes.push(sqlFile ? `确认脚本 ${sqlFile} 本身能否单独跑通；能跑通则偏引擎侧` : "到 UI 打开任务日志确认是否 Tez/YARN 报错");
     fixes.push("可短暂重试该任务；若反复出现再升给平台/Yarn");
+  } else if (isRealTimeoutFailure(log)) {
+    category = "超时";
+    const elapsed = String(log).match(/elapsed=(\d+)s/i)?.[1];
+    where =
+      signal.cause ||
+      (elapsed
+        ? `任务跑满 ${elapsed}s 后被杀掉（exit 124），不是分区缺失`
+        : "任务超时退出（exit 124 / Timed out），不是分区缺失");
+    fixes.push("先看下游/接口是否卡住或单次扫描过大");
+    fixes.push("可加大超时、拆批，或查卡住的后端 taskId（日志 Timed out 行）");
+    fixes.push(task?.processInstanceId ? `[Bot] 点「一键重跑」→ 确认` : "超时原因消除后再从失败处恢复");
   } else if (/InvalidInputException|Partition.+not found|Path does not exist|cannot find partition/i.test(log)) {
     category = "分区/路径";
     where = signal.cause || "多半是分区不存在或分区参数算错（country / partition_day / hour）";
@@ -1248,7 +1288,10 @@ export function classifyFailure({ task, logText = "", purged = false } = {}) {
     if (vars.length) fixes.push(`核对参数：${vars.slice(0, 4).join(", ")}`);
   } else if (
     !purged &&
-    /partition|InvalidInputException/i.test(log) // only from log, not rawScript
+    // Require real engine signals — bare word "partition" in shell source is NOT enough
+    /InvalidInputException|Partition\s+\S+\s+not found|Path does not exist|cannot find partition/i.test(
+      log,
+    )
   ) {
     category = "分区/路径";
     where = "多半是分区不存在或分区参数算错（country / partition_day / hour）";

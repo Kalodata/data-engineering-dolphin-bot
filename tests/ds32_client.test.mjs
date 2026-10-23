@@ -358,3 +358,36 @@ test("formatFailedList includes next step", () => {
 test("formatTaskList empty", () => {
   assert.match(formatTaskList(9, { totalList: [] }), /没有任务/);
 });
+
+test("visitor shell exit 124 is 超时 not 分区/路径 (ignore script echo ERROR / partition text)", () => {
+  const log = `
+[INFO] 2026-10-23 13:03:52.484 +0800 [taskAppId=TASK-x] TaskLogLogger-class org.apache.dolphinscheduler.plugin.task.shell.ShellTask:[84] - shell task params {"rawScript":"die() {\\n    echo \\"ERROR: $*\\" >&2\\n}\\necho \\"Skipped old partition: country=$countryCode\\"\\nexit 124"}
+[INFO] TaskLogLogger - raw script :
+die() {
+    echo "ERROR: $*" >&2
+    exit 2
+}
+echo "Skipped old partition: country=$countryCode data_date=$lastDay"
+[INFO] 2026-10-23 14:03:52.498 +0800 [taskAppId=TASK-x] TaskLogLogger-class org.apache.dolphinscheduler.plugin.task.shell.ShellTask:[205] - process has exited, exitStatusCode:124 ,processExitValue:124
+[INFO] 2026-10-23 14:03:52.906 +0800 [taskAppId=TASK-x] TaskLogLogger-class org.apache.dolphinscheduler.plugin.task.shell.ShellTask:[63] -  -> Timed out: taskId=0687ce1d-6146-4974-8692-a94b4532124d elapsed=3600s; backend task is not cancelled
+`;
+  const s = extractAlertEvidence(log);
+  assert.match(s.cause || "", /超时|3600|124/);
+  assert.doesNotMatch(s.cause || "", /ERROR:\s*\$|分区/);
+  assert.ok(s.evidence.every((e) => !/echo\s+"ERROR:/i.test(e)));
+  const c = classifyFailure({
+    task: {
+      id: 11445272,
+      name: "为游客模式功能生成数据（1h ）",
+      taskType: "SHELL",
+      processInstanceId: 2334079,
+    },
+    logText: log,
+  });
+  assert.equal(c.category, "超时");
+  assert.match(c.verdict || "", /超时/);
+  assert.match(c.mechanism || c.where || "", /exit 124|超时/);
+  assert.doesNotMatch(c.mechanism || c.where || "", /分区\/路径不存在/);
+  assert.ok(c.fixes.some((f) => /超时|下游|backend taskId/i.test(f)));
+  assert.ok(!c.fixes.some((f) => /核对.*分区是否已有/.test(f)));
+});
