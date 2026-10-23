@@ -1,9 +1,12 @@
 import { analyzeSqlAgainstFailure, resolveGithubRepo } from "./sql_repo_analysis.mjs";
-import { verifyPartitionExists } from "./hive_probe.mjs";
+import {
+  verifyPartitionExists,
+  probeQualityTable,
+} from "./hive_probe.mjs";
 import { recentPrsForFile } from "./github_extra.mjs";
 
 /**
- * Enrich failure with code/git/GitHub PR + optional live partition probe.
+ * Enrich failure with code/git/GitHub PR + optional live partition / quality probe.
  */
 export async function enrichFailureContext({
   repoRoot,
@@ -13,23 +16,36 @@ export async function enrichFailureContext({
   varsMap = {},
   hiveProbe = null,
   enablePrLookup = true,
+  quality = null,
 } = {}) {
-  const repoAnalysis = analyzeSqlAgainstFailure({
-    repoRoot,
-    sqlFile,
-    logText,
-    category,
-    varsMap,
-  });
+  const repoAnalysis = sqlFile
+    ? analyzeSqlAgainstFailure({
+        repoRoot,
+        sqlFile,
+        logText,
+        category,
+        varsMap,
+      })
+    : { lines: [], relativePath: null, struct: null, useful: false };
 
   const lines = [...(repoAnalysis.lines || [])];
   let partition = null;
+  let qualityHive = null;
   let prs = [];
 
-  const wantPartition =
+  const hiveOn =
     Boolean(hiveProbe) &&
     hiveProbe.enabled !== false &&
-    hiveProbe.onAlert === true &&
+    hiveProbe.onAlert === true;
+  const hiveOptions = {
+    enabled: true,
+    timeoutMs: hiveProbe?.timeoutMs || 90_000,
+    jdbcUrl: hiveProbe?.jdbcUrl,
+    jdbcJar: hiveProbe?.jdbcJar,
+  };
+
+  const wantPartition =
+    hiveOn &&
     (/分区\/路径/.test(String(category || "")) ||
       /InvalidInputException|Partition.+not found|Path does not exist|cannot find partition/i.test(
         String(logText || ""),
@@ -39,14 +55,22 @@ export async function enrichFailureContext({
     partition = await verifyPartitionExists({
       struct: repoAnalysis.struct,
       varsMap,
-      hiveOptions: {
-        enabled: true,
-        timeoutMs: hiveProbe?.timeoutMs || 90_000,
-        jdbcUrl: hiveProbe?.jdbcUrl,
-        jdbcJar: hiveProbe?.jdbcJar,
-      },
+      hiveOptions,
     });
     if (partition?.lines?.length) lines.push(...partition.lines);
+  }
+
+  const wantQualityHive =
+    hiveOn &&
+    (/数据质量/.test(String(category || "")) || Boolean(quality?.table));
+  if (wantQualityHive && quality?.table) {
+    qualityHive = await probeQualityTable({
+      quality,
+      varsMap,
+      logText,
+      hiveOptions,
+    });
+    if (qualityHive?.lines?.length) lines.push(...qualityHive.lines);
   }
 
   if (enablePrLookup && repoRoot && repoAnalysis.relativePath) {
@@ -63,6 +87,7 @@ export async function enrichFailureContext({
     useful: lines.length > 0,
     lines: lines.slice(0, 8),
     partition,
+    qualityHive,
     prs,
   };
 }

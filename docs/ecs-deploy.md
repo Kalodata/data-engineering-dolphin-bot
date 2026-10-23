@@ -39,6 +39,22 @@ Workflow：`.github/workflows/deploy-ecs.yml`
 | `dolphin-bot/ds-api-token` | `DS_API_TOKEN` |
 | `dolphin-bot/cursor-api-key` | `CURSOR_API_KEY` |
 | `dolphin-bot/feishu-verification-token` | `FEISHU_VERIFICATION_TOKEN` |
+| `dolphin-bot/hive-jdbc-url` | `HIVE_JDBC_URL` |
+
+### Hive 只读查数（告警质量 / 验分区）
+
+- 镜像内已含 OpenJDK 17 + `hive-jdbc-standalone.jar`（`HIVE_JDBC_JAR=/app/lib/hive-jdbc-standalone.jar`）。
+- **必须**在 Secrets Manager 创建 `dolphin-bot/hive-jdbc-url`，值为 ECS **VPC 内可达**的 HiveServer2 JDBC，例如：
+  - `jdbc:hive2://<hs2-internal-host>:10001`
+  - 勿用本机 `localhost`（Fargate 容器内没有 Mac 隧道）。
+- `config.ecs.example.json` 默认 `hive_probe.enabled/on_alert/on_diagnose=true`；URL 空则回退读 `HIVE_JDBC_URL`。
+- 质量告警：先做 expected/actual 边界 `[已查]`，再可选 `SHOW PARTITIONS` + 分区 `COUNT(*)` 写入「验数」。
+- Task Role / 安全组：放行 ECS → HS2:10001（及 Kerberos/LDAP 若集群需要，把 principal 写进 JDBC URL）。
+
+### 生产只走 ECS
+
+- 告警 / 卡片回调 / event consume **只跑 ECS 一份**；本机 Mac 桥在切流后停掉，避免 `online_instance_cnt` 抢连接。
+- 飞书「卡片回传交互」URL 固定为下方公网回调；不要再指 localhost.run。
 
 ## 卡片回调（方案：共用 ds-offline 域名 + 路径前缀）
 
@@ -92,6 +108,10 @@ curl -i -X POST "https://ds-offline.kalowave.com/dolphin-bot/feishu/card" \
 
 运维侧建议 Service 部署配置：`minimumHealthyPercent=0`、`maximumPercent=100`（先停旧再起新），缩短双实例抢 bus 窗口。
 
-## 本机未切流前
+## 切流检查清单
 
-Mac 桥 + localhost.run 继续服务卡片；ECS + 上表公网回调就绪后再改飞书 URL。
+1. Secrets 含 `hive-jdbc-url`（VPC 可达 HS2）
+2. 飞书卡片回调 → `https://ds-offline.kalowave.com/dolphin-bot/feishu/card`
+3. `curl -fsS https://ds-offline.kalowave.com/dolphin-bot/health` 通
+4. **停掉本机** `lark-cli event consume` / Mac 桥，仅留 ECS
+5. 推一条质量/HTTP 失败，确认经典告警卡 +「一键重跑」

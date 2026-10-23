@@ -2,6 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+export {
+  buildActionPlaybook,
+  applyPlaybookToClassification,
+} from "./alert_playbook.mjs";
+import { buildActionPlaybook } from "./alert_playbook.mjs";
+
 const DEFAULT_ENV_FILE = path.join(os.homedir(), ".config/dsctl/offline.env");
 
 export function loadDsEnv(envFile = process.env.DS_ENV_FILE || DEFAULT_ENV_FILE) {
@@ -350,19 +356,76 @@ export class Ds32Client {
     return data?.message || "";
   }
 
+  /**
+   * Head + tail log. Long jobs (1h+) often bury the Exception at the end;
+   * head-only sampling yields TaskLogLogger INFO noise and weak exitStatusCode.
+   */
   async getTaskLogChunks(taskInstanceId, { maxChunks = 8, limit = 400 } = {}) {
-    const chunks = [];
+    const headChunks = [];
     let skip = 0;
-    for (let i = 0; i < maxChunks; i += 1) {
+    const headPages = Math.min(2, maxChunks);
+    for (let i = 0; i < headPages; i += 1) {
       const message = await this.getTaskLog(taskInstanceId, { skipLineNum: skip, limit });
       if (!message) break;
-      chunks.push(message);
+      headChunks.push(message);
       const lines = message.split(/\r?\n/).length;
-      if (lines <= 1 && message.includes("[LOG-PATH]")) break;
+      if (lines <= 1 && message.includes("[LOG-PATH]")) {
+        return message;
+      }
       skip += Math.max(lines - 1, limit);
       if (lines < limit) break;
     }
-    return chunks.join("\n");
+
+    // Probe toward the end; keep the last non-empty full-ish pages.
+    const probes = [500, 2000, 8000, 20000, 50000, 100000];
+    let lastHitSkip = -1;
+    let lastHit = "";
+    for (const probe of probes) {
+      if (probe <= skip) continue;
+      const message = await this.getTaskLog(taskInstanceId, {
+        skipLineNum: probe,
+        limit,
+      });
+      if (!message) break;
+      const lines = message.split(/\r?\n/).filter((l) => l.trim()).length;
+      if (lines <= 1 && message.includes("[LOG-PATH]")) break;
+      if (lines === 0) break;
+      lastHitSkip = probe;
+      lastHit = message;
+      if (lines < Math.floor(limit * 0.25)) break;
+    }
+
+    const tailChunks = [];
+    if (lastHitSkip >= 0 && lastHit) {
+      const prevSkip = Math.max(skip, lastHitSkip - limit);
+      if (prevSkip < lastHitSkip) {
+        const prev = await this.getTaskLog(taskInstanceId, {
+          skipLineNum: prevSkip,
+          limit,
+        });
+        if (prev && prev !== lastHit) tailChunks.push(prev);
+      }
+      tailChunks.push(lastHit);
+    } else {
+      // Short log: continue sequential read from head cursor.
+      for (let i = headChunks.length; i < maxChunks; i += 1) {
+        const message = await this.getTaskLog(taskInstanceId, {
+          skipLineNum: skip,
+          limit,
+        });
+        if (!message) break;
+        headChunks.push(message);
+        const lines = message.split(/\r?\n/).length;
+        skip += Math.max(lines - 1, limit);
+        if (lines < limit) break;
+      }
+    }
+
+    const parts = [...headChunks];
+    if (tailChunks.length) {
+      parts.push("\n--- log tail ---\n", ...tailChunks);
+    }
+    return parts.join("\n");
   }
 
   /**
@@ -487,6 +550,109 @@ export function extractLogHighlights(logText, { maxLines = 25 } = {}) {
 const LOG_NOISE_RE =
   /^\s*(INFO\s*:)?\s*(Map\s+\d+:|Reducer\s+\d+:|Concurrency mode|Completed executing|Starting Job|Kill Command|number of splits|Hadoop job information|Stage-|Total MapReduce|Launching Job)/i;
 
+/** DS worker wrapper lines — never use as 原因/证据. */
+const DS_FRAMEWORK_NOISE_RE =
+  /^\[INFO\]\s+\d{4}-\d{2}-\d{2}.*\[taskAppId=TASK-/i;
+
+/** Safe HTTP query/body keys for alert facts (never auth/token/secret). */
+const HTTP_FACT_PARAM_KEYS = [
+  "countryCode",
+  "country",
+  "dataDate",
+  "partition_day",
+  "date",
+  "workPlanId",
+  "tableId",
+];
+
+/** Parse HTTP task failure facts for complete localization. */
+export function parseHttpFailure(logText = "") {
+  const log = String(logText || "");
+  const codeM =
+    log.match(/statusCode\s*[:=]\s*([45]\d{2})\b/i) ||
+    log.match(/statuscode\s*[:=]\s*([45]\d{2})\b/i) ||
+    log.match(/HTTP Status\s*([45]\d{2})\b/i);
+  const code = codeM?.[1] || "?";
+  // Prefer httpUrl: field from HttpTask logger; fall back to first URL
+  const httpUrlM = log.match(/httpUrl:\s*(https?:\/\/[^\s,]+)/i);
+  const urlM = httpUrlM || log.match(/https?:\/\/[^\s"'<>]+/i);
+  const url = urlM ? String(urlM[1] || urlM[0]).replace(/[,;]+$/, "") : "";
+  const costM = log.match(/costTime\s*[:=]\s*(\d+)\s*milliseconds/i);
+  const costMs = costM ? Number(costM[1]) : null;
+  const params = [];
+  const seen = new Set();
+  const isPlaceholder = (v) => /\$\{|^\s*$/.test(String(v || ""));
+  for (const key of HTTP_FACT_PARAM_KEYS) {
+    // DS HttpTask runtime: {"prop":"dataDate",...,"value":"2026-10-22"}
+    const jsonAll = [
+      ...log.matchAll(
+        new RegExp(
+          `"prop"\\s*:\\s*"${key}"[^\\n}]*?"value"\\s*:\\s*"([^"]*)"`,
+          "gi",
+        ),
+      ),
+    ];
+    const jsonVal = jsonAll.map((m) => m[1]).find((v) => !isPlaceholder(v));
+    const plainAll = [
+      ...log.matchAll(
+        new RegExp(`${key}\\s*[=:]\\s*([^\\s,&"']+)`, "gi"),
+      ),
+    ];
+    const plainVal = plainAll.map((m) => m[1]).find((v) => !isPlaceholder(v));
+    const val = jsonVal || plainVal;
+    if (!val || seen.has(key.toLowerCase())) continue;
+    seen.add(key.toLowerCase());
+    params.push(`${key}=${val}`);
+  }
+  const facts = [];
+  if (url) facts.push(`${url} → HTTP ${code}${costMs != null ? `（${costMs}ms）` : ""}`);
+  else facts.push(`HTTP ${code}${costMs != null ? `（${costMs}ms）` : ""}`);
+  if (params.length) facts.push(`参数 ${params.join(" ")}`);
+  return { code, url, costMs, params, facts };
+}
+
+/**
+ * True timeout failure — not HTTP/JDBC config keys like socketTimeout:60000.
+ * Old bug: HTTP task JSON contains "socketTimeout" → mislabeled 超时 + vague JDBC card.
+ */
+export function isRealTimeoutFailure(text = "") {
+  const s = String(text || "");
+  if (!s) return false;
+  // Strip common timeout *config* keys so they never drive classification
+  const scrubbed = s.replace(
+    /"(?:socket|connect|connection|read|write)?[Tt]imeout"\s*:\s*\d+/g,
+    "",
+  ).replace(
+    /\b(?:socket|connect|connection|read|write)?Timeout\s*[:=]\s*\d+/gi,
+    "",
+  );
+  return /SocketTimeoutException|ConnectTimeoutException|Read timed out|Connection timed out|query timed out|执行超时|任务超时|超时失败|Timed out|TimeoutException/i.test(
+    scrubbed,
+  );
+}
+
+/** Real failure signal (not bare exit code / framework INFO). */
+export function hasStrongFailureSignal(logText = "") {
+  const log = String(logText || "");
+  return /Error while processing statement|AnalysisException|SemanticException|ParseException|TTransportException|MetadataFetchFailed|FetchFailedException|OutOfMemoryError|Java heap space|InvalidInputException|Partition.+not found|Permission denied|matched:\s*false|状态:\s*dead|任务执行失败|FAILED:\s*Execution Error|Caused by:|statusCode\s*[:=]\s*[45]\d{2}|HTTP Status\s*[45]\d{2}|Must be:\s*200/i.test(
+    log,
+  );
+}
+
+/** exitStatusCode alone / INFO taskAppId — not enough to call SQL/JDBC. */
+export function isWeakExitOnlyEvidence(evidence = [], logText = "") {
+  if (hasStrongFailureSignal(logText)) return false;
+  const lines = (evidence || []).map((e) => String(e || "").trim()).filter(Boolean);
+  if (!lines.length) {
+    return /exitStatusCode:\s*[1-9]|processExitValue:\s*[1-9]|return code\s+[1-9]/i.test(
+      String(logText || ""),
+    );
+  }
+  return lines.every((l) =>
+    /^(exitStatusCode|processExitValue|return code)\s*:?\s*\d+\s*$/i.test(l),
+  );
+}
+
 /**
  * Pick a short, human key error for Feishu alert cards (1 line).
  */
@@ -498,12 +664,22 @@ export function extractAlertEvidence(logText, { maxEvidence = 1, maxLen = 100 } 
 
   const ranked = [];
   for (const line of all) {
+    // Never surface DS TaskLogLogger / taskAppId INFO as the alert "原因"
+    if (DS_FRAMEWORK_NOISE_RE.test(line)) continue;
+    if (
+      /TaskLogLogger/i.test(line) &&
+      !/Exception|Error while|matched:\s*false|状态:\s*dead|任务执行失败/i.test(line)
+    ) {
+      continue;
+    }
     let score = 0;
     // Data quality checker (kalo quality) — prefer over JSON "level":"ERROR" noise
     if (/expected:\s*\[[^\]]+\].*actual:\s*[\d.]+.*matched:\s*false/i.test(line)) score = 110;
     else if (/Checking val's value.*matched:\s*false/i.test(line)) score = 108;
     else if (/RuntimeException:.*Test [Cc]ase:/i.test(line)) score = 106;
     else if (/Error executing quality check/i.test(line)) score = 104;
+    else if (/statusCode\s*[:=]\s*[45]\d{2}|HTTP Status\s*[45]\d{2}|Must be:\s*200/i.test(line))
+      score = 105;
     else if (/Error while processing statement/i.test(line)) score = 100;
     else if (/MetadataFetchFailedException|FetchFailedException/i.test(line)) score = 98;
     else if (/Job aborted due to stage failure|failed the maximum allowable number of times/i.test(line))
@@ -518,10 +694,18 @@ export function extractAlertEvidence(logText, { maxEvidence = 1, maxLen = 100 } 
     else if (/Caused by:/i.test(line)) score = 80;
     else if (/状态:\s*dead/i.test(line)) score = 112;
     else if (/❌\s*任务执行失败/.test(line)) score = 110;
-    else if (/batches\/\d+\/log|Livy 详情|Batch ID:\s*\d+/i.test(line)) score = 95;
+    // Designed branch skip (country gate exit 1) — prefer over bare exitStatusCode→SQL/JDBC
+    else if (
+      /\bskip\b/i.test(line) &&
+      /(export|comment|for\s+[a-z]{2}\b|product\s+comment)/i.test(line)
+    ) {
+      score = 114;
+    } else if (/batches\/\d+\/log|Livy 详情|Batch ID:\s*\d+/i.test(line)) score = 95;
     else if (/UploadProductPic|Upload.*PicJob|pic\.search|主类:\s*\S+/i.test(line)) score = 88;
+    else if (/return code\s+[1-9]\d*\b/i.test(line) && /Error while|FAILED|Exception/i.test(line))
+      score = 92;
     else if (/return code\s+\d+|exitStatusCode:\s*[1-9]|processExitValue:\s*[1-9]/i.test(line))
-      score = 75;
+      score = 35; // weak alone — not enough for SQL/JDBC cause
     else if (/ERROR\s*:/i.test(line) && /FAILED|Exception|Error|quality/i.test(line)) score = 70;
     else if (/\bERROR\b/.test(line) && !/Status:\s*Failed/i.test(line)) score = 40;
     else continue;
@@ -583,13 +767,85 @@ export function extractAlertEvidence(logText, { maxEvidence = 1, maxLen = 100 } 
     cause = "内存不足 / OOM";
   } else if (/AnalysisException|SemanticException|ParseException/i.test(blob)) {
     cause = "SQL 语义/解析错误";
-  } else if (/return code\s+(\d+)/i.test(blob)) {
+  } else if (/return code\s+(\d+)/i.test(blob) && hasStrongFailureSignal(blob)) {
     cause = `引擎返回码 ${blob.match(/return code\s+(\d+)/i)[1]}`;
-  } else if (evidence[0]) {
+  } else if (evidence[0] && !isWeakExitOnlyEvidence(evidence, logText || blob)) {
     cause = evidence[0];
   }
 
-  return { cause, evidence, quality, livy };
+  // Do not override Livy/quality with skip heuristics.
+  const designedSkip =
+    !livy && !quality ? parseDesignedBranchSkip(logText || blob, null) : null;
+  if (designedSkip) {
+    cause = designedSkip.cause;
+    if (designedSkip.evidenceLine && !evidence.includes(designedSkip.evidenceLine)) {
+      evidence.unshift(designedSkip.evidenceLine);
+      if (evidence.length > maxEvidence) evidence.length = maxEvidence;
+    }
+  }
+
+  const weakExit = !designedSkip && isWeakExitOnlyEvidence(evidence, logText || blob);
+  if (weakExit && !livy && !quality) {
+    cause = "日志未抽出可定责报错（仅有退出码/框架 INFO）";
+  }
+
+  return { cause, evidence, quality, livy, designedSkip, weakExit };
+}
+
+/**
+ * Country/scope gate: SHELL check exits 1 on purpose so CONDITIONS routes to skip.
+ * Must not be classified as SQL/JDBC (rerun/FS would wrongly enter the export branch).
+ */
+export function parseDesignedBranchSkip(logText, task = null) {
+  const log = String(logText || "");
+  const name = String(task?.name || "");
+
+  const skipM =
+    log.match(/skip\s+product\s+comment[^\n]*/i) ||
+    log.match(/skip\s+[\w.\s/-]*export[^\n]*\bfor\s+([a-z]{2})\b[^\n]*/i) ||
+    log.match(/case\s+["']?([a-z]{2})["']?[^\n]*\bskip\b[^\n]*/i) ||
+    log.match(/\bskip\b[^\n]*\bfor\s+([a-z]{2})\b[^\n]*/i);
+
+  const exitOne =
+    /exitStatusCode:\s*1\b|processExitValue:\s*1\b|exit\s*code\s*:?\s*1\b|return code\s+1\b/i.test(
+      log,
+    );
+  const nameLooksGate =
+    /country\s*check|country\s*router|comment.*(?:country\s*)?check|(?:check|router).*country/i.test(
+      name,
+    );
+  const hasSqlException =
+    /Error while processing statement|AnalysisException|SemanticException|ParseException|TTransportException|MetadataFetchFailed|OutOfMemoryError/i.test(
+      log,
+    );
+
+  if (skipM && !hasSqlException) {
+    const country =
+      (skipM[1] && /^[a-z]{2}$/i.test(skipM[1]) ? skipM[1].toLowerCase() : null) ||
+      (skipM[0].match(/\bfor\s+([a-z]{2})\b/i) || [])[1]?.toLowerCase() ||
+      (skipM[0].match(/case\s+["']?([a-z]{2})/i) || [])[1]?.toLowerCase() ||
+      null;
+    return {
+      cause: country
+        ? `设计内分支跳过：${country} 不在导出范围（exit 1 → 条件走 skip）`
+        : "设计内分支跳过：检查脚本按约定 exit 1，条件节点跳过后续导出",
+      evidenceLine: clip(skipM[0], 100),
+      country,
+      exitOne: exitOne || true,
+    };
+  }
+
+  // Gate/router task + exit 1, no real engine/SQL exception → treat as designed skip
+  if (nameLooksGate && exitOne && !hasSqlException) {
+    return {
+      cause: `设计内分支跳过：检查/路由节点「${name}」exit 1（非 SQL 失败）`,
+      evidenceLine: null,
+      country: null,
+      exitOne: true,
+    };
+  }
+
+  return null;
 }
 
 /**
@@ -663,8 +919,16 @@ export function parseQualityFailure(logText) {
   let field = null;
   const caseM = log.match(/Test [Cc]ase:\s*([^\n]{0,80}?)(?:\s+for\s+|\s*$)/);
   if (caseM) field = caseM[1].replace(/\s+/g, " ").trim().slice(0, 60);
-  const tableM = log.match(/quality check for\s+([a-z0-9_.]+)/i);
-  const table = tableM ? tableM[1] : null;
+  // Prefer the failing suite near matched:false; else last quality check for …
+  const failCtx = log.slice(Math.max(0, log.search(/matched:\s*false/i) - 800));
+  const tableNear =
+    failCtx.match(/quality check for\s+([a-z0-9_.]+)/i) ||
+    failCtx.match(/test case suite:\s*([a-z0-9_.]+)/i);
+  const tableM =
+    tableNear ||
+    log.match(/quality check for\s+([a-z0-9_.]+)/gi)?.slice(-1)?.[0]?.match?.(/for\s+([a-z0-9_.]+)/i) ||
+    log.match(/quality check for\s+([a-z0-9_.]+)/i);
+  const table = tableNear?.[1] || (typeof tableM === "object" && tableM?.[1]) || null;
   const cause = field
     ? `质量校验未过：${field} 期望${expected} 实际${actual}`
     : `质量校验未过：期望${expected} 实际${actual}`;
@@ -676,6 +940,49 @@ export function parseQualityFailure(logText) {
     cause,
     evidenceLine: `expected:${expected}, actual:${actual}, matched:false`,
   };
+}
+
+/**
+ * Deterministic quality triage from expected/actual — no Hive/Agent required.
+ * Writes human-ready [已查]/[外部] so 现在做 is not "请你去查表".
+ */
+export function probeQualityBoundary(quality = {}) {
+  const expected = String(quality.expected || "");
+  const actual = Number(quality.actual);
+  const m = expected.match(/\[\s*([-\d.eE]+)\s*,\s*([-\d.eE]+)\s*\]/);
+  if (!m || !Number.isFinite(actual)) return null;
+  const lo = Number(m[1]);
+  const hi = Number(m[2]);
+  if (![lo, hi].every(Number.isFinite)) return null;
+  const below = actual < lo;
+  const above = actual > hi;
+  const margin = below ? lo - actual : above ? actual - hi : 0;
+  const span = Math.abs(hi - lo) || 1;
+  const rel = margin / span;
+  const field = quality.field || "指标";
+  const table = quality.table || "质量表";
+  let kind;
+  let checked;
+  if (!below && !above) {
+    kind = "in_range";
+    checked = `[已查] ${field} 实际=${actual} 已在期望${expected}内（复查日志）`;
+  } else if (rel < 0.02) {
+    kind = "boundary";
+    checked = `[已查] ${field} 实际=${actual} 期望${expected}：贴${below ? "下" : "上"}沿越界 ${margin.toPrecision(3)}（相对区间 ${(rel * 100).toFixed(2)}%），偏边界波动，非数量级异常`;
+  } else if (rel < 0.1) {
+    kind = "mild";
+    checked = `[已查] ${field} 实际=${actual} 期望${expected}：轻度越界 ${margin.toPrecision(3)}，优先核 ${table} 失败日是否回刷/口径变更`;
+  } else {
+    kind = "severe";
+    checked = `[已查] ${field} 实际=${actual} 期望${expected}：明显越界 ${margin.toPrecision(3)}，优先查 ${table} 重复入库/回刷/业务暴增`;
+  }
+  const external =
+    kind === "boundary"
+      ? "[外部] 边界波动：业务确认后微调阈值，或核对当日汇率/币种回刷，再重跑 QUALITY"
+      : kind === "severe" || kind === "mild"
+        ? `[外部] 先核 ${table} 失败日分区；数据错→修数后再跑质量，波动合理→调阈值`
+        : "[外部] 核对质量任务日志后决定修数或调阈值";
+  return { kind, checked, external, margin, rel };
 }
 
 /** Strip DS/beeline wrappers; keep exception name + short message. */
@@ -787,13 +1094,48 @@ export function classifyFailure({ task, logText = "", purged = false } = {}) {
   const { rawScript, sqlFile, vars, varsMap } = parseTaskScript(task || {});
   const log = String(logText || "");
   const signal = extractAlertEvidence(log);
+  const designedSkip =
+    signal.designedSkip || parseDesignedBranchSkip(log, task);
   const livy = signal.livy || parseLivyFailure(log);
+  const weakExit =
+    Boolean(signal.weakExit) ||
+    (!designedSkip && !livy && isWeakExitOnlyEvidence(signal.evidence, log));
   const fixes = [];
   let where = "任务执行失败（详见证据）";
   let category = "未知";
 
-  // 1) Log-first (avoid false "分区" from template params in rawScript).
-  if (livy) {
+  // 0) Designed branch skip before JDBC (exit 1 + skip text is expected routing).
+  if (designedSkip) {
+    category = "分支跳过";
+    where = designedSkip.cause;
+    fixes.push("不要重跑该检查/路由节点，也不要强制成功（会误入被跳过的导出分支）");
+    fixes.push("核对同实例 skip 节点是否 SUCCESS，目标导出 SQL 是否未执行");
+    fixes.push("工作流最终 SUCCESS 即可；仅当 skip 未成功或整实例 FAILURE 再升级");
+  } else if (weakExit) {
+    // Bare exitStatusCode / framework INFO — do NOT pretend it is SQL/JDBC.
+    category = "证据不足";
+    where =
+      "拉到的日志没有 Exception/SQL 报错行，只有退出码或 DS INFO；无法定责，禁止空话「处理完后重跑」";
+    signal.cause = "日志未抽出可定责报错（仅有退出码/框架 INFO）";
+    signal.evidence = [
+      "（无 Exception 行 — 长任务请看日志末尾，勿把 [INFO] taskAppId 当原因）",
+    ];
+    fixes.push(
+      task?.id
+        ? `点「看日志」或发 /log ${task.id}，从日志末尾找 Exception / Error while processing`
+        : "打开任务完整日志，从末尾找 Exception / Error while processing",
+    );
+    fixes.push(
+      task?.processInstanceId
+        ? `把含 Exception 的 5～10 行贴回，或发 /diagnose ${task.processInstanceId}`
+        : "把含 Exception 的 5～10 行贴回，或发 /diagnose <实例id>",
+    );
+    if (sqlFile) {
+      fixes.push(`若日志确认是脚本问题，再对照 ${sqlFile}；未看到报错前不要改仓库`);
+    } else {
+      fixes.push("日志若只有 [LOG-PATH]：到 DS UI 打开 Worker 完整日志再贴关键行");
+    }
+  } else if (livy) {
     const L = livy;
     category = "Livy/Spark提交";
     where =
@@ -818,9 +1160,36 @@ export function classifyFailure({ task, logText = "", purged = false } = {}) {
     where =
       q?.cause ||
       "质量校验未通过（指标超出设定区间），不是 JDBC/SQL 语法失败";
-    fixes.push("先查对应表分区指标是否业务异常（重复、回刷、口径变更）");
-    fixes.push("数据确实错 → 修数/重跑上游；波动合理 → 与业务对齐后调质量阈值");
+    signal.quality = q || signal.quality;
+    const qb = q ? probeQualityBoundary(q) : null;
+    if (qb) {
+      fixes.push(qb.checked);
+      fixes.push(qb.external);
+      signal.qualityProbe = qb;
+    } else {
+      fixes.push("先查对应表分区指标是否业务异常（重复、回刷、口径变更）");
+      fixes.push("数据确实错 → 修数/重跑上游；波动合理 → 与业务对齐后调质量阈值");
+    }
     fixes.push("不要把父 stage/SUB_PROCESS 红当成独立根因");
+  } else if (
+    /statusCode\s*[:=]\s*([45]\d{2})\b|HTTP Status\s*([45]\d{2})\b|Must be:\s*200/i.test(
+      log,
+    )
+  ) {
+    const http = parseHttpFailure(log);
+    category = "HTTP下游";
+    where =
+      signal.cause ||
+      `HTTP ${http.code}${http.url ? ` ${http.url}` : ""} → 非 200`;
+    signal.cause = signal.cause || `HTTP ${http.code}${http.costMs != null ? `（${http.costMs}ms）` : ""}`;
+    signal.evidence = http.facts.length ? http.facts : signal.evidence;
+    signal.http = http;
+    fixes.push(
+      http.code === "403" || http.code === "401"
+        ? "[外部] 修下游鉴权/IP白名单/WAF，确认可返回 200"
+        : `[外部] 修下游至 HTTP 200（当前 ${http.code}）`,
+    );
+    fixes.push("[Bot] 点「一键重跑」→ 确认");
   } else if (/TTransportException|Socket closed|Could not open client transport|Connection refused/i.test(log)) {
     category = "连接/会话";
     where =
@@ -868,7 +1237,10 @@ export function classifyFailure({ task, logText = "", purged = false } = {}) {
     category = "SQL";
     where = signal.cause || (sqlFile ? `SQL 错误：${sqlFile}` : "SQL 语义/解析错误");
     fixes.push(sqlFile ? `打开 ${sqlFile} 对照报错行修改` : "对照日志里的 AnalysisException 改 SQL");
-  } else if (signal.cause || /Error while processing statement|Execution Error|return code/i.test(log)) {
+  } else if (
+    hasStrongFailureSignal(log) &&
+    (signal.cause || /Error while processing statement|Execution Error|return code/i.test(log))
+  ) {
     category = "SQL/JDBC";
     where = signal.cause || (sqlFile ? `JDBC 脚本执行失败：${sqlFile}` : "JDBC/Shell SQL 任务失败");
     fixes.push(sqlFile ? `打开 ${sqlFile}，对照失败时刻参数复跑` : "打开该任务 rawScript 中的 SQL 复跑");
@@ -887,10 +1259,10 @@ export function classifyFailure({ task, logText = "", purged = false } = {}) {
     fixes.push(sqlFile ? `打开仓库/资源里的 ${sqlFile}，对照失败时刻的参数复跑` : "打开该任务 rawScript 中的 SQL 复跑");
     fixes.push("看是否依赖上游表/分区未就绪（先查上游实例是否 SUCCESS）");
     if (vars.length) fixes.push(`核对参数：${vars.join(", ")}`);
-  } else if (/timeout|超时|SocketTimeout/i.test(`${rawScript}\n${log}`)) {
+  } else if (isRealTimeoutFailure(`${rawScript}\n${log}`)) {
     category = "超时";
-    where = "任务或连接超时";
-    fixes.push("检查下游拥堵、锁表、或加大超时配置");
+    where = "任务或连接超时（读到真实超时报错，不是配置里的 socketTimeout 字段）";
+    fixes.push("查下游拥堵/锁表；必要时加大超时或拆批");
   } else {
     category = "执行失败";
     where = task?.name ? `任务「${task.name}」失败` : "任务失败";
@@ -928,179 +1300,25 @@ export function classifyFailure({ task, logText = "", purged = false } = {}) {
     cause: signal.cause || playbook.cause || null,
     evidence: signal.evidence,
     verdict: playbook.verdict,
+    severity: playbook.severity || "P2",
+    allowRerun: playbook.allowRerun !== false,
+    dont: playbook.dont || [],
+    verify: playbook.verify || [],
+    escalate: playbook.escalate || "",
     quality: signal.quality || null,
+    qualityProbe: signal.qualityProbe || null,
     livy: signal.livy || livy || null,
+    designedSkip: designedSkip || null,
+    http: signal.http || null,
+    facts: signal.http?.facts || signal.evidence || [],
+    probeSource: signal.qualityProbe ? "quality_boundary" : undefined,
+    probeLines: signal.qualityProbe
+      ? [`已查：${String(signal.qualityProbe.checked || "").replace(/^\[已查\]\s*/, "")}`]
+      : undefined,
   };
 }
 
-/**
- * Concrete「怎么导致的 / 现在怎么做」— avoid "请再去排查" style.
- */
-export function buildActionPlaybook({
-  category,
-  log = "",
-  sqlFile = null,
-  signal = {},
-  task = null,
-  nearbyFailureCount = 0,
-  retryRunning = false,
-  workflowState = "",
-  processInstanceId = null,
-  dsReadonly = false,
-} = {}) {
-  const instId = processInstanceId || task?.processInstanceId || null;
-  const script = sqlFile ? String(sqlFile) : null;
-  const wf = String(workflowState || "").toUpperCase();
-  const rerunHint = dsReadonly
-    ? "到 DS UI 对该实例「恢复失败节点」"
-    : instId
-      ? `飞书回「重跑 ${instId}」→ 再回 YES（从失败处恢复）`
-      : "飞书回「重跑 <实例id>」→ YES";
-
-  let mechanism = "";
-  let cause = signal.cause || null;
-  let verdict = "";
-  const actions = [];
-
-  if (category === "数据质量" || signal.quality || /expected:\s*\[[^\]]+\].*actual:.*matched:\s*false/i.test(log)) {
-    const q = signal.quality || parseQualityFailure(log) || {};
-    mechanism = q.table
-      ? `质量门禁未过：表 ${q.table} 上指标超出设定区间（期望${q.expected}，实际${q.actual}）。JDBC/脚本可能已跑成功，是校验任务拦下的。`
-      : `质量门禁未过：指标超出设定区间（${q.cause || "见报错 expected/actual"}）。不是 SQL 语法错误。`;
-    cause = q.cause || cause || "质量校验未通过";
-    verdict = "判定：数据质量阈值未过";
-    actions.push(
-      q.table
-        ? `查 ${q.table} 失败日分区指标是否异常（重复入库/回刷/业务暴增）`
-        : "查质量任务对应表分区，确认指标是否业务异常",
-    );
-    actions.push("数据错 → 修数后再跑质量；波动合理 → 业务确认后调阈值，再重跑 QUALITY");
-    actions.push(`恢复：${rerunHint}（针对 QUALITY/叶子任务，不必对父 STAGE 连点）`);
-  } else if (category === "Livy/Spark提交" || signal.livy || (/状态:\s*dead/i.test(log) && /Livy|batches\//i.test(log))) {
-    const L = signal.livy || parseLivyFailure(log) || {};
-    mechanism = L.nullDriver || L.quickDead
-      ? "SHELL 脚本经 Livy 提交 Spark 批任务后秒级 dead，driver 未起来（driverLogUrl/sparkUiUrl 均为 null）。不是 JDBC/SQL，真因在 Livy/YARN 侧。"
-      : "SHELL → Livy Spark 批任务失败；DS 任务日志只有摘要，堆栈在 Livy batch log。";
-    cause = L.cause || cause || "Livy Spark 批任务失败";
-    verdict = "判定：先查 Livy batch 日志，再决定是否重跑";
-    if (L.livyLogUrl) {
-      actions.push(`打开 ${L.livyLogUrl} 看 dead 前 Exception（OOM/权限/依赖/OSS）`);
-    } else if (L.batchId) {
-      actions.push(`Livy batches/${L.batchId}/log 看应用真因`);
-    } else {
-      actions.push("从 DS 任务日志复制 Livy「查看日志」URL，打开看 dead 前堆栈");
-    }
-    actions.push(
-      L.nullDriver || L.quickDead
-        ? "秒级 dead + 无 driver 日志 → 查 EMR/YARN 资源与 Livy 队列，勿当分区/SQL 问题"
-        : "按 Livy 堆栈修：资源/权限/依赖/OSS 凭证",
-    );
-    if (nearbyFailureCount >= 2) {
-      actions.push(`同窗另有 ${nearbyFailureCount} 个同类失败 → 按集群/Livy 面处理后再批量 ${rerunHint}`);
-    } else {
-      actions.push(`根因处理后 ${rerunHint}；未看 Livy 日志前不要盲重跑`);
-    }
-  } else if (
-    category === "引擎/集群" ||
-    /MetadataFetchFailed|FetchFailedException|stage failure|TezTask|NodeId\.getHost/i.test(log)
-  ) {
-    if (/MetadataFetchFailed|Missing an output location for shuffle|broadcasted map statuses/i.test(log)) {
-      mechanism =
-        "Spark 在 shuffle 阶段读不到某分区输出（MetadataFetchFailed）。常见：executor 丢失/节点抖动导致 shuffle 文件缺失——不是 SQL 语法或分区参数写错。";
-      cause = cause || "Spark shuffle 丢分区（MetadataFetchFailed）";
-      verdict = "判定：集群/引擎抖动（瞬时）";
-    } else if (/TezTask|NodeId\.getHost|TA_OUTPUT_FAILED/i.test(log)) {
-      mechanism =
-        "Hive Tez/YARN TaskAttempt 异常（节点或 attempt 丢失）。偏执行引擎侧，不是业务 SQL 写错。";
-      cause = cause || "Hive Tez/YARN TaskAttempt 异常";
-      verdict = "判定：集群/引擎抖动（瞬时）";
-    } else {
-      mechanism = "Spark/Hive 引擎执行阶段失败（stage/attempt），优先当集群抖动。";
-      verdict = "判定：引擎/集群";
-    }
-    if (
-      retryRunning ||
-      (/RUNNING/.test(wf) &&
-        Number(task?.maxRetryTimes || 0) > Number(task?.retryTimes || 0))
-    ) {
-      actions.push("DS 仍在自动重试或实例还在跑 → 先等这一轮；变绿则不用管");
-    }
-    actions.push(`若最终仍红 → ${rerunHint}`);
-    if (nearbyFailureCount >= 2) {
-      actions.push(
-        `同约 30 分钟内至少 ${nearbyFailureCount} 个任务失败 → 按集群面处理，不要改 ${script || "业务 SQL"}`,
-      );
-    } else {
-      actions.push(
-        script
-          ? `不要改 ${script}；单次失败优先重跑，短时反复再找平台看 YARN/磁盘`
-          : "单次失败优先重跑；短时反复再找平台看 YARN/磁盘",
-      );
-    }
-  } else if (category === "连接/会话") {
-    mechanism =
-      "HiveServer/Thrift 会话中断（连接被踢、HS2 重启或网络抖动），语句可能执行到一半掉线。";
-    verdict = "判定：连接/会话中断";
-    actions.push(`直接 ${rerunHint}`);
-    if (nearbyFailureCount >= 2) {
-      actions.push(`同窗 ${nearbyFailureCount} 个失败 → 等 HS2/网络稳定后再批量恢复，别改 SQL`);
-    }
-  } else if (category === "分区/路径") {
-    const day = extractVarHint(task, "partition_day");
-    const country = extractVarHint(task, "country") || extractVarHint(task, "country_code");
-    mechanism = "读表时分区或路径不存在（参数指到空分区，或上游未产出）。";
-    verdict = "判定：分区/路径缺失（需补数或改参数）";
-    actions.push(
-      `核对参数${country ? ` country=${country}` : ""}${day ? ` partition_day=${day}` : ""} 是否已有分区`,
-    );
-    actions.push("上游未就绪则等上游 SUCCESS；参数错了则改 DS 参数");
-    actions.push(`补齐后再 ${rerunHint}`);
-  } else if (category === "权限") {
-    mechanism = "执行账号对 HDFS/S3/表无权限。";
-    verdict = "判定：权限不足（重跑无效）";
-    actions.push("找平台/数据源管理员开权限；修好前不要反复重跑");
-  } else if (category === "资源") {
-    mechanism = "容器内存不足或被 YARN 杀掉（OOM / exit 137）。";
-    verdict = "判定：资源不足";
-    actions.push("加大 executor/driver 内存，或拆小扫描范围后再重跑");
-    actions.push(`资源调完后 ${rerunHint}`);
-  } else if (category === "SQL") {
-    mechanism = "SQL 语义/解析错误（字段、表名、语法）。";
-    verdict = "判定：SQL 需改代码";
-    actions.push(script ? `改仓库 ${script} 对照报错后发布` : "按 AnalysisException 改 SQL 后发布");
-    actions.push(`上线后再 ${rerunHint}`);
-  } else if (category === "SQL/JDBC" || category === "超时" || category === "执行失败") {
-    mechanism = signal.cause
-      ? `任务执行失败：${signal.cause}`
-      : script
-        ? `JDBC 脚本 ${script} 执行失败（见报错行）`
-        : "JDBC/任务执行失败";
-    verdict = "判定：需按报错处理后再跑";
-    if (script) actions.push(`用失败时刻参数确认 ${script} 依赖是否就绪`);
-    actions.push(`处理完后 ${rerunHint}`);
-  } else {
-    mechanism = signal.cause || "未能从日志归到明确类型";
-    verdict = "判定：信息不足";
-    actions.push(`先 ${rerunHint}；若再挂把完整 Exception 贴给我`);
-  }
-
-  return {
-    mechanism,
-    cause,
-    verdict,
-    actions: actions.slice(0, 4),
-  };
-}
-
-function extractVarHint(task, prop) {
-  try {
-    const { varsMap } = parseTaskScript(task || {});
-    const v = varsMap?.[prop];
-    return v ? String(v) : "";
-  } catch {
-    return "";
-  }
-}
+// buildActionPlaybook / applyPlaybookToClassification → alert_playbook.mjs
 
 export function formatPracticalDiagnosis({
   inst,

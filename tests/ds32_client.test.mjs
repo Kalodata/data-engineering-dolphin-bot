@@ -162,6 +162,77 @@ test("quality failure is classified with expected/actual", () => {
   assert.ok(c.fixes.some((f) => /阈值|修数|指标/.test(f)));
 });
 
+test("INFO taskAppId + bare exitStatusCode is 证据不足 not SQL/JDBC", () => {
+  const log = `
+[INFO] 2026-10-23 08:50:51.245 +0800 [taskAppId=TASK-20261023-17978380499424_50-2333469-11436097] TaskLogLogger-11436097:[1] - -> start
+exitStatusCode:1
+`;
+  const s = extractAlertEvidence(log);
+  assert.equal(s.weakExit, true);
+  assert.doesNotMatch(s.cause || "", /taskAppId/);
+  const c = classifyFailure({
+    task: {
+      id: 11436097,
+      name: "为游客模式功能生成数据",
+      taskType: "SHELL",
+      processInstanceId: 2333469,
+    },
+    logText: log,
+  });
+  assert.equal(c.category, "证据不足");
+  assert.equal(c.allowRerun, false);
+  assert.match(c.verdict || "", /证据不足|补日志/);
+  assert.ok(c.fixes.some((f) => /\/log 11436097|看日志|末尾/.test(f)));
+  assert.ok(c.fixes.every((f) => !/处理完后/.test(f)));
+  assert.ok((c.dont || []).some((d) => /盲重跑|taskAppId|exitStatusCode/.test(d)));
+});
+
+test("designed country gate skip is not SQL/JDBC", () => {
+  const log = `
+case "br"
+skip product comment export for br
+exitStatusCode:1
+`;
+  const s = extractAlertEvidence(log);
+  assert.match(s.cause || "", /分支跳过|br/);
+  assert.ok(s.designedSkip);
+  const c = classifyFailure({
+    task: {
+      id: 11428881,
+      name: "product comment country check",
+      taskType: "SHELL",
+      processInstanceId: 2332183,
+    },
+    logText: log,
+  });
+  assert.equal(c.category, "分支跳过");
+  assert.match(c.verdict || "", /分支跳过|预期/);
+  assert.equal(c.severity, "P3");
+  assert.equal(c.allowRerun, false);
+  assert.ok((c.dont || []).some((d) => /不要重跑|强制成功/.test(d)));
+  assert.ok(c.fixes.every((f) => !/打开.*\.sql|复跑/.test(f)));
+  const p = buildActionPlaybook({
+    category: c.category,
+    log,
+    signal: { cause: c.cause, designedSkip: c.designedSkip },
+    task: { id: 11428881, processInstanceId: 2332183 },
+  });
+  assert.match(p.verdict, /分支跳过/);
+  assert.ok(p.dont.some((d) => /不要重跑|强制成功/.test(d)));
+});
+
+test("country check exit 1 without SQL exception is designed skip", () => {
+  const c = classifyFailure({
+    task: {
+      name: "product comment country router",
+      taskType: "CONDITIONS",
+      processInstanceId: 1,
+    },
+    logText: "exitStatusCode:1\nprocessExitValue:1\n",
+  });
+  assert.equal(c.category, "分支跳过");
+});
+
 test("Livy UploadProductPic dead is not JDBC", () => {
   const log = `
 	Livy URL: http://172.31.67.156:8998
@@ -198,6 +269,73 @@ test("Livy UploadProductPic dead is not JDBC", () => {
   assert.match(c.verdict || "", /Livy/);
   assert.ok(c.fixes.some((f) => /batches\/4488\/log|Livy/.test(f)));
   assert.ok(c.fixes.some((f) => /YARN|队列|盲重跑|不要当|勿当/.test(f)));
+});
+
+test("quality boundary probe fills [已查] instead of 请人查表", () => {
+  const log = `
+Executing quality check for kalo_data_online.dwd_product_detail_api
+Test Case: 货币单位检验
+expected:[-40,1000], actual:-40.10256190264735, matched:false
+exitStatusCode:1
+`;
+  const c = classifyFailure({
+    task: {
+      id: 11438719,
+      name: "QUALITY TASK",
+      taskType: "SHELL",
+      processInstanceId: 2333945,
+    },
+    logText: log,
+  });
+  assert.equal(c.category, "数据质量");
+  assert.ok(c.fixes[0].startsWith("[已查]"));
+  assert.match(c.fixes[0], /边界|贴下沿|越界/);
+  assert.ok(c.fixes.some((f) => /^\[外部\]|^\[Bot\]|一键重跑|调阈值/.test(f)));
+  assert.ok(!c.fixes.some((f) => /^查 .+失败日分区/.test(f)));
+});
+
+test("socketTimeout config alone is not 超时 category", () => {
+  const log = `
+http task params {"socketTimeout":60000,"connectTimeout":60000}
+httpUrl: http://172.31.61.3/x, statusCode : 403, Must be: 200
+exitStatusCode:1
+`;
+  const c = classifyFailure({
+    task: { id: 1, name: "触发采集验收", taskType: "HTTP", processInstanceId: 2 },
+    logText: log,
+  });
+  assert.equal(c.category, "HTTP下游");
+  assert.notEqual(c.category, "超时");
+  assert.match(c.verdict || "", /403/);
+});
+
+test("classifyFailure HTTP 403 packs [外部]+[Bot] with facts", () => {
+  const log = `
+[INFO] http request params：{"prop":"dataDate","httpParametersType":"PARAMETER","value":"2026-10-22"}
+[INFO] http request params：{"prop":"Authorization","httpParametersType":"HEADERS","value":"secret-token"}
+[INFO] startTime: 2026-10-23 10:51:18, httpUrl: http://172.31.61.3/workPlanAccept/updateFeishuTableStatus, httpMethod: GET, costTime : 13 milliseconds, statusCode : 403, body : <h1>HTTP Status 403 – Forbidden</h1>, log : http://172.31.61.3/workPlanAccept/updateFeishuTableStatus statuscode: 403, Must be: 200
+exitStatusCode:1
+`;
+  const c = classifyFailure({
+    task: {
+      id: 11437715,
+      name: "触发采集验收",
+      taskType: "HTTP",
+      processInstanceId: 2333822,
+    },
+    logText: log,
+  });
+  assert.equal(c.category, "HTTP下游");
+  assert.equal(c.severity, "P1");
+  assert.match(c.verdict || "", /403 鉴权/);
+  assert.equal(c.http?.code, "403");
+  assert.ok(c.facts.some((f) => /workPlanAccept.*→ HTTP 403/.test(f)));
+  assert.ok(c.facts.some((f) => /dataDate=2026-10-22/.test(f)));
+  assert.ok(!c.facts.some((f) => /secret-token|Authorization/i.test(f)));
+  assert.match(c.fixes[0], /^\[外部\].*(鉴权|200)/);
+  assert.ok(c.fixes.some((f) => /\[Bot\].*一键重跑/.test(f)));
+  assert.ok(!c.fixes.some((f) => /172\.31|http:\/\//i.test(f)));
+  assert.equal(c.allowRerun, true);
 });
 
 test("formatFailedList includes next step", () => {

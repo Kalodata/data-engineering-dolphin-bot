@@ -27,7 +27,8 @@
         { "name": "DS_API_URL", "value": "https://ds-offline.kalowave.com/dolphinscheduler" },
         { "name": "DS_PROJECT_CODE", "value": "9892432515424" },
         { "name": "DS_READONLY", "value": "false" },
-        { "name": "NODE_ENV", "value": "production" }
+        { "name": "NODE_ENV", "value": "production" },
+        { "name": "HIVE_JDBC_JAR", "value": "/app/lib/hive-jdbc-standalone.jar" }
       ],
       "secrets": [
         {
@@ -49,6 +50,10 @@
         {
           "name": "FEISHU_VERIFICATION_TOKEN",
           "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/feishu-verification-token"
+        },
+        {
+          "name": "HIVE_JDBC_URL",
+          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/hive-jdbc-url"
         }
       ],
       "healthCheck": {

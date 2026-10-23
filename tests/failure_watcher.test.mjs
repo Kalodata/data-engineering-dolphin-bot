@@ -179,7 +179,9 @@ test("seed then notify only new task ids", async () => {
   assert.equal(second.seeded, false);
   assert.equal(second.alerts.length, 1);
   assert.equal(second.alerts[0].taskId, 101);
-  assert.match(second.alerts[0].text, /工作流告警/);
+  assert.match(second.alerts[0].text, /原因：/);
+  assert.match(second.alerts[0].text, /现在做：/);
+  assert.doesNotMatch(second.alerts[0].text, /【不要】/);
 });
 
 test("self-healed failure is not pushed", async () => {
@@ -344,24 +346,28 @@ test("format alert report is short and actionable", () => {
       cause: "Hive Tez 引擎执行失败",
       mechanism:
         "Hive Tez/YARN TaskAttempt 异常（节点或 attempt 丢失）。偏执行引擎侧，不是业务 SQL 写错。",
-      verdict: "判定：集群/引擎抖动（瞬时）",
+      verdict: "集群/引擎抖动（瞬时）",
+      severity: "P2",
+      allowRerun: true,
+      dont: ["不要改 a.sql"],
+      verify: ["任务 SUCCESS"],
+      escalate: "短时反复 → 升平台",
       sqlFile: "a.sql",
       evidence: ["Error while processing statement: return code 2 from TezTask"],
-      fixes: ["飞书回「重跑 42」→ 再回 YES（从失败处恢复）", "不要改 a.sql；单次失败优先重跑"],
+      fixes: ["飞书回「重跑 42」→ 再回 YES（从失败处恢复）", "单次失败优先重跑"],
     },
     highlight: { purged: false, lines: [], evidence: [] },
   });
   assert.match(text, /原因：/);
+  assert.match(text, /判定：/);
   assert.match(text, /现在做：/);
-  assert.match(text, /\/diagnose 42/);
+  assert.match(text, /类别：/);
+  assert.doesNotMatch(text, /【不要】/);
+  assert.doesNotMatch(text, /处理完后/);
   assert.match(text, /a\.sql/);
-  assert.match(
-    text,
-    /位置：https:\/\/ds-offline\.kalowave\.com\/dolphinscheduler\/ui\/projects\/9892432515424\/workflow\/instances\/42\?code=17954605828064/,
-  );
   assert.doesNotMatch(text, /Map 1:/);
   assert.doesNotMatch(text, /代码\/Git/);
-  assert.ok(text.split("\n").length <= 24);
+  assert.ok(text.split("\n").length <= 36);
 });
 
 test("alertFacingRepoLines drops Cloud dumps", () => {
