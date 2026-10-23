@@ -4,6 +4,7 @@ FROM node:22-bookworm-slim
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates curl tini openjdk-17-jre-headless \
+    python3 make g++ \
   && rm -rf /var/lib/apt/lists/*
 
 # Feishu event consumer (bot uses `lark-cli event consume`)
@@ -20,7 +21,12 @@ RUN mkdir -p /app/lib /app/scripts/hive-ro \
   && test -s /app/lib/hive-jdbc-standalone.jar
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+# sqlite3 (lark-cli transitive) needs native rebuild on Node 22; drop compilers after
+RUN npm ci --omit=dev \
+  && apt-get update \
+  && apt-get purge -y python3 make g++ \
+  && apt-get autoremove -y \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY src ./src
 COPY mcp ./mcp
