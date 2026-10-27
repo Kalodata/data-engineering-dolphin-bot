@@ -57,21 +57,31 @@ export function resolveJobProcessInstanceId(job = {}, _hit = {}) {
   return Number.isFinite(id) && id > 0 ? id : null;
 }
 
-/** Flatten hits → Top SQL rows sorted by seconds. */
-export function collectTopSqlRows(hits = [], { limit = 8 } = {}) {
+/**
+ * Flatten hits → Top SQL rows sorted by seconds.
+ * @param {{ limit?: number, minSec?: number, allowJobFallback?: boolean }} [opts]
+ *   limit≤0 → no cap (caller should still bound for Feishu). minSec filters Beeline sec.
+ */
+export function collectTopSqlRows(
+  hits = [],
+  { limit = 8, minSec = 0, allowJobFallback = true } = {},
+) {
+  const min = Math.max(0, Number(minSec) || 0);
   const rows = [];
   for (const hit of hits || []) {
     for (const job of hit.jobs || []) {
       const script = scriptBase(job.taskScript || job.sqlScriptPath || job.name || "");
       const processInstanceId = resolveJobProcessInstanceId(job, hit);
       for (const s of job.sqlTop || []) {
+        const sec = Number(s.sec) || 0;
+        if (sec < min) continue;
         const label = sqlLabel(s, script);
         const rawTbl = String(s.table || "").trim();
         // Avoid "script · script" when display name is already the job script
         const sqlBit =
           label && script && label.replace(/…$/, "") === script ? "" : label;
         rows.push({
-          sec: Number(s.sec) || 0,
+          sec,
           secExact: s.secExact || String(s.sec ?? ""),
           secLabel: s.secLabel || `${Math.round(s.sec || 0)}s`,
           durationLine:
@@ -96,7 +106,13 @@ export function collectTopSqlRows(hits = [], { limit = 8 } = {}) {
     }
   }
   rows.sort((a, b) => b.sec - a.sec);
-  if (rows.length) return rows.slice(0, limit);
+  if (rows.length) {
+    const lim = Number(limit);
+    if (!Number.isFinite(lim) || lim <= 0) return rows;
+    return rows.slice(0, lim);
+  }
+
+  if (!allowJobFallback || min > 0) return [];
 
   const jobs = [];
   for (const hit of hits || []) {
@@ -121,7 +137,9 @@ export function collectTopSqlRows(hits = [], { limit = 8 } = {}) {
     }
   }
   jobs.sort((a, b) => b.sec - a.sec);
-  return jobs.slice(0, limit);
+  const lim = Number(limit);
+  if (!Number.isFinite(lim) || lim <= 0) return jobs;
+  return jobs.slice(0, lim);
 }
 
 export function pickSlowestJob(hits = []) {
@@ -152,10 +170,16 @@ export function formatSlowMarkdown(result = {}, opts = {}) {
     selectedInstances = null,
     enrichSql = false,
   } = result;
-  const { uiUrlBuilder = null } = opts;
+  const {
+    uiUrlBuilder = null,
+    sqlLimit = 8,
+    sqlMinSec = 0,
+  } = opts;
 
   const stageM = Math.round(Number(stageMinSec || 0) / 60) || 15;
   const jobM = Math.round(Number(jobMinSec || 0) / 60) || 5;
+  const sqlMinM = Math.round(Number(sqlMinSec || 0) / 60);
+  const listAll = sqlMinSec > 0 || Number(sqlLimit) <= 0 || Number(sqlLimit) > 8;
   const dates = [
     ...new Set(
       (selectedInstances || [])
@@ -169,15 +193,32 @@ export function formatSlowMarkdown(result = {}, opts = {}) {
     (countries || []).map((c) => String(c).toUpperCase()).join("+") || "ALL";
 
   const lines = [];
-  lines.push(
-    `**${countryLabel} · ${dateLabel} · SUCCESS**（stage≥${stageM}m / job≥${jobM}m）`,
-  );
+  const gate =
+    sqlMinM > 0
+      ? `Beeline SQL≥${sqlMinM}m（单位=语句秒数，不是 job 墙钟）`
+      : `stage≥${stageM}m / job≥${jobM}m`;
+  lines.push(`**${countryLabel} · ${dateLabel} · SUCCESS**（${gate}）`);
 
-  const topSql = collectTopSqlRows(hits, { limit: 8 });
+  const cappedLimit =
+    Number(sqlLimit) <= 0 ? 40 : Math.min(Math.max(Number(sqlLimit) || 8, 1), 40);
+  const allMatching = collectTopSqlRows(hits, {
+    limit: 0,
+    minSec: sqlMinSec,
+    allowJobFallback: sqlMinSec <= 0,
+  });
+  const topSql = allMatching.slice(0, cappedLimit);
   if (topSql.length) {
     lines.push("");
     // 对比单位=Beeline 语句（跨全部数仓 job），job 只是归属
-    lines.push(`**最慢 Beeline SQL**（跨数仓 job 全局比；下拉看该截 SQL）`);
+    const title =
+      sqlMinM > 0
+        ? `**Beeline SQL≥${sqlMinM}m**（跨数仓全局；共 ${allMatching.length} 条${
+            allMatching.length > topSql.length ? `，下列前 ${topSql.length}` : "全部列出"
+          }）`
+        : listAll
+          ? `**最慢 Beeline SQL**（跨数仓 job 全局比；下列 ${topSql.length} 条）`
+          : `**最慢 Beeline SQL**（跨数仓 job 全局比；下拉看该截 SQL）`;
+    lines.push(title);
     topSql.forEach((r, i) => {
       const c = r.country ? String(r.country).toUpperCase() : "?";
       const jobUrl =
@@ -199,7 +240,11 @@ export function formatSlowMarkdown(result = {}, opts = {}) {
     });
   } else if (enrichSql) {
     lines.push("");
-    lines.push(`未解析到 ≥1m 的 Beeline 语句`);
+    lines.push(
+      sqlMinM > 0
+        ? `未解析到 ≥${sqlMinM}m 的 Beeline 语句（单位=SQL，不是 job）`
+        : `未解析到 ≥1m 的 Beeline 语句`,
+    );
   }
 
   return lines.join("\n");

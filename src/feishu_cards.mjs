@@ -766,12 +766,17 @@ export function slowJobsCard({
   dsReadonly = true,
   uiUrlBuilder = null,
   projectCode = "",
+  /** Beeline statement floor (seconds). >0 → list matching SQL, not Top8. */
+  sqlMinSec = 0,
+  /** Max SQL rows on card / dropdown (cap 40). ≤0 → 40. */
+  sqlLimit = 8,
 } = {}) {
   void dsReadonly;
   void stageNameRe;
   void uiUrlBuilder;
   const stageLabel = Math.round(Number(stageMinSec || 0) / 60) || 15;
   const jobLabel = Math.round(Number(jobMinSec || 0) / 60) || 5;
+  const sqlMinM = Math.round(Number(sqlMinSec || 0) / 60);
   const countryLabel = countries?.length
     ? countries.map((c) => String(c).toUpperCase()).join("+")
     : country
@@ -799,6 +804,25 @@ export function slowJobsCard({
     });
   }
 
+  const cappedLimit =
+    Number(sqlLimit) <= 0 ? 40 : Math.min(Math.max(Number(sqlLimit) || 8, 1), 40);
+  const mdOpts = {
+    sqlLimit: cappedLimit,
+    sqlMinSec: Number(sqlMinSec) || 0,
+    uiUrlBuilder: (row) => {
+      // Only link when we know the leaf instance that hosts this job.
+      // Do NOT fall back to top-level 天级 WF (wrong country / wrong DAG).
+      const leafId = row.processInstanceId;
+      if (!leafId || typeof uiUrlBuilder !== "function") return "";
+      return uiUrlBuilder({
+        workflowId: row.workflowId,
+        jobId: row.jobId,
+        taskInstanceId: row.jobId,
+        processInstanceId: leafId,
+      });
+    },
+  };
+
   const body = formatSlowMarkdown(
     {
       hits,
@@ -809,23 +833,14 @@ export function slowJobsCard({
       selectedInstances,
       enrichSql,
     },
-    {
-      uiUrlBuilder: (row) => {
-        // Only link when we know the leaf instance that hosts this job.
-        // Do NOT fall back to top-level 天级 WF (wrong country / wrong DAG).
-        const leafId = row.processInstanceId;
-        if (!leafId || typeof uiUrlBuilder !== "function") return "";
-        return uiUrlBuilder({
-          workflowId: row.workflowId,
-          jobId: row.jobId,
-          taskInstanceId: row.jobId,
-          processInstanceId: leafId,
-        });
-      },
-    },
+    mdOpts,
   );
 
-  const topSql = collectTopSqlRows(hits, { limit: 8 });
+  const topSql = collectTopSqlRows(hits, {
+    limit: cappedLimit,
+    minSec: Number(sqlMinSec) || 0,
+    allowJobFallback: !(Number(sqlMinSec) > 0),
+  });
   const bundleId = putSlowSqlBundle(topSql);
   const els = [md(body)];
 
@@ -844,10 +859,16 @@ export function slowJobsCard({
         })),
       }),
     );
+  } else if (sqlMinM > 0) {
+    els.push(
+      md(
+        `没有 ≥${sqlMinM}m 的 Beeline SQL。可改阈值：超过十五分钟的都列出来 · /slow sql 5`,
+      ),
+    );
   }
 
   return card({
-    title: "🐢 慢任务",
+    title: sqlMinM > 0 ? `🐢 慢 SQL≥${sqlMinM}m` : "🐢 慢任务",
     template: "orange",
     elements: els,
   });

@@ -278,14 +278,18 @@ server.registerTool(
 server.registerTool(
   "ds_slow",
   {
-    title: "Find slow stages / jobs",
+    title: "Find slow Beeline SQL / stages",
     description:
-      "Find slow SUB_PROCESS stages and nested leaf jobs. For WH country scans use country + nest_depth=1.",
+      "Rank slow Beeline SQL (No rows selected seconds) across WH leaf jobs — unit is SQL statement, NOT job wall clock. Use stmt_min_sec to list all SQL ≥ N seconds (e.g. 600 for ≥10m). For WH country scans use country + nest_depth=1.",
     inputSchema: {
       process_instance_id: z.number().int().positive().optional(),
       country: z.string().optional().describe("e.g. id, th — filters globalParams country_code"),
       stage_min_sec: z.number().optional().describe("Default 900 (15m)"),
       job_min_sec: z.number().optional().describe("Default 300 (5m)"),
+      stmt_min_sec: z
+        .number()
+        .optional()
+        .describe("Beeline SQL floor seconds; e.g. 600 = list SQL ≥10m. Default 60"),
       nest_depth: z.number().int().min(0).max(3).optional().describe("WH daily often needs 1"),
       wh_stages_only: z
         .boolean()
@@ -318,6 +322,8 @@ server.registerTool(
           ? null
           : countriesRaw.split(/[,|\s]+/).filter(Boolean);
       const latestSuccessByCountry = Boolean(countries?.length);
+      const stmtMinSec = args.stmt_min_sec ?? 60;
+      const listThreshold = stmtMinSec >= 300;
       const result = await ds.findSlowStageJobs({
         processInstanceId: args.process_instance_id ?? null,
         country: args.country || null,
@@ -332,11 +338,16 @@ server.registerTool(
         pageSize: args.page_size ?? 50,
         maxPages: args.max_pages ?? 10,
         enrichSql: args.enrich_sql !== false,
-        enrichJobLimit: 8,
-        stmtTopK: 3,
-        stmtMinSec: 60,
+        enrichJobLimit: 0,
+        stmtTopK: listThreshold ? 40 : 5,
+        stmtMinSec,
       });
-      return ok(formatSlowStageJobs(result));
+      return ok(
+        formatSlowStageJobs(result, {
+          sqlMinSec: listThreshold ? stmtMinSec : 0,
+          sqlLimit: listThreshold ? 40 : 8,
+        }),
+      );
     } catch (error) {
       return fail(error);
     }

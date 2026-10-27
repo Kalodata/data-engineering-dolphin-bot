@@ -51,6 +51,66 @@ test("collectTopSqlRows prefers leaf processInstanceId", () => {
   assert.equal(top[0].jobId, 11527417);
 });
 
+test("collectTopSqlRows minSec filters Beeline SQL not job wall", () => {
+  const hits = [
+    {
+      country: "us",
+      dataDate: "2026-10-26",
+      jobs: [
+        {
+          id: 1,
+          processInstanceId: 9,
+          duration: "50m",
+          sec: 3000,
+          taskScript: "job_a",
+          sqlTop: [
+            { sec: 700, secLabel: "11m40s", table: "t_slow" },
+            { sec: 120, secLabel: "2m", table: "t_fast" },
+          ],
+        },
+      ],
+    },
+  ];
+  const ge10 = collectTopSqlRows(hits, { limit: 0, minSec: 600 });
+  assert.equal(ge10.length, 1);
+  assert.equal(ge10[0].table, "t_slow");
+  assert.equal(
+    collectTopSqlRows(hits, { limit: 0, minSec: 600, allowJobFallback: false }).length,
+    1,
+  );
+});
+
+test("formatSlowMarkdown with sqlMinSec lists matching SQL", () => {
+  const hits = [
+    {
+      country: "id",
+      dataDate: "2026-10-26",
+      jobs: [
+        {
+          id: 11,
+          processInstanceId: 1,
+          taskScript: "ads_x",
+          sqlTop: [{ sec: 1911, secExact: "1911", secLabel: "31m52s", table: "ads_x" }],
+        },
+        {
+          id: 12,
+          processInstanceId: 2,
+          taskScript: "dwd_y",
+          sqlTop: [{ sec: 400, secExact: "400", secLabel: "6m40s", table: "dwd_y" }],
+        },
+      ],
+    },
+  ];
+  const text = formatSlowMarkdown(
+    { hits, countries: ["id"], dataDate: "2026-10-26", enrichSql: true },
+    { sqlMinSec: 600, sqlLimit: 40 },
+  );
+  assert.match(text, /Beeline SQL≥10m/);
+  assert.match(text, /单位=语句秒数/);
+  assert.match(text, /ads_x/);
+  assert.doesNotMatch(text, /dwd_y/);
+});
+
 test("WITH/CTE weak labels fall back to job script name", () => {
   const hits = [
     {
