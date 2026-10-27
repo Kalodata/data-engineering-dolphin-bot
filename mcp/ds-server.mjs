@@ -290,7 +290,7 @@ server.registerTool(
       wh_stages_only: z
         .boolean()
         .optional()
-        .describe("If true, only match warehouse stage name pattern"),
+        .describe("Default true: only ADS/DWS/DWM/DWD/ODS/DIM-STAGE. Set false for 前置检测/导出等"),
       page_size: z.number().int().min(1).max(50).optional(),
       project_code: z.string().optional(),
     },
@@ -298,13 +298,14 @@ server.registerTool(
   async (args) => {
     try {
       const ds = getClient(args.project_code);
+      const whOnly = args.wh_stages_only !== false;
       const result = await ds.findSlowStageJobs({
         processInstanceId: args.process_instance_id ?? null,
         country: args.country || null,
         stageMinSec: args.stage_min_sec ?? 15 * 60,
         jobMinSec: args.job_min_sec ?? 5 * 60,
-        nestDepth: args.nest_depth ?? (args.country || args.wh_stages_only ? 1 : 0),
-        stageNameRe: args.wh_stages_only ? WH_STAGE_NAME_RE : null,
+        nestDepth: args.nest_depth ?? (whOnly || args.country ? 1 : 0),
+        stageNameRe: whOnly ? WH_STAGE_NAME_RE : null,
         pageSize: args.page_size ?? 20,
       });
       return ok(formatSlowStageJobs(result));

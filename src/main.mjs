@@ -766,7 +766,10 @@ async function runCommand(config, command, message) {
     return formatTaskList(id, page);
   }
   if (name === "slow") {
+    // Default: warehouse stages only (DWD/ADS/…-STAGE) + nest into JDBC leaves.
     // /slow [n] [stage分] [job分]
+    // /slow wh [country] [n] …     — same as default (alias)
+    // /slow all [n] …              — any SUB_PROCESS (含前置检测/导出)
     // /slow id <processInstanceId> [stage分] [job分]
     // /slow project <projectCode> [n] [stage分] [job分]
     const args = command.slice(1);
@@ -776,45 +779,65 @@ async function runCommand(config, command, message) {
     let jobMin = 5;
     let processInstanceId = null;
     let country = null;
-    let stageNameRe = null;
-    let nestDepth = 0;
-    if (args[0] === "wh" || args[0] === "warehouse" || args[0] === "layers") {
-      // /slow wh [country] [n] [stageMin] [jobMin]
-      stageNameRe = WH_STAGE_NAME_RE;
-      nestDepth = 1;
-      pageSize = 40;
-      const maybeCountry = args[1];
-      if (maybeCountry && Number.isNaN(Number(maybeCountry))) {
-        country = String(maybeCountry).toLowerCase();
-        pageSize = Math.min(Math.max(Number(args[2] || 40) || 40, 1), 50);
-        stageMin = Number(args[3] || 15) || 15;
-        jobMin = Number(args[4] || 5) || 5;
+    // Default scope: WH SQL layers —「前置检测」等等待 stage 不进榜
+    let stageNameRe = WH_STAGE_NAME_RE;
+    let nestDepth = 1;
+
+    const parseTailNums = (from, { defaultPage = 40 } = {}) => {
+      const a = args[from];
+      const b = args[from + 1];
+      const c = args[from + 2];
+      if (a != null && Number.isNaN(Number(a))) {
+        country = String(a).toLowerCase();
+        pageSize = Math.min(Math.max(Number(b || defaultPage) || defaultPage, 1), 50);
+        stageMin = Number(c || 15) || 15;
+        jobMin = Number(args[from + 3] || 5) || 5;
       } else {
-        pageSize = Math.min(Math.max(Number(args[1] || 40) || 40, 1), 50);
-        stageMin = Number(args[2] || 15) || 15;
-        jobMin = Number(args[3] || 5) || 5;
+        pageSize = Math.min(Math.max(Number(a || defaultPage) || defaultPage, 1), 50);
+        stageMin = Number(b || 15) || 15;
+        jobMin = Number(c || 5) || 5;
       }
+    };
+
+    if (args[0] === "all" || args[0] === "any") {
+      stageNameRe = null;
+      nestDepth = 0;
+      parseTailNums(1, { defaultPage: 20 });
+    } else if (args[0] === "wh" || args[0] === "warehouse" || args[0] === "layers") {
+      parseTailNums(1, { defaultPage: 40 });
     } else if (args[0] === "project" || args[0] === "--project") {
       const rawArg = String(args[1] || "");
       if (!rawArg) {
         return "Usage: /slow project <名称或projectCode> [n] [stageMinutes] [jobMinutes]\n可选名称：tiktok amazon shopee tiered hourly test";
       }
       projectCode = getEffectiveProjectCode(message?.chatId, rawArg, config);
-      pageSize = Math.min(Math.max(Number(args[2] || 20) || 20, 1), 50);
-      stageMin = Number(args[3] || 15) || 15;
-      jobMin = Number(args[4] || 5) || 5;
+      if (args[2] === "all" || args[2] === "any") {
+        stageNameRe = null;
+        nestDepth = 0;
+        pageSize = Math.min(Math.max(Number(args[3] || 20) || 20, 1), 50);
+        stageMin = Number(args[4] || 15) || 15;
+        jobMin = Number(args[5] || 5) || 5;
+      } else {
+        pageSize = Math.min(Math.max(Number(args[2] || 20) || 20, 1), 50);
+        stageMin = Number(args[3] || 15) || 15;
+        jobMin = Number(args[4] || 5) || 5;
+      }
     } else if (args[0] === "id" || args[0] === "--id") {
-      // /slow id <processInstanceId> — numeric workflow instance
       processInstanceId = Number(args[1]);
       if (!processInstanceId) {
-        return "Usage: /slow id <processInstanceId> [stageMinutes] [jobMinutes]\n或数仓层+国家：/slow wh id";
+        return "Usage: /slow id <processInstanceId> [stageMinutes] [jobMinutes]\n全 stage：/slow id <id> all\n默认只扫 DWD/ADS 等数仓层";
       }
-      stageMin = Number(args[2] || 15) || 15;
-      jobMin = Number(args[3] || 5) || 5;
+      if (args[2] === "all" || args[2] === "any") {
+        stageNameRe = null;
+        nestDepth = 0;
+        stageMin = Number(args[3] || 15) || 15;
+        jobMin = Number(args[4] || 5) || 5;
+      } else {
+        stageMin = Number(args[2] || 15) || 15;
+        jobMin = Number(args[3] || 5) || 5;
+      }
     } else {
-      pageSize = Math.min(Math.max(Number(args[0] || 20) || 20, 1), 50);
-      stageMin = Number(args[1] || 15) || 15;
-      jobMin = Number(args[2] || 5) || 5;
+      parseTailNums(0, { defaultPage: 20 });
     }
     const effectiveCode = projectCode || getEffectiveProjectCode(message?.chatId, null, config);
     const ds = getDsClient(config, effectiveCode);
