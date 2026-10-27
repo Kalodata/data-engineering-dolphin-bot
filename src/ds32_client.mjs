@@ -11,6 +11,7 @@ import {
   formatStatementSec,
   parseBeelineStatementDurations,
 } from "./beeline_duration.mjs";
+import { formatSlowMarkdown } from "./slow_format.mjs";
 
 const DEFAULT_ENV_FILE = path.join(os.homedir(), ".config/dsctl/offline.env");
 
@@ -394,11 +395,13 @@ export class Ds32Client {
   }
 
   /**
-   * Attach Beeline Top-K statement timings to the slowest leaf jobs.
+   * Pull Beeline `No rows selected (N seconds)` from leaf jobs so we can
+   * rank SQL statements globally across all WH jobs (not within one job).
+   * enrichJobLimit≤0 → all jobs in hits; otherwise cap after sorting by job wall.
    */
   async _enrichSlowHitsWithSql(
     hits,
-    { projectCode, enrichJobLimit = 6, stmtTopK = 3, stmtMinSec = 60 } = {},
+    { projectCode, enrichJobLimit = 0, stmtTopK = 5, stmtMinSec = 60 } = {},
   ) {
     const flat = [];
     for (const hit of hits) {
@@ -407,12 +410,16 @@ export class Ds32Client {
       }
     }
     flat.sort((a, b) => (b.job.sec || 0) - (a.job.sec || 0));
-    const targets = flat.slice(0, Math.max(1, enrichJobLimit));
+    const lim = Number(enrichJobLimit);
+    const targets =
+      !Number.isFinite(lim) || lim <= 0
+        ? flat
+        : flat.slice(0, Math.max(1, lim));
 
     for (const { job } of targets) {
       try {
         const logText = await this.getTaskLogChunks(job.id, {
-          maxChunks: 6,
+          maxChunks: 8,
           limit: 400,
         });
         const parsed = parseBeelineStatementDurations(logText, {
@@ -421,10 +428,14 @@ export class Ds32Client {
         });
         job.sqlTop = parsed.statements.map((s) => ({
           sec: s.sec,
-          secLabel: formatStatementSec(s.sec),
+          secExact: s.secExact || String(s.sec),
+          secLabel: s.secLabel || formatStatementSec(s.sec),
+          durationLine: s.durationLine || `No rows selected (${s.sec} seconds)`,
           table: s.table,
           kind: s.kind,
-          anchor: (s.anchor || []).slice(0, 2),
+          // Preview;「查看明细」再拉日志取完整这一截
+          anchor: (s.anchor || []).slice(0, 60),
+          sql: s.sql || (s.anchor || []).join("\n"),
         }));
         if (parsed.scriptPath && !job.taskScript) {
           job.taskScript = parsed.scriptPath;
@@ -496,6 +507,8 @@ export class Ds32Client {
         sec,
         parentSub,
         taskScript,
+        // Leaf lives on this (often nested) instance — not the top-level 天级 WF
+        processInstanceId: Number(processInstanceId) || null,
       });
     }
     return out.sort((a, b) => b.sec - a.sec);
@@ -638,6 +651,33 @@ export function buildProcessInstanceUiUrl({
     url += `?code=${defCode}`;
   }
   return url;
+}
+
+/**
+ * Open the process instance that actually hosts the JDBC leaf
+ * (nested 子流程实例), NOT the top-level 天级 WF.
+ * Caller must pass the leaf processInstanceId collected with the job.
+ * Returns "" if missing — never guess another country's instance.
+ */
+export function buildTaskInstanceUiUrl({
+  apiUrl,
+  projectCode,
+  processInstanceId,
+  taskInstanceId,
+} = {}) {
+  const instId =
+    processInstanceId != null ? String(processInstanceId).trim() : "";
+  if (!instId || instId === "0") return "";
+  const url = buildProcessInstanceUiUrl({
+    apiUrl,
+    projectCode,
+    processInstanceId: instId,
+  });
+  if (!url) return "";
+  const tid = taskInstanceId != null ? String(taskInstanceId).trim() : "";
+  if (!tid) return url;
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}taskInstanceId=${encodeURIComponent(tid)}`;
 }
 
 export function extractLogHighlights(logText, { maxLines = 25 } = {}) {
@@ -1791,95 +1831,28 @@ export function formatSlowStageJobs(result) {
   } = result || {};
   const stageLabel = formatMinutesLabel(stageMinSec);
   const jobLabel = formatMinutesLabel(jobMinSec);
-  const countryLabel = countries?.length
-    ? `countries=${countries.join("|")}`
-    : country
-      ? `country=${country}`
-      : null;
-  const modeLabel =
-    selectionMode === "latest_success"
-      ? "最新SUCCESS天级"
-      : selectionMode === "instance"
-        ? "指定实例"
-        : "近期SUCCESS";
-  const filters = [
-    modeLabel,
-    countryLabel,
-    dataDate ? `date=${dataDate}` : selectedDates?.length ? `dates=${selectedDates.join("|")}` : null,
-    stageNameRe ? `stages=WH` : null,
-    enrichSql ? "sql=TopK" : null,
-  ]
-    .filter(Boolean)
-    .join(", ");
   if (!hits?.length) {
+    const countryLabel = countries?.length
+      ? countries.map((c) => String(c).toUpperCase()).join("+")
+      : country
+        ? String(country).toUpperCase()
+        : null;
     const picked = (selectedInstances || [])
       .map((i) => `${i.country}:${i.dataDate}#${i.id}`)
       .join(", ");
     return (
       `选中 ${scannedInstances ?? 0} 个实例` +
-      (filters ? `（${filters}）` : "") +
+      (countryLabel || dataDate || selectedDates?.length
+        ? `（${[countryLabel, dataDate || selectedDates?.join("|"), stageNameRe ? "WH" : null]
+            .filter(Boolean)
+            .join(" · ")}）`
+        : "") +
       (picked ? `\n实例：${picked}` : "") +
       `\n没有「stage≥${stageLabel} 且内含 job≥${jobLabel}」。\n` +
       `指定日：/slow date 2026-10-26 · 单国：/slow wh us · 前置检测：/slow all`
     );
   }
-  const scope = stageNameRe ? "数仓层" : "全 stage";
-  const pickedLine = (selectedInstances || [])
-    .map((i) => `${String(i.country || "?").toUpperCase()} date=${i.dataDate} WF#${i.id}`)
-    .join(" · ");
-  const lines = [
-    `🐢 慢任务 · ${scope}（stage≥${stageLabel}，job≥${jobLabel}` +
-      (filters ? `，${filters}` : "") +
-      `；命中 ${hits.length}）：`,
-    pickedLine ? `选中：${pickedLine}` : null,
-    "",
-  ].filter((x) => x !== null);
-  const shown = hits.slice(0, 12);
-  let lastCountry = null;
-  for (const hit of shown) {
-    const c = hit.country || "?";
-    if (c !== lastCountry) {
-      lines.push(`—— ${String(c).toUpperCase()} ——`);
-      lastCountry = c;
-    }
-    const meta = [
-      hit.dataDate ? `date=${hit.dataDate}` : null,
-      hit.country ? `country=${hit.country}` : null,
-    ]
-      .filter(Boolean)
-      .join(" ");
-    lines.push(
-      `WF #${hit.workflowId}  ${hit.workflowState || "?"}  ${meta}  ${hit.workflowName || ""}`,
-    );
-    lines.push(
-      `  STAGE #${hit.stageId}  ${hit.stageName}  ${hit.stageDuration}  → child #${hit.childInstanceId}`,
-    );
-    for (const job of hit.jobs.slice(0, 5)) {
-      const script = job.taskScript || job.sqlScriptPath
-        ? `  script=${job.taskScript || job.sqlScriptPath}`
-        : "";
-      const parent = job.parentSub ? `  ←${job.parentSub}` : "";
-      lines.push(
-        `    JOB #${job.id}  ${job.duration}  ${job.taskType || ""}  ${job.name || ""}${parent}${script}`,
-      );
-      for (const s of job.sqlTop || []) {
-        const tbl = s.table ? s.table : "(语句)";
-        const tip = (s.anchor && s.anchor[0]) || "";
-        lines.push(
-          `      SQL ${s.secLabel}  ${tbl}${tip ? `  · ${tip.slice(0, 72)}` : ""}`,
-        );
-      }
-      if (job.sqlError) {
-        lines.push(`      SQL解析失败：${job.sqlError}`);
-      }
-    }
-    lines.push("");
-  }
-  if (hits.length > shown.length) {
-    lines.push(`…另有 ${hits.length - shown.length} 个 stage 未展开`);
-  }
-  lines.push("看完整日志：/log <job任务id> · 调优：把最慢 SQL 丢给 /tune");
-  return lines.join("\n");
+  return formatSlowMarkdown(result || {});
 }
 
 export function formatFailedList(page) {

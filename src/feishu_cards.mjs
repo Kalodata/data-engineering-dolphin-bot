@@ -4,6 +4,14 @@
  */
 
 import crypto from "node:crypto";
+import {
+  collectTopSqlRows,
+  formatSlowMarkdown,
+} from "./slow_format.mjs";
+import {
+  putSlowSqlBundle,
+  encodeSlowSqlOption,
+} from "./slow_sql_store.mjs";
 
 export function newNonce() {
   return crypto.randomBytes(12).toString("hex");
@@ -741,7 +749,7 @@ export function runningCard({ enrich = [], total = null, uiUrlBuilder = null } =
   return card({ title: "⏳ 正在运行", template: "green", elements: els });
 }
 
-/** Slow stage/job hits as interactive card. */
+/** Slow card: flat Top SQL + dropdown for SQL detail (code block). */
 export function slowJobsCard({
   hits = [],
   stageMinSec = 900,
@@ -758,30 +766,16 @@ export function slowJobsCard({
   uiUrlBuilder = null,
   projectCode = "",
 } = {}) {
+  void dsReadonly;
+  void stageNameRe;
+  void uiUrlBuilder;
   const stageLabel = Math.round(Number(stageMinSec || 0) / 60) || 15;
   const jobLabel = Math.round(Number(jobMinSec || 0) / 60) || 5;
   const countryLabel = countries?.length
-    ? `countries=${countries.join("|")}`
+    ? countries.map((c) => String(c).toUpperCase()).join("+")
     : country
-      ? `country=${country}`
+      ? String(country).toUpperCase()
       : null;
-  const modeLabel =
-    selectionMode === "latest_success"
-      ? "最新SUCCESS天级"
-      : selectionMode === "instance"
-        ? "指定实例"
-        : selectionMode
-          ? String(selectionMode)
-          : null;
-  const filters = [
-    modeLabel,
-    countryLabel,
-    dataDate ? `date=${dataDate}` : null,
-    stageNameRe ? "stages=WH" : null,
-    enrichSql ? "sql=TopK" : null,
-  ]
-    .filter(Boolean)
-    .join(", ");
 
   const picked = (selectedInstances || [])
     .map((i) => `${String(i.country || "?").toUpperCase()} ${i.dataDate} #${i.id}`)
@@ -794,109 +788,63 @@ export function slowJobsCard({
       elements: [
         md(
           `选中 ${scannedInstances} 个实例` +
-            (filters ? `（${filters}）` : "") +
+            (countryLabel ? `（${countryLabel}` : "（") +
+            (dataDate ? ` · ${dataDate}` : "") +
+            ` · stage≥${stageLabel}m / job≥${jobLabel}m）` +
             (picked ? `\n${picked}` : "") +
-            `\n没有「数仓层 stage≥${stageLabel}m 且 SQL job≥${jobLabel}m」。\n指定日：/slow date YYYY-MM-DD · 前置检测：/slow all`,
+            `\n没有命中。\n指定日：/slow date YYYY-MM-DD · 前置：/slow all`,
         ),
       ],
     });
   }
 
-  const shown = hits.slice(0, 8);
-  const els = [
-    md(
-      `🐢 数仓慢任务（stage≥${stageLabel}m，job≥${jobLabel}m` +
-        (filters ? `，${filters}` : "") +
-        `；命中 ${hits.length}）` +
-        (picked ? `\n选中：${picked}` : "") +
-        (enrichSql
-          ? "\n已拆 Beeline Top SQL（仅 SUCCESS；按国家分开，勿跨国比秒数）"
-          : ""),
-    ),
-  ];
+  const body = formatSlowMarkdown(
+    {
+      hits,
+      stageMinSec,
+      jobMinSec,
+      countries,
+      dataDate,
+      selectedInstances,
+      enrichSql,
+    },
+    {
+      uiUrlBuilder: (row) => {
+        // Only link when we know the leaf instance that hosts this job.
+        // Do NOT fall back to top-level 天级 WF (wrong country / wrong DAG).
+        const leafId = row.processInstanceId;
+        if (!leafId || typeof uiUrlBuilder !== "function") return "";
+        return uiUrlBuilder({
+          workflowId: row.workflowId,
+          jobId: row.jobId,
+          taskInstanceId: row.jobId,
+          processInstanceId: leafId,
+        });
+      },
+    },
+  );
 
-  let lastCountry = null;
-  for (const hit of shown) {
-    const c = String(hit.country || "?").toUpperCase();
-    if (c !== lastCountry) {
-      els.push(md(`**—— ${c} ——**`));
-      lastCountry = c;
-    }
-    const uiUrl = typeof uiUrlBuilder === "function" ? uiUrlBuilder(hit) : "";
-    const link = uiUrl ? ` · [打开实例](${uiUrl})` : "";
-    const meta = [
-      hit.dataDate ? `date=${hit.dataDate}` : null,
-      hit.country ? `country=${hit.country}` : null,
-    ]
-      .filter(Boolean)
-      .join(" ");
-    const jobLines = (hit.jobs || [])
-      .slice(0, 3)
-      .map((j) => {
-        const head = `· JOB #${j.id} ${j.duration || ""} ${clip(j.name || j.taskType || "", 28)}`;
-        const script = j.taskScript || j.sqlScriptPath
-          ? `\n  script=${clip(j.taskScript || j.sqlScriptPath, 48)}`
-          : "";
-        const sqlLines = (j.sqlTop || [])
-          .slice(0, 3)
-          .map((s) => {
-            const tbl = s.table || "语句";
-            return `  SQL ${s.secLabel || s.sec + "s"} · ${clip(tbl, 40)}`;
-          })
-          .join("\n");
-        return `${head}${script}${sqlLines ? `\n${sqlLines}` : ""}`;
-      })
-      .join("\n");
+  const topSql = collectTopSqlRows(hits, { limit: 8 });
+  const bundleId = putSlowSqlBundle(topSql);
+  const els = [md(body)];
+
+  if (topSql.length) {
     els.push(
-      md(
-        `**WF #${hit.workflowId}** ${hit.workflowState || "?"}${link}\n` +
-          `${clip(hit.workflowName || "", 40)} ${meta}\n` +
-          `STAGE #${hit.stageId} ${clip(hit.stageName || "", 32)} ${hit.stageDuration || ""}\n` +
-          (jobLines || "（无慢 job）"),
-      ),
-    );
-    const actions = [
-      button({
-        label: "诊断",
-        action: "diagnose",
-        type: "primary",
-        value: withProjectCode(
-          { processInstanceId: String(hit.workflowId) },
-          projectCode,
-        ),
-      }),
-    ];
-    const firstJob = hit.jobs?.[0];
-    if (firstJob?.id) {
-      actions.push(
-        button({
-          label: "看日志",
-          action: "log",
-          value: withProjectCode({ taskId: String(firstJob.id) }, projectCode),
-        }),
-      );
-    }
-    if (!dsReadonly) {
-      actions.push(
-        button({
-          label: "重跑",
-          action: "rerun_request",
-          type: "danger",
-          value: withProjectCode(
-            {
-              processInstanceId: String(hit.workflowId),
-              executeType: "START_FAILURE_TASK_PROCESS",
-            },
-            projectCode,
+      selectStatic({
+        placeholder: "查看 SQL 明细…",
+        action: "slow_sql_detail",
+        value: withProjectCode({ bundleId }, projectCode),
+        options: topSql.map((r, i) => ({
+          label: clip(
+            `${i + 1}. ${r.secLabel} ${r.sqlBit || r.table || r.script} ←#${r.jobId}`,
+            48,
           ),
-        }),
-      );
-    }
-    els.push(actionRow(actions));
+          value: encodeSlowSqlOption(bundleId, i, r),
+        })),
+      }),
+    );
   }
-  if (hits.length > shown.length) {
-    els.push(note(`另有 ${hits.length - shown.length} 个 stage 未展开`));
-  }
+
   return card({
     title: "🐢 慢任务",
     template: "orange",
