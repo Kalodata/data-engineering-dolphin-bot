@@ -7,6 +7,10 @@ export {
   applyPlaybookToClassification,
 } from "./alert_playbook.mjs";
 import { buildActionPlaybook } from "./alert_playbook.mjs";
+import {
+  formatStatementSec,
+  parseBeelineStatementDurations,
+} from "./beeline_duration.mjs";
 
 const DEFAULT_ENV_FILE = path.join(os.homedir(), ".config/dsctl/offline.env");
 
@@ -180,12 +184,21 @@ export class Ds32Client {
     projectCode = this.projectCode,
     pageNo = 1,
     pageSize = 20,
+    maxPages = 1,
     stageMinSec = 15 * 60,
     jobMinSec = 5 * 60,
     processInstanceId = null,
     country = null,
+    countries = null,
+    dataDate = null,
+    /** When true: per-country latest SUCCESS daily only (skip RUNNING). */
+    latestSuccessByCountry = false,
     stageNameRe = null,
     nestDepth = 0,
+    enrichSql = false,
+    enrichJobLimit = 6,
+    stmtTopK = 3,
+    stmtMinSec = 60,
   } = {}) {
     const nameRe =
       stageNameRe instanceof RegExp
@@ -193,36 +206,96 @@ export class Ds32Client {
         : stageNameRe
           ? new RegExp(stageNameRe, "i")
           : null;
-    const countryWanted = country ? String(country).toLowerCase() : null;
+
+    const countrySet = new Set();
+    if (countries != null) {
+      for (const c of Array.isArray(countries) ? countries : [countries]) {
+        const x = String(c || "")
+          .trim()
+          .toLowerCase();
+        if (x) countrySet.add(x);
+      }
+    } else if (country) {
+      countrySet.add(String(country).toLowerCase());
+    }
+    const filterByCountry = countrySet.size > 0;
+    const pinDate = normalizeDataDate(dataDate || "");
 
     let instances = [];
+    let selectionMode = "recent";
+
     if (processInstanceId) {
+      selectionMode = "instance";
       const inst = await this.getProcessInstance(processInstanceId, projectCode);
-      if (inst) instances.push(inst);
-    } else {
-      const page = await this.listProcessInstances({
-        projectCode,
-        pageNo,
-        pageSize,
+      if (inst) {
+        const full = inst;
+        const code = getGlobalParam(full, "country_code").toLowerCase();
+        instances.push({
+          ...full,
+          _country: code || null,
+          _dataDate:
+            normalizeDataDate(
+              getGlobalParam(full, "data_date") ||
+                getGlobalParam(full, "partition_day"),
+            ) || null,
+        });
+      }
+    } else if (latestSuccessByCountry && filterByCountry) {
+      selectionMode = "latest_success";
+      instances = await resolveLatestSuccessByCountries(this, {
+        countries: [...countrySet],
+        dataDate: pinDate || null,
+        maxPages: Math.max(Number(maxPages) || 10, 6),
+        pageSize: Math.max(Number(pageSize) || 50, 40),
       });
-      instances = page?.totalList || [];
+    } else {
+      selectionMode = "recent";
+      const pages = Math.max(1, Math.min(Number(maxPages) || 1, 8));
+      const size = Math.max(1, Math.min(Number(pageSize) || 20, 50));
+      for (let p = pageNo; p < pageNo + pages; p += 1) {
+        const page = await this.listProcessInstances({
+          projectCode,
+          pageNo: p,
+          pageSize: size,
+          stateType: "SUCCESS",
+        });
+        const batch = page?.totalList || [];
+        if (!batch.length) break;
+        instances.push(...batch);
+        if (batch.length < size) break;
+      }
     }
 
-    if (countryWanted) {
-      const filtered = [];
+    // Resolve country_code / data_date when filtering or when listing (for分组展示)
+    if (selectionMode !== "latest_success" && (filterByCountry || !processInstanceId)) {
+      const enriched = [];
       for (const inst of instances) {
-        const full = await this.getProcessInstance(inst.id, projectCode);
-        const row = full || inst;
-        const code = getGlobalParam(row, "country_code").toLowerCase();
-        if (code === countryWanted) {
-          filtered.push({
-            ...row,
-            _country: code,
-            _dataDate: getGlobalParam(row, "data_date"),
-          });
+        let code = inst._country != null ? String(inst._country).toLowerCase() : "";
+        let dd = inst._dataDate || null;
+        let row = inst;
+        if (!code || dd == null) {
+          try {
+            const full = await this.getProcessInstance(inst.id, projectCode);
+            row = full || inst;
+            if (!code) code = getGlobalParam(row, "country_code").toLowerCase();
+            if (dd == null) {
+              dd =
+                normalizeDataDate(
+                  getGlobalParam(row, "data_date") ||
+                    getGlobalParam(row, "partition_day"),
+                ) || null;
+            }
+          } catch {
+            /* keep sparse */
+          }
         }
+        if (filterByCountry && !countrySet.has(code)) continue;
+        if (pinDate && dd !== pinDate) continue;
+        // Skip in-flight even if API returned them
+        if (/RUNNING/i.test(String(row.state || inst.state || ""))) continue;
+        enriched.push({ ...row, _country: code || null, _dataDate: dd });
       }
-      instances = filtered;
+      instances = enriched;
     }
 
     const hits = [];
@@ -259,7 +332,7 @@ export class Ds32Client {
           workflowId: inst.id,
           workflowName: inst.name,
           workflowState: inst.state,
-          country: inst._country || countryWanted || null,
+          country: inst._country || null,
           dataDate: inst._dataDate || null,
           stageId: stage.id,
           stageName: stage.name,
@@ -273,14 +346,95 @@ export class Ds32Client {
     hits.sort(
       (a, b) => b.stageSec - a.stageSec || (b.jobs[0]?.sec || 0) - (a.jobs[0]?.sec || 0),
     );
+
+    if (enrichSql && hits.length) {
+      await this._enrichSlowHitsWithSql(hits, {
+        projectCode,
+        enrichJobLimit,
+        stmtTopK,
+        stmtMinSec,
+      });
+    }
+
+    // Prefer country-grouped order: us, id, then others — within country by stageSec
+    const countryOrder = ["us", "id"];
+    hits.sort((a, b) => {
+      const ai = countryOrder.indexOf(String(a.country || ""));
+      const bi = countryOrder.indexOf(String(b.country || ""));
+      const ao = ai === -1 ? 99 : ai;
+      const bo = bi === -1 ? 99 : bi;
+      if (ao !== bo) return ao - bo;
+      return b.stageSec - a.stageSec || (b.jobs[0]?.sec || 0) - (a.jobs[0]?.sec || 0);
+    });
+
+    const selectedDates = [
+      ...new Set(instances.map((i) => i._dataDate).filter(Boolean)),
+    ].sort();
+
     return {
       stageMinSec,
       jobMinSec,
-      country: countryWanted,
+      country: country ? String(country).toLowerCase() : null,
+      countries: filterByCountry ? [...countrySet] : null,
+      dataDate: pinDate || null,
+      selectionMode,
+      selectedDates,
+      selectedInstances: instances.map((i) => ({
+        id: i.id,
+        country: i._country,
+        dataDate: i._dataDate,
+        state: i.state,
+        name: i.name,
+      })),
       stageNameRe: nameRe ? String(nameRe) : null,
       scannedInstances: instances.length,
+      enrichSql: Boolean(enrichSql),
       hits,
     };
+  }
+
+  /**
+   * Attach Beeline Top-K statement timings to the slowest leaf jobs.
+   */
+  async _enrichSlowHitsWithSql(
+    hits,
+    { projectCode, enrichJobLimit = 6, stmtTopK = 3, stmtMinSec = 60 } = {},
+  ) {
+    const flat = [];
+    for (const hit of hits) {
+      for (const job of hit.jobs || []) {
+        flat.push({ hit, job });
+      }
+    }
+    flat.sort((a, b) => (b.job.sec || 0) - (a.job.sec || 0));
+    const targets = flat.slice(0, Math.max(1, enrichJobLimit));
+
+    for (const { job } of targets) {
+      try {
+        const logText = await this.getTaskLogChunks(job.id, {
+          maxChunks: 6,
+          limit: 400,
+        });
+        const parsed = parseBeelineStatementDurations(logText, {
+          topK: stmtTopK,
+          minSec: stmtMinSec,
+        });
+        job.sqlTop = parsed.statements.map((s) => ({
+          sec: s.sec,
+          secLabel: formatStatementSec(s.sec),
+          table: s.table,
+          kind: s.kind,
+          anchor: (s.anchor || []).slice(0, 2),
+        }));
+        if (parsed.scriptPath && !job.taskScript) {
+          job.taskScript = parsed.scriptPath;
+        }
+        job.sqlScriptPath = parsed.scriptPath || job.taskScript || null;
+      } catch (error) {
+        job.sqlTop = [];
+        job.sqlError = String(error?.message || error).slice(0, 120);
+      }
+    }
   }
 
   async _collectSlowLeafJobs({
@@ -1454,6 +1608,98 @@ export function getGlobalParam(inst, prop) {
   return "";
 }
 
+/** Normalize data_date / partition_day to YYYY-MM-DD. */
+export function normalizeDataDate(raw = "") {
+  const s = String(raw || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  if (/^\d{8}$/.test(s)) {
+    return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+  }
+  return "";
+}
+
+/**
+ * For each country, pick the latest SUCCESS daily instance (by data_date, then endTime).
+ * Skips RUNNING. Optional dataDate pins to that partition day.
+ */
+export async function resolveLatestSuccessByCountries(
+  ds,
+  {
+    countries = ["us", "id"],
+    dataDate = null,
+    maxPages = 10,
+    pageSize = 50,
+    nameRe = /天级|daily/i,
+  } = {},
+) {
+  const want = new Set(
+    (Array.isArray(countries) ? countries : [countries])
+      .map((c) => String(c || "").trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const pin = normalizeDataDate(dataDate || "");
+  /** @type {Map<string, { inst: object, dataDate: string, endTime: string }>} */
+  const best = new Map();
+
+  for (let p = 1; p <= Math.max(1, maxPages); p += 1) {
+    const page = await ds.listProcessInstances({
+      stateType: "SUCCESS",
+      pageNo: p,
+      pageSize,
+    });
+    const batch = page?.totalList || [];
+    if (!batch.length) break;
+
+    const settled = await Promise.allSettled(
+      batch.map((row) => ds.getProcessInstance(row.id)),
+    );
+    for (let i = 0; i < settled.length; i += 1) {
+      const r = settled[i];
+      const inst = r.status === "fulfilled" ? r.value || batch[i] : batch[i];
+      if (!inst) continue;
+      if (nameRe && !nameRe.test(String(inst.name || batch[i]?.name || ""))) {
+        continue;
+      }
+      const code = getGlobalParam(inst, "country_code").toLowerCase();
+      if (!want.has(code)) continue;
+      const dd = normalizeDataDate(
+        getGlobalParam(inst, "data_date") ||
+          getGlobalParam(inst, "partition_day"),
+      );
+      if (!dd) continue;
+      if (pin && dd !== pin) continue;
+
+      const endTime = String(inst.endTime || inst.startTime || "");
+      const prev = best.get(code);
+      if (
+        !prev ||
+        dd > prev.dataDate ||
+        (dd === prev.dataDate && endTime > prev.endTime)
+      ) {
+        best.set(code, {
+          inst: {
+            ...inst,
+            _country: code,
+            _dataDate: dd,
+          },
+          dataDate: dd,
+          endTime,
+        });
+      }
+    }
+
+    // Pinned date: stop once every country found
+    if (pin && [...want].every((c) => best.has(c))) break;
+    // Unpinned: after enough SUCCESS pages, if all countries have a candidate, can stop
+    // when page looks older than best dates — keep scanning a bit for safety
+  }
+
+  return [...want]
+    .map((c) => best.get(c))
+    .filter(Boolean)
+    .map((x) => x.inst);
+}
+
 /**
  * Find process instances matching a country code and optional data date.
  * Fetches detail for each candidate (N+1) to read globalParams.
@@ -1529,33 +1775,73 @@ function formatMinutesLabel(sec) {
 }
 
 export function formatSlowStageJobs(result) {
-  const { hits, stageMinSec, jobMinSec, scannedInstances, country, stageNameRe } =
-    result || {};
+  const {
+    hits,
+    stageMinSec,
+    jobMinSec,
+    scannedInstances,
+    country,
+    countries,
+    dataDate,
+    selectionMode,
+    selectedDates,
+    selectedInstances,
+    stageNameRe,
+    enrichSql,
+  } = result || {};
   const stageLabel = formatMinutesLabel(stageMinSec);
   const jobLabel = formatMinutesLabel(jobMinSec);
+  const countryLabel = countries?.length
+    ? `countries=${countries.join("|")}`
+    : country
+      ? `country=${country}`
+      : null;
+  const modeLabel =
+    selectionMode === "latest_success"
+      ? "最新SUCCESS天级"
+      : selectionMode === "instance"
+        ? "指定实例"
+        : "近期SUCCESS";
   const filters = [
-    country ? `country=${country}` : null,
-    stageNameRe ? `stages=${stageNameRe}` : null,
+    modeLabel,
+    countryLabel,
+    dataDate ? `date=${dataDate}` : selectedDates?.length ? `dates=${selectedDates.join("|")}` : null,
+    stageNameRe ? `stages=WH` : null,
+    enrichSql ? "sql=TopK" : null,
   ]
     .filter(Boolean)
     .join(", ");
   if (!hits?.length) {
+    const picked = (selectedInstances || [])
+      .map((i) => `${i.country}:${i.dataDate}#${i.id}`)
+      .join(", ");
     return (
-      `扫了 ${scannedInstances ?? 0} 个工作流实例` +
+      `选中 ${scannedInstances ?? 0} 个实例` +
       (filters ? `（${filters}）` : "") +
-      `：没有「stage≥${stageLabel} 且内含 job≥${jobLabel}」。\n` +
-      `可加大扫描：/slow 40 · 看全部 stage（含前置检测）：/slow all`
+      (picked ? `\n实例：${picked}` : "") +
+      `\n没有「stage≥${stageLabel} 且内含 job≥${jobLabel}」。\n` +
+      `指定日：/slow date 2026-10-26 · 单国：/slow wh us · 前置检测：/slow all`
     );
   }
   const scope = stageNameRe ? "数仓层" : "全 stage";
+  const pickedLine = (selectedInstances || [])
+    .map((i) => `${String(i.country || "?").toUpperCase()} date=${i.dataDate} WF#${i.id}`)
+    .join(" · ");
   const lines = [
     `🐢 慢任务 · ${scope}（stage≥${stageLabel}，job≥${jobLabel}` +
       (filters ? `，${filters}` : "") +
-      `；扫 ${scannedInstances} 个，命中 ${hits.length}）：`,
+      `；命中 ${hits.length}）：`,
+    pickedLine ? `选中：${pickedLine}` : null,
     "",
-  ];
+  ].filter((x) => x !== null);
   const shown = hits.slice(0, 12);
+  let lastCountry = null;
   for (const hit of shown) {
+    const c = hit.country || "?";
+    if (c !== lastCountry) {
+      lines.push(`—— ${String(c).toUpperCase()} ——`);
+      lastCountry = c;
+    }
     const meta = [
       hit.dataDate ? `date=${hit.dataDate}` : null,
       hit.country ? `country=${hit.country}` : null,
@@ -1569,18 +1855,30 @@ export function formatSlowStageJobs(result) {
       `  STAGE #${hit.stageId}  ${hit.stageName}  ${hit.stageDuration}  → child #${hit.childInstanceId}`,
     );
     for (const job of hit.jobs.slice(0, 5)) {
-      const script = job.taskScript ? `  script=${job.taskScript}` : "";
+      const script = job.taskScript || job.sqlScriptPath
+        ? `  script=${job.taskScript || job.sqlScriptPath}`
+        : "";
       const parent = job.parentSub ? `  ←${job.parentSub}` : "";
       lines.push(
         `    JOB #${job.id}  ${job.duration}  ${job.taskType || ""}  ${job.name || ""}${parent}${script}`,
       );
+      for (const s of job.sqlTop || []) {
+        const tbl = s.table ? s.table : "(语句)";
+        const tip = (s.anchor && s.anchor[0]) || "";
+        lines.push(
+          `      SQL ${s.secLabel}  ${tbl}${tip ? `  · ${tip.slice(0, 72)}` : ""}`,
+        );
+      }
+      if (job.sqlError) {
+        lines.push(`      SQL解析失败：${job.sqlError}`);
+      }
     }
     lines.push("");
   }
   if (hits.length > shown.length) {
     lines.push(`…另有 ${hits.length - shown.length} 个 stage 未展开`);
   }
-  lines.push("看某个 job 日志：/log <job任务id>");
+  lines.push("看完整日志：/log <job任务id> · 调优：把最慢 SQL 丢给 /tune");
   return lines.join("\n");
 }
 
