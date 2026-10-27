@@ -10,6 +10,7 @@ import {
   formatPracticalDiagnosis,
   formatTaskList,
   isMeaningfulSlowLeaf,
+  normalizeDataDate,
   WH_STAGE_NAME_RE,
 } from "../src/ds32_client.mjs";
 
@@ -378,6 +379,12 @@ test("slow leaf filter drops wait/gate jobs, keeps JDBC script tasks", () => {
   assert.match("DWD-STAGE", WH_STAGE_NAME_RE);
   assert.doesNotMatch("前置检测", WH_STAGE_NAME_RE);
   assert.doesNotMatch("导出数据给kalodata.com", WH_STAGE_NAME_RE);
+});
+
+test("normalizeDataDate accepts dash and compact forms", () => {
+  assert.equal(normalizeDataDate("2026-10-26"), "2026-10-26");
+  assert.equal(normalizeDataDate("20261026"), "2026-10-26");
+  assert.equal(normalizeDataDate(""), "");
 });
 
 test("visitor shell exit 124 is 超时 not 分区/路径 (ignore script echo ERROR / partition text)", () => {

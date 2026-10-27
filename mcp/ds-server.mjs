@@ -291,7 +291,20 @@ server.registerTool(
         .boolean()
         .optional()
         .describe("Default true: only ADS/DWS/DWM/DWD/ODS/DIM-STAGE. Set false for 前置检测/导出等"),
+      countries: z
+        .string()
+        .optional()
+        .describe("Comma countries, default us,id. Pass all to disable latest-SUCCESS mode"),
+      data_date: z
+        .string()
+        .optional()
+        .describe("YYYY-MM-DD pin; default = latest SUCCESS data_date per country"),
+      enrich_sql: z
+        .boolean()
+        .optional()
+        .describe("Default true: parse Beeline No rows selected Top SQL on slowest jobs"),
       page_size: z.number().int().min(1).max(50).optional(),
+      max_pages: z.number().int().min(1).max(15).optional(),
       project_code: z.string().optional(),
     },
   },
@@ -299,14 +312,29 @@ server.registerTool(
     try {
       const ds = getClient(args.project_code);
       const whOnly = args.wh_stages_only !== false;
+      const countriesRaw = String(args.countries || "us,id").trim().toLowerCase();
+      const countries =
+        !countriesRaw || countriesRaw === "all" || countriesRaw === "any"
+          ? null
+          : countriesRaw.split(/[,|\s]+/).filter(Boolean);
+      const latestSuccessByCountry = Boolean(countries?.length);
       const result = await ds.findSlowStageJobs({
         processInstanceId: args.process_instance_id ?? null,
         country: args.country || null,
+        countries: args.country ? [args.country] : countries,
+        dataDate: args.data_date || null,
+        latestSuccessByCountry:
+          latestSuccessByCountry && !args.process_instance_id,
         stageMinSec: args.stage_min_sec ?? 15 * 60,
         jobMinSec: args.job_min_sec ?? 5 * 60,
         nestDepth: args.nest_depth ?? (whOnly || args.country ? 1 : 0),
         stageNameRe: whOnly ? WH_STAGE_NAME_RE : null,
-        pageSize: args.page_size ?? 20,
+        pageSize: args.page_size ?? 50,
+        maxPages: args.max_pages ?? 10,
+        enrichSql: args.enrich_sql !== false,
+        enrichJobLimit: 8,
+        stmtTopK: 3,
+        stmtMinSec: 60,
       });
       return ok(formatSlowStageJobs(result));
     } catch (error) {

@@ -748,19 +748,44 @@ export function slowJobsCard({
   jobMinSec = 300,
   scannedInstances = 0,
   country = null,
+  countries = null,
+  dataDate = null,
+  selectionMode = null,
+  selectedInstances = null,
   stageNameRe = null,
+  enrichSql = false,
   dsReadonly = true,
   uiUrlBuilder = null,
   projectCode = "",
 } = {}) {
   const stageLabel = Math.round(Number(stageMinSec || 0) / 60) || 15;
   const jobLabel = Math.round(Number(jobMinSec || 0) / 60) || 5;
+  const countryLabel = countries?.length
+    ? `countries=${countries.join("|")}`
+    : country
+      ? `country=${country}`
+      : null;
+  const modeLabel =
+    selectionMode === "latest_success"
+      ? "最新SUCCESS天级"
+      : selectionMode === "instance"
+        ? "指定实例"
+        : selectionMode
+          ? String(selectionMode)
+          : null;
   const filters = [
-    country ? `country=${country}` : null,
-    stageNameRe ? `stages=${stageNameRe}` : null,
+    modeLabel,
+    countryLabel,
+    dataDate ? `date=${dataDate}` : null,
+    stageNameRe ? "stages=WH" : null,
+    enrichSql ? "sql=TopK" : null,
   ]
     .filter(Boolean)
     .join(", ");
+
+  const picked = (selectedInstances || [])
+    .map((i) => `${String(i.country || "?").toUpperCase()} ${i.dataDate} #${i.id}`)
+    .join(" · ");
 
   if (!hits.length) {
     return card({
@@ -768,9 +793,10 @@ export function slowJobsCard({
       template: "grey",
       elements: [
         md(
-          `扫了 ${scannedInstances} 个实例` +
+          `选中 ${scannedInstances} 个实例` +
             (filters ? `（${filters}）` : "") +
-            `：没有「数仓层 stage≥${stageLabel}m 且 SQL job≥${jobLabel}m」。\n加大扫描：/slow 40 · 含前置检测/导出：/slow all`,
+            (picked ? `\n${picked}` : "") +
+            `\n没有「数仓层 stage≥${stageLabel}m 且 SQL job≥${jobLabel}m」。\n指定日：/slow date YYYY-MM-DD · 前置检测：/slow all`,
         ),
       ],
     });
@@ -779,13 +805,23 @@ export function slowJobsCard({
   const shown = hits.slice(0, 8);
   const els = [
     md(
-      `慢 stage/job（stage≥${stageLabel}m，job≥${jobLabel}m` +
+      `🐢 数仓慢任务（stage≥${stageLabel}m，job≥${jobLabel}m` +
         (filters ? `，${filters}` : "") +
-        `；扫 ${scannedInstances} 个，命中 ${hits.length}）：`,
+        `；命中 ${hits.length}）` +
+        (picked ? `\n选中：${picked}` : "") +
+        (enrichSql
+          ? "\n已拆 Beeline Top SQL（仅 SUCCESS；按国家分开，勿跨国比秒数）"
+          : ""),
     ),
   ];
 
+  let lastCountry = null;
   for (const hit of shown) {
+    const c = String(hit.country || "?").toUpperCase();
+    if (c !== lastCountry) {
+      els.push(md(`**—— ${c} ——**`));
+      lastCountry = c;
+    }
     const uiUrl = typeof uiUrlBuilder === "function" ? uiUrlBuilder(hit) : "";
     const link = uiUrl ? ` · [打开实例](${uiUrl})` : "";
     const meta = [
@@ -796,10 +832,20 @@ export function slowJobsCard({
       .join(" ");
     const jobLines = (hit.jobs || [])
       .slice(0, 3)
-      .map(
-        (j) =>
-          `· JOB #${j.id} ${j.duration || ""} ${clip(j.name || j.taskType || "", 28)}`,
-      )
+      .map((j) => {
+        const head = `· JOB #${j.id} ${j.duration || ""} ${clip(j.name || j.taskType || "", 28)}`;
+        const script = j.taskScript || j.sqlScriptPath
+          ? `\n  script=${clip(j.taskScript || j.sqlScriptPath, 48)}`
+          : "";
+        const sqlLines = (j.sqlTop || [])
+          .slice(0, 3)
+          .map((s) => {
+            const tbl = s.table || "语句";
+            return `  SQL ${s.secLabel || s.sec + "s"} · ${clip(tbl, 40)}`;
+          })
+          .join("\n");
+        return `${head}${script}${sqlLines ? `\n${sqlLines}` : ""}`;
+      })
       .join("\n");
     els.push(
       md(

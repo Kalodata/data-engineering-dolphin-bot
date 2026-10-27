@@ -766,29 +766,42 @@ async function runCommand(config, command, message) {
     return formatTaskList(id, page);
   }
   if (name === "slow") {
-    // Default: warehouse stages only (DWD/ADS/…-STAGE) + nest into JDBC leaves.
-    // /slow [n] [stage分] [job分]
-    // /slow wh [country] [n] …     — same as default (alias)
-    // /slow all [n] …              — any SUB_PROCESS (含前置检测/导出)
-    // /slow id <processInstanceId> [stage分] [job分]
-    // /slow project <projectCode> [n] [stage分] [job分]
+    // Default: US+ID 各自最新 SUCCESS 天级 → 数仓 stage → Beeline Top SQL（不含 RUNNING）
+    // /slow
+    // /slow date 2026-10-26
+    // /slow wh us | /slow wh id
+    // /slow all …              — 任意 stage（含前置检测）
+    // /slow id <processInstanceId> …
     const args = command.slice(1);
     let projectCode = null;
-    let pageSize = 40;
+    let pageSize = 50;
+    let maxPages = 10;
     let stageMin = 15;
     let jobMin = 5;
     let processInstanceId = null;
     let country = null;
-    // Default scope: WH SQL layers —「前置检测」等等待 stage 不进榜
+    /** @type {string[]|null} */
+    let countries = ["us", "id"];
+    let dataDate = null;
+    let latestSuccessByCountry = true;
     let stageNameRe = WH_STAGE_NAME_RE;
     let nestDepth = 1;
+    let enrichSql = true;
 
-    const parseTailNums = (from, { defaultPage = 40 } = {}) => {
+    const parseTailNums = (from, { defaultPage = 50 } = {}) => {
       const a = args[from];
       const b = args[from + 1];
       const c = args[from + 2];
+      if (a != null && /^\d{4}-\d{2}-\d{2}$/.test(String(a))) {
+        dataDate = String(a);
+        pageSize = Math.min(Math.max(Number(b || defaultPage) || defaultPage, 1), 50);
+        stageMin = Number(c || 15) || 15;
+        jobMin = Number(args[from + 3] || 5) || 5;
+        return;
+      }
       if (a != null && Number.isNaN(Number(a))) {
         country = String(a).toLowerCase();
+        countries = [country];
         pageSize = Math.min(Math.max(Number(b || defaultPage) || defaultPage, 1), 50);
         stageMin = Number(c || 15) || 15;
         jobMin = Number(args[from + 3] || 5) || 5;
@@ -802,9 +815,28 @@ async function runCommand(config, command, message) {
     if (args[0] === "all" || args[0] === "any") {
       stageNameRe = null;
       nestDepth = 0;
+      enrichSql = false;
+      latestSuccessByCountry = false;
+      countries = null;
       parseTailNums(1, { defaultPage: 20 });
+    } else if (args[0] === "date" || args[0] === "--date") {
+      dataDate = String(args[1] || "");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dataDate)) {
+        return "Usage: /slow date YYYY-MM-DD\n例：/slow date 2026-10-26";
+      }
+      parseTailNums(2, { defaultPage: 50 });
+    } else if (args[0] === "countries" && (args[1] === "all" || args[1] === "any")) {
+      countries = null;
+      latestSuccessByCountry = false;
+      parseTailNums(2, { defaultPage: 25 });
+    } else if (args[0] === "recent") {
+      latestSuccessByCountry = false;
+      parseTailNums(1, { defaultPage: 25 });
+    } else if (args[0] === "nosql" || args[0] === "no-sql") {
+      enrichSql = false;
+      parseTailNums(1, { defaultPage: 50 });
     } else if (args[0] === "wh" || args[0] === "warehouse" || args[0] === "layers") {
-      parseTailNums(1, { defaultPage: 40 });
+      parseTailNums(1, { defaultPage: 50 });
     } else if (args[0] === "project" || args[0] === "--project") {
       const rawArg = String(args[1] || "");
       if (!rawArg) {
@@ -814,42 +846,60 @@ async function runCommand(config, command, message) {
       if (args[2] === "all" || args[2] === "any") {
         stageNameRe = null;
         nestDepth = 0;
+        enrichSql = false;
+        latestSuccessByCountry = false;
         pageSize = Math.min(Math.max(Number(args[3] || 20) || 20, 1), 50);
         stageMin = Number(args[4] || 15) || 15;
         jobMin = Number(args[5] || 5) || 5;
       } else {
-        pageSize = Math.min(Math.max(Number(args[2] || 20) || 20, 1), 50);
+        pageSize = Math.min(Math.max(Number(args[2] || 50) || 50, 1), 50);
         stageMin = Number(args[3] || 15) || 15;
         jobMin = Number(args[4] || 5) || 5;
       }
     } else if (args[0] === "id" || args[0] === "--id") {
       processInstanceId = Number(args[1]);
       if (!processInstanceId) {
-        return "Usage: /slow id <processInstanceId> [stageMinutes] [jobMinutes]\n全 stage：/slow id <id> all\n默认只扫 DWD/ADS 等数仓层";
+        return "Usage: /slow id <processInstanceId> [stageMinutes] [jobMinutes]\n指定日：/slow date YYYY-MM-DD\n默认：US+ID 最新 SUCCESS 天级 + Beeline SQL";
       }
+      countries = null;
+      latestSuccessByCountry = false;
       if (args[2] === "all" || args[2] === "any") {
         stageNameRe = null;
         nestDepth = 0;
+        enrichSql = false;
         stageMin = Number(args[3] || 15) || 15;
         jobMin = Number(args[4] || 5) || 5;
       } else {
         stageMin = Number(args[2] || 15) || 15;
         jobMin = Number(args[3] || 5) || 5;
       }
+    } else if (args[0] && /^\d{4}-\d{2}-\d{2}$/.test(String(args[0]))) {
+      dataDate = String(args[0]);
+      parseTailNums(1, { defaultPage: 50 });
     } else {
-      parseTailNums(0, { defaultPage: 20 });
+      parseTailNums(0, { defaultPage: 50 });
     }
     const effectiveCode = projectCode || getEffectiveProjectCode(message?.chatId, null, config);
     const ds = getDsClient(config, effectiveCode);
+    const useLatest =
+      latestSuccessByCountry && !processInstanceId && Boolean(countries?.length || country);
     const result = await ds.findSlowStageJobs({
       projectCode: effectiveCode,
       pageSize,
+      maxPages: processInstanceId ? 1 : maxPages,
       processInstanceId,
       stageMinSec: stageMin * 60,
       jobMinSec: jobMin * 60,
       country,
+      countries: country ? [country] : countries,
+      dataDate,
+      latestSuccessByCountry: useLatest,
       stageNameRe,
       nestDepth,
+      enrichSql,
+      enrichJobLimit: 8,
+      stmtTopK: 3,
+      stmtMinSec: 60,
     });
     const body = formatSlowStageJobs(result);
     const env = loadDsEnv();
@@ -860,7 +910,12 @@ async function runCommand(config, command, message) {
         jobMinSec: jobMin * 60,
         scannedInstances: result?.scannedInstances,
         country,
+        countries: result?.countries || countries,
+        dataDate: result?.dataDate || dataDate,
+        selectionMode: result?.selectionMode,
+        selectedInstances: result?.selectedInstances,
         stageNameRe: stageNameRe ? String(stageNameRe) : null,
+        enrichSql,
         dsReadonly: config.dsReadonly,
         projectCode: effectiveCode,
         uiUrlBuilder: (hit) =>
