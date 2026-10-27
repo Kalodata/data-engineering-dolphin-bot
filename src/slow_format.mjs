@@ -16,14 +16,36 @@ function scriptBase(script = "") {
   return m ? m[1] : s;
 }
 
-function sqlLabel(s = {}) {
+/** CTE / bare keyword fragments are useless in the card — show job script instead. */
+function isWeakSqlLabel(label = "") {
+  const t = String(label || "").trim();
+  if (!t) return true;
+  if (/^（未解析/.test(t)) return true;
+  if (/^WITH\b/i.test(t)) return true;
+  if (/^SELECT\b/i.test(t)) return true;
+  if (/^MERGE\b/i.test(t) && !/\bINTO\s+[`\w.]+/i.test(t)) return true;
+  if (/\bAS\s*\(?\s*$/i.test(t)) return true;
+  // too short / truncated token like "dim"
+  if (t.length <= 4 && !/^[a-z]+_[a-z0-9_]+$/i.test(t)) return true;
+  return false;
+}
+
+function sqlLabel(s = {}, script = "") {
   const tbl = String(s.table || "").trim();
-  if (tbl) return clip(tbl, 40);
-  const a0 = String(s.anchor?.[0] || "")
+  if (tbl && !isWeakSqlLabel(tbl)) return clip(tbl, 40);
+  const a0 = String(s.anchor?.[0] || s.sql?.split?.("\n")?.[0] || "")
     .replace(/^0:\s*jdbc:[^\s>]*>\s*/i, "")
     .trim();
-  if (a0) return clip(a0, 40);
-  return "（未解析表名）";
+  if (a0 && !isWeakSqlLabel(a0)) return clip(a0, 40);
+  const job = scriptBase(script);
+  return job || "（未解析表名）";
+}
+
+/** Card / dropdown display name: real table, else job script. */
+export function displaySqlName(row = {}) {
+  const raw = String(row.tableRaw || row.table || "").trim();
+  if (raw && !isWeakSqlLabel(raw)) return clip(raw, 40);
+  return scriptBase(row.script) || "JDBC";
 }
 
 /**
@@ -43,8 +65,9 @@ export function collectTopSqlRows(hits = [], { limit = 8 } = {}) {
       const script = scriptBase(job.taskScript || job.sqlScriptPath || job.name || "");
       const processInstanceId = resolveJobProcessInstanceId(job, hit);
       for (const s of job.sqlTop || []) {
-        const label = sqlLabel(s);
-        // Avoid "script · script" when table name matches script
+        const label = sqlLabel(s, script);
+        const rawTbl = String(s.table || "").trim();
+        // Avoid "script · script" when display name is already the job script
         const sqlBit =
           label && script && label.replace(/…$/, "") === script ? "" : label;
         rows.push({
@@ -55,7 +78,7 @@ export function collectTopSqlRows(hits = [], { limit = 8 } = {}) {
             s.durationLine ||
             (s.sec != null ? `No rows selected (${s.sec} seconds)` : ""),
           table: label,
-          tableRaw: String(s.table || "").trim(),
+          tableRaw: isWeakSqlLabel(rawTbl) ? "" : rawTbl,
           script,
           sqlBit,
           jobId: job.id,
@@ -162,16 +185,15 @@ export function formatSlowMarkdown(result = {}, opts = {}) {
       const jobBit = jobUrl
         ? `[#${r.jobId}](${jobUrl})`
         : `#${r.jobId}`;
-      const sqlName = r.tableRaw || r.table || r.script || "语句";
+      const sqlName = displaySqlName(r);
+      // name already job script → don't repeat after #id
       const scriptBit =
-        r.script && r.script !== sqlName && r.script !== String(r.table || "")
-          ? r.script
-          : "";
+        r.script && r.script !== sqlName ? r.script : "";
       const dur =
         r.secExact && Number(r.secExact) >= 60
           ? `**${r.secLabel}**(${r.secExact}s)`
           : `**${r.secLabel}**`;
-      // 对比主体=SQL；job 仅归属：35m52s · table ← #job [script] · ID
+      // 35m52s · table|job名 ← #id [script若不同] · ID
       const attr = [jobBit, scriptBit].filter(Boolean).join(" ");
       lines.push(`${i + 1}. ${dur} · ${sqlName} ← ${attr} · ${c}`);
     });
@@ -187,4 +209,4 @@ export function groupSlowHits() {
   return [];
 }
 
-export { clip, scriptBase, sqlLabel };
+export { clip, scriptBase, sqlLabel, isWeakSqlLabel };

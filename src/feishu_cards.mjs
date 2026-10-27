@@ -6,6 +6,7 @@
 import crypto from "node:crypto";
 import {
   collectTopSqlRows,
+  displaySqlName,
   formatSlowMarkdown,
 } from "./slow_format.mjs";
 import {
@@ -836,7 +837,7 @@ export function slowJobsCard({
         value: withProjectCode({ bundleId }, projectCode),
         options: topSql.map((r, i) => ({
           label: clip(
-            `${i + 1}. ${r.secLabel} ${r.sqlBit || r.table || r.script} ←#${r.jobId}`,
+            `${i + 1}. ${r.secLabel} ${displaySqlName(r)} ←#${r.jobId}`,
             48,
           ),
           value: encodeSlowSqlOption(bundleId, i, r),

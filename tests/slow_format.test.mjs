@@ -51,6 +51,53 @@ test("collectTopSqlRows prefers leaf processInstanceId", () => {
   assert.equal(top[0].jobId, 11527417);
 });
 
+test("WITH/CTE weak labels fall back to job script name", () => {
+  const hits = [
+    {
+      workflowId: 1,
+      country: "id",
+      dataDate: "2026-10-26",
+      jobs: [
+        {
+          id: 11566827,
+          processInstanceId: 9,
+          taskScript: "ads_brand_cate_stat",
+          sqlTop: [
+            {
+              sec: 1911,
+              secExact: "1911.882",
+              secLabel: "31m52s",
+              table: "WITH",
+            },
+          ],
+        },
+        {
+          id: 11546460,
+          processInstanceId: 8,
+          taskScript: "dwd_scraper_creator_videos",
+          sqlTop: [
+            {
+              sec: 1196,
+              secExact: "1196.72",
+              secLabel: "19m57s",
+              table: "WITH ods_new AS (",
+            },
+          ],
+        },
+      ],
+    },
+  ];
+  const text = formatSlowMarkdown({
+    hits,
+    countries: ["id"],
+    dataDate: "2026-10-26",
+    enrichSql: true,
+  });
+  assert.match(text, /ads_brand_cate_stat ← #11566827/);
+  assert.match(text, /dwd_scraper_creator_videos ← #11546460/);
+  assert.doesNotMatch(text, /· WITH ←|· WITH ods_new/);
+});
+
 test("formatSlowMarkdown ranks SQL globally with job as attribution", () => {
   const text = formatSlowMarkdown(
     { hits: sampleHits, countries: ["id"], dataDate: "2026-10-25", enrichSql: true },
