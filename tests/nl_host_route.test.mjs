@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseNlHostCommand } from "../src/nl_host_route.mjs";
+import {
+  parseNlHostCommand,
+  parseSlowSqlMinutes,
+} from "../src/nl_host_route.mjs";
 
 test("parseNlHostCommand maps write intents to slash", () => {
   assert.deepEqual(parseNlHostCommand("重跑 123"), ["/rerun", "123"]);
@@ -30,4 +33,21 @@ test("parseNlHostCommand ignores prose and slash", () => {
   assert.equal(parseNlHostCommand("对比下两天耗时为什么不能重跑"), null);
   assert.equal(parseNlHostCommand("怎么分析 dws_creator_info 耗时"), null);
   assert.equal(parseNlHostCommand("重跑策略有哪些"), null);
+});
+
+test("parseSlowSqlMinutes and slow follow-ups → /slow sql N", () => {
+  assert.equal(parseSlowSqlMinutes("超过十分钟的都列出来"), 10);
+  assert.equal(parseSlowSqlMinutes("≥15分钟"), 15);
+  assert.equal(parseSlowSqlMinutes("大于10分钟"), 10);
+  assert.deepEqual(parseNlHostCommand("超过十分钟的都列出来"), [
+    "/slow",
+    "sql",
+    "10",
+  ]);
+  assert.deepEqual(parseNlHostCommand("大于20分钟"), ["/slow", "sql", "20"]);
+  assert.deepEqual(
+    parseNlHostCommand("都列出来", { hasSlowCache: true }),
+    ["/slow", "sql", "10"],
+  );
+  assert.equal(parseNlHostCommand("都列出来"), null);
 });

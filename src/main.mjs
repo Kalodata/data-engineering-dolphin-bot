@@ -37,6 +37,7 @@ import { enrichFailureContext } from "./deep_enrich.mjs";
 import { analyzeSqlAgainstFailure } from "./sql_repo_analysis.mjs";
 import { resolveCountryCode } from "./country_code.mjs";
 import { parseNlHostCommand } from "./nl_host_route.mjs";
+import { createSessionStore } from "./session_context.mjs";
 import {
   buildAgentPromptOptions,
   buildDsOfflineMcpServers,
@@ -94,6 +95,7 @@ import {
   formatSlowSqlDetailText,
   hydrateSlowSqlFromLog,
 } from "./slow_sql_store.mjs";
+import { collectTopSqlRows } from "./slow_format.mjs";
 
 loadDotEnv(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.env"));
 
@@ -111,16 +113,34 @@ const HELP_TEXT = `可以直接打字，自然语言交给 Agent（不固定句�
 写操作弹确认卡（点按钮或回 YES）；仍禁止改工作流定义。
 告警卡可点：诊断 / 重跑 / 看日志。
 快捷：/progress id  /board  /failed  /diagnose
-高级：/slow /tasks /log /mcp /status /help`;
+高级：/slow /tasks /log /mcp /status /help
+换任务发「新话题」可清空 Chat 续聊上下文。`;
 
 const CONFIRM_TTL_MS = 5 * 60 * 1000;
 const pendingConfirms = createConfirmStore({ ttlMs: CONFIRM_TTL_MS });
 
-/** Last FAILURE / diagnosed process instance per chat — for bare「重跑」. */
-const lastFailureByChat = new Map();
+/** Unified per-chat slots + lastResult (slow cache, ids, summary). */
+const sessions = createSessionStore();
 
-/** Last diagnosed / logged FAILURE task id — for bare「强制成功」. */
-const lastTaskByChat = new Map();
+/** Compat Map-like: last FAILURE / diagnosed process instance — bare「重跑」. */
+const lastFailureByChat = {
+  get(chatId) {
+    return sessions.get(chatId).processInstanceId || undefined;
+  },
+  set(chatId, id) {
+    sessions.setProcessInstance(chatId, id);
+  },
+};
+
+/** Compat Map-like: last FAILURE task — bare「强制成功」/「看日志」. */
+const lastTaskByChat = {
+  get(chatId) {
+    return sessions.get(chatId).taskInstanceId || undefined;
+  },
+  set(chatId, id) {
+    sessions.setTaskInstance(chatId, id);
+  },
+};
 
 /** @type {Map<string, Array<{role: string, text: string}>>} */
 const chatHistories = new Map();
@@ -180,6 +200,8 @@ function loadConfig(configPath) {
     ),
     model: raw.model ?? "auto",
     maxReplyChars: Number(raw.max_reply_chars ?? 6000),
+    /** Feishu NL Chat: Agent.resume per chat (default on; FEISHU_CHAT_RESUME=0 to disable). */
+    chatAgentResume: raw.chat_agent_resume !== false,
     alertPromptPath: path.resolve(
       raw.alert_prompt_path ?? DEFAULT_ALERT_PROMPT_PATH,
     ),
@@ -681,6 +703,11 @@ async function runCommand(config, command, message) {
       return `未知项目「${key}」，可选：${keys}`;
     }
     sessionProjectByChat.set(message.chatId, key);
+    if (message?.chatId) {
+      sessions.setLastIntent(message.chatId, "use", {
+        projectCode: String(KNOWN_PROJECTS[key].code),
+      });
+    }
     const p = KNOWN_PROJECTS[key];
     const cloudKey = normalizeCloudRepoKey(key);
     const cloud = config.cloudRepos?.[cloudKey] || config.cloudRepos?.tiktok;
@@ -696,7 +723,14 @@ async function runCommand(config, command, message) {
     const ds = getDsClient(config, projectCode);
     if (projectCode === KNOWN_PROJECTS.tiktok.code) {
       const board = await listCountryDailyBoard(ds, {});
-      return { card: boardCard(board), text: formatCountryDailyBoard(board) };
+      const text = formatCountryDailyBoard(board);
+      if (message?.chatId) {
+        sessions.setLastIntent(message.chatId, "board", {
+          projectCode: String(projectCode || ""),
+          summary: String(text).slice(0, 500),
+        });
+      }
+      return { card: boardCard(board), text };
     }
     if (projectCode === KNOWN_PROJECTS.tiered.code) {
       const board = await listTieredBoard(ds, {});
@@ -721,6 +755,14 @@ async function runCommand(config, command, message) {
     const ds = getDsClient(config, projectCode);
     const result = await listRunningProgress(ds, { country, pageSize: 20 });
     const env = loadDsEnv();
+    const progressText = formatProgressReport(result);
+    if (message?.chatId) {
+      sessions.setLastIntent(message.chatId, "progress", {
+        projectCode: String(projectCode || ""),
+        country: country || null,
+        summary: String(progressText).slice(0, 500),
+      });
+    }
     return {
       card: runningCard({
         enrich: result.enrich,
@@ -732,7 +774,7 @@ async function runCommand(config, command, message) {
             processInstanceId: inst.id,
           }),
       }),
-      text: formatProgressReport(result),
+      text: progressText,
     };
   }
   if (name === "failed") {
@@ -745,6 +787,20 @@ async function runCommand(config, command, message) {
     const top = page?.totalList?.[0];
     if (top?.id && message?.chatId) lastFailureByChat.set(message.chatId, Number(top.id));
     const text = formatFailedList(page);
+    if (message?.chatId) {
+      const ids = (page?.totalList || [])
+        .map((r) => Number(r.id))
+        .filter((id) => Number.isFinite(id) && id > 0)
+        .slice(0, 10);
+      sessions.setLastIntent(message.chatId, "failed", {
+        projectCode: String(projectCode || ""),
+        processInstanceId: top?.id
+          ? Number(top.id)
+          : sessions.get(message.chatId).processInstanceId,
+        failedIds: ids,
+        summary: String(text).slice(0, 500),
+      });
+    }
     const env = loadDsEnv();
     return {
       card: failedListCard({
@@ -774,6 +830,7 @@ async function runCommand(config, command, message) {
   if (name === "slow") {
     // Default: US+ID 各自最新 SUCCESS 天级 → 数仓 stage → Beeline Top SQL（不含 RUNNING）
     // /slow
+    // /slow sql 10              — 列出 Beeline SQL≥10m（优先用本群上次扫描缓存）
     // /slow date 2026-10-26
     // /slow wh us | /slow wh id
     // /slow all …              — 任意 stage（含前置检测）
@@ -793,6 +850,9 @@ async function runCommand(config, command, message) {
     let stageNameRe = WH_STAGE_NAME_RE;
     let nestDepth = 1;
     let enrichSql = true;
+    /** @type {number} Beeline statement floor minutes; 0 = default Top8 card */
+    let sqlMinMinutes = 0;
+    let preferSlowCache = false;
 
     const parseTailNums = (from, { defaultPage = 50 } = {}) => {
       const a = args[from];
@@ -818,7 +878,17 @@ async function runCommand(config, command, message) {
       }
     };
 
-    if (args[0] === "all" || args[0] === "any") {
+    if (args[0] === "sql" || args[0] === "minsql" || args[0] === "min-sql") {
+      sqlMinMinutes = Number(args[1] || 10) || 10;
+      preferSlowCache = true;
+      // optional: /slow sql 10 date 2026-10-26 → force rescan
+      if (args[2] === "date" && /^\d{4}-\d{2}-\d{2}$/.test(String(args[3] || ""))) {
+        dataDate = String(args[3]);
+        preferSlowCache = false;
+      } else if (args[2] === "refresh" || args[2] === "rescan") {
+        preferSlowCache = false;
+      }
+    } else if (args[0] === "all" || args[0] === "any") {
       stageNameRe = null;
       nestDepth = 0;
       enrichSql = false;
@@ -886,35 +956,76 @@ async function runCommand(config, command, message) {
       parseTailNums(0, { defaultPage: 50 });
     }
     const effectiveCode = projectCode || getEffectiveProjectCode(message?.chatId, null, config);
-    const ds = getDsClient(config, effectiveCode);
-    const useLatest =
-      latestSuccessByCountry && !processInstanceId && Boolean(countries?.length || country);
-    const result = await ds.findSlowStageJobs({
-      projectCode: effectiveCode,
-      pageSize,
-      maxPages: processInstanceId ? 1 : maxPages,
-      processInstanceId,
-      stageMinSec: stageMin * 60,
-      jobMinSec: jobMin * 60,
-      country,
-      countries: country ? [country] : countries,
-      dataDate,
-      latestSuccessByCountry: useLatest,
-      stageNameRe,
-      nestDepth,
-      enrichSql,
-      // 0 = 命中的数仓 leaf job 全量拉 Beeline，再按 SQL 秒数全局 TopK
-      enrichJobLimit: 0,
-      stmtTopK: 5,
-      stmtMinSec: 60,
-    });
-    const body = formatSlowStageJobs(result);
     const env = loadDsEnv();
+    const sqlMinSec = sqlMinMinutes > 0 ? sqlMinMinutes * 60 : 0;
+    const sqlLimit = sqlMinSec > 0 ? 40 : 8;
+
+    let result = null;
+    const sess = message?.chatId ? sessions.get(message.chatId) : null;
+    if (
+      preferSlowCache &&
+      sessions.hasSlowCache(message?.chatId) &&
+      String(sess?.projectCode || "") === String(effectiveCode)
+    ) {
+      result = sess.slowResult;
+      console.error(
+        `[slow] reuse cache chat=${message.chatId} sql≥${sqlMinMinutes}m hits=${result.hits.length}`,
+      );
+    } else {
+      const ds = getDsClient(config, effectiveCode);
+      const useLatest =
+        latestSuccessByCountry && !processInstanceId && Boolean(countries?.length || country);
+      result = await ds.findSlowStageJobs({
+        projectCode: effectiveCode,
+        pageSize,
+        maxPages: processInstanceId ? 1 : maxPages,
+        processInstanceId,
+        stageMinSec: stageMin * 60,
+        jobMinSec: jobMin * 60,
+        country,
+        countries: country ? [country] : countries,
+        dataDate,
+        latestSuccessByCountry: useLatest,
+        stageNameRe,
+        nestDepth,
+        enrichSql,
+        // 0 = 命中的数仓 leaf job 全量拉 Beeline，再按 SQL 秒数全局排
+        enrichJobLimit: 0,
+        stmtTopK: sqlMinSec > 0 ? 40 : 5,
+        stmtMinSec: sqlMinSec > 0 ? sqlMinSec : 60,
+      });
+    }
+
+    const body = formatSlowStageJobs(result, {
+      sqlLimit,
+      sqlMinSec,
+    });
+    if (message?.chatId && result?.hits?.length) {
+      const slowSqlRows = collectTopSqlRows(result.hits, {
+        limit: 40,
+        minSec: sqlMinSec || 0,
+        allowJobFallback: false,
+      }).map((r) => ({
+        jobId: Number(r.jobId) || 0,
+        processInstanceId: r.processInstanceId || null,
+        sec: Number(r.sec) || 0,
+        label: String(r.table || r.script || "").slice(0, 48),
+      }));
+      sessions.setLastIntent(message.chatId, "slow", {
+        projectCode: String(effectiveCode || ""),
+        country: country || result?.countries?.[0] || null,
+        dataDate: result?.dataDate || dataDate || null,
+        sqlMinSec: sqlMinSec || null,
+        slowResult: result,
+        slowSqlRows,
+        summary: String(body).slice(0, 800),
+      });
+    }
     return {
       card: slowJobsCard({
         hits: result?.hits || [],
-        stageMinSec: stageMin * 60,
-        jobMinSec: jobMin * 60,
+        stageMinSec: result?.stageMinSec ?? stageMin * 60,
+        jobMinSec: result?.jobMinSec ?? jobMin * 60,
         scannedInstances: result?.scannedInstances,
         country,
         countries: result?.countries || countries,
@@ -922,9 +1033,11 @@ async function runCommand(config, command, message) {
         selectionMode: result?.selectionMode,
         selectedInstances: result?.selectedInstances,
         stageNameRe: stageNameRe ? String(stageNameRe) : null,
-        enrichSql,
+        enrichSql: result?.enrichSql ?? enrichSql,
         dsReadonly: config.dsReadonly,
         projectCode: effectiveCode,
+        sqlMinSec,
+        sqlLimit,
         uiUrlBuilder: (hit) =>
           buildTaskInstanceUiUrl({
             apiUrl: env.apiUrl,
@@ -934,13 +1047,15 @@ async function runCommand(config, command, message) {
             taskInstanceId: hit.jobId || hit.taskInstanceId,
           }),
       }),
-      text: `project ${effectiveCode}\n${body}`,
+      text:
+        `project ${effectiveCode}\n` +
+        `【单位=Beeline SQL 语句秒数，不是 job 墙钟】\n` +
+        body,
     };
   }
   if (name === "log") {
     const id = Number(command[1]);
     if (!id) return "Usage: /log <taskInstanceId>";
-    if (message?.chatId) lastTaskByChat.set(message.chatId, id);
     return handleLog(config, id, message);
   }
   if (name === "diagnose") {
@@ -1230,6 +1345,14 @@ async function handleLog(config, taskInstanceId, message = null, projectCodeOver
   const ds = getDsClient(config, projectCode);
   const logText = await ds.getTaskLogChunks(taskInstanceId);
   const highlight = extractLogHighlights(logText);
+  if (message?.chatId) {
+    lastTaskByChat.set(message.chatId, Number(taskInstanceId));
+    sessions.setLastIntent(message.chatId, "log", {
+      projectCode: String(projectCode || ""),
+      taskInstanceId: Number(taskInstanceId),
+      summary: `task #${taskInstanceId} log`,
+    });
+  }
   if (highlight.purged) {
     return `任务 #${taskInstanceId}\n${highlight.summary}\n${highlight.lines.join("\n")}`;
   }
@@ -1257,7 +1380,13 @@ async function handleDiagnose(config, processInstanceId, message, projectCodeOve
     instId = rows[0].id;
   }
 
-  if (message?.chatId) lastFailureByChat.set(message.chatId, Number(instId));
+  if (message?.chatId) {
+    lastFailureByChat.set(message.chatId, Number(instId));
+    sessions.setLastIntent(message.chatId, "diagnose", {
+      projectCode: String(projectCode || ""),
+      processInstanceId: Number(instId),
+    });
+  }
   const inst = await ds.getProcessInstance(instId);
   let page = await ds.listTaskInstances({
     processInstanceId: instId,
@@ -1379,6 +1508,15 @@ async function handleDiagnose(config, processInstanceId, message, projectCodeOve
     if (facing.length) {
       text += `\n\n【定责/验数】\n${facing.map((l) => `- ${l}`).join("\n")}`;
     }
+  }
+
+  if (message?.chatId) {
+    sessions.setLastIntent(message.chatId, "diagnose", {
+      projectCode: String(projectCode || ""),
+      processInstanceId: Number(instId),
+      taskInstanceId: Number(task.id),
+      summary: String(text).slice(0, 800),
+    });
   }
 
   return {
@@ -1642,6 +1780,7 @@ async function handleChat(config, message) {
     .slice(-CHAT_HISTORY_MAX)
     .map((m) => `${m.role}: ${m.text}`)
     .join("\n");
+  const sessionBlock = sessions.formatForPrompt(message.chatId);
   const env = loadDsEnv();
   const projectCode =
     getEffectiveProjectCode(message.chatId, null, config) ||
@@ -1680,12 +1819,19 @@ async function handleChat(config, message) {
 - 写操作只走宿主确认卡 + 审计日志；与 IDE MCP 配置相互独立
 - 用户问 mcp/MCP 状态：先调 ds_status，再简短说明
 
+【跟进规则】
+- 优先使用下方「本群会话状态」里的 processInstanceId / taskInstanceId / lastIntent
+- lastIntent=slow：单位=Beeline SQL 语句秒数；「超过N分钟」= SQL≥Nm，禁止改成 job 墙钟列表
+- lastIntent=diagnose/failed：用户说「这个/上面」默认指会话里的实例/任务 id
+- 缺证据再调 MCP；不要编造 id
+
 约束：
 - 不要 commit/push/删数据/开 PR
 - 禁止建议改工作流定义
 - 不输出 token、密码、完整 JDBC 连接串
 - 飞书回复宜短
 
+${sessionBlock ? `${sessionBlock}\n` : ""}
 ${historyBlock ? `## 近期对话\n${historyBlock}\n` : ""}
 ## 用户本轮
 ${message.text}`;
@@ -1694,9 +1840,12 @@ ${message.text}`;
     model: config.model,
     timeoutMs: 300_000,
     ...runtimeOpts,
+    chatId: message.chatId,
+    resumeChat: config.chatAgentResume !== false,
   });
   pushChat(message.chatId, "user", message.text);
   pushChat(message.chatId, "assistant", answer);
+  sessions.ingestIdsFromText(message.chatId, answer);
   return answer;
 }
 
@@ -1862,7 +2011,7 @@ async function maybeAttachCloudCodeAnalysis({
 
 /**
  * @param {string} prompt
- * @param {{ model?: string, timeoutMs?: number, runtime?: "cloud"|"local", localCwd?: string, cloudRepos?: Array<{url:string,startingRef?:string}>, mcpServers?: object|null, cancellable?: boolean }} opts
+ * @param {{ model?: string, timeoutMs?: number, runtime?: "cloud"|"local", localCwd?: string, cloudRepos?: Array<{url:string,startingRef?:string}>, mcpServers?: object|null, cancellable?: boolean, chatId?: string, resumeChat?: boolean }} opts
  */
 async function runCursor(prompt, opts = {}) {
   const {
@@ -1873,6 +2022,8 @@ async function runCursor(prompt, opts = {}) {
     cloudRepos = [],
     mcpServers = null,
     cancellable = false,
+    chatId = null,
+    resumeChat = false,
   } = opts;
   if (!process.env.CURSOR_API_KEY) {
     throw new Error("CURSOR_API_KEY is required for chat / /alert / /ask（写在项目 .env）");
@@ -1894,39 +2045,86 @@ async function runCursor(prompt, opts = {}) {
         : ` cwd=${localCwd}`),
   );
 
+  const waitWithTimeout = (run, agentLabel = "Agent") => {
+    const waited = run.wait().then((result) => {
+      if (result?.status === "error") {
+        return `Cursor run failed: ${result.result ?? result.id ?? "unknown error"}`;
+      }
+      return String(result?.result ?? "").trim();
+    });
+    const timeout = new Promise((_, reject) => {
+      setTimeout(async () => {
+        try {
+          if (run && typeof run.supports === "function" && run.supports("cancel")) {
+            await run.cancel();
+          }
+        } catch {
+          // ignore
+        }
+        reject(
+          new Error(
+            `Cursor ${agentLabel} 超时（>${Math.round(timeoutMs / 1000)}s），请重发或改用 /diagnose /slow`,
+          ),
+        );
+      }, timeoutMs);
+    });
+    return Promise.race([waited, timeout]);
+  };
+
   // Cloud code analysis: create+send so we can cancel on timeout (Agent.prompt cannot).
   if (cancellable && runtime === "cloud") {
     const agent = await Agent.create(agentOpts);
     let run = null;
     try {
       run = await agent.send(prompt);
-      const waited = run.wait().then((result) => {
-        if (result?.status === "error") {
-          return `Cursor run failed: ${result.result ?? result.id ?? "unknown error"}`;
-        }
-        return String(result?.result ?? "").trim();
-      });
-      const timeout = new Promise((_, reject) => {
-        setTimeout(async () => {
-          try {
-            if (run && typeof run.supports === "function" && run.supports("cancel")) {
-              await run.cancel();
-            }
-          } catch {
-            // ignore cancel errors
-          }
-          reject(
-            new Error(
-              `Cursor Agent 超时（>${Math.round(timeoutMs / 1000)}s），请重发或改用 /diagnose /slow`,
-            ),
-          );
-        }, timeoutMs);
-      });
-      return await Promise.race([waited, timeout]);
+      return await waitWithTimeout(run);
     } finally {
       try {
         if (typeof agent.close === "function") agent.close();
         else if (agent[Symbol.asyncDispose]) await agent[Symbol.asyncDispose]();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  // Feishu NL Chat: durable agent per chat (resume) when enabled.
+  const resumeEnabled =
+    resumeChat &&
+    chatId &&
+    runtime === "local" &&
+    process.env.FEISHU_CHAT_RESUME !== "0";
+  if (resumeEnabled) {
+    const prevId = sessions.get(chatId).agentId;
+    let agent = null;
+    try {
+      if (prevId) {
+        try {
+          agent = await Agent.resume(prevId, {
+            apiKey: process.env.CURSOR_API_KEY,
+            ...(localCwd ? { cwd: localCwd } : {}),
+          });
+          console.error(`[cursor] resume agentId=${prevId}`);
+        } catch (error) {
+          console.error(
+            `[cursor] resume failed (${error.message}); create new agent`,
+          );
+          sessions.clearAgentId(chatId);
+          agent = await Agent.create(agentOpts);
+        }
+      } else {
+        agent = await Agent.create(agentOpts);
+      }
+      const run = await agent.send(prompt);
+      const text = await waitWithTimeout(run, "Chat");
+      if (agent.agentId) sessions.setAgentId(chatId, agent.agentId);
+      return text;
+    } finally {
+      try {
+        if (agent) {
+          if (typeof agent.close === "function") agent.close();
+          else if (agent[Symbol.asyncDispose]) await agent[Symbol.asyncDispose]();
+        }
       } catch {
         // ignore
       }
@@ -2322,6 +2520,17 @@ async function handleMessage(config, message) {
     return;
   }
 
+  // Explicit topic switch → new Chat agent + drop task caches (keep project).
+  if (/^(新话题|换个话题|换话题|重新开始|清空上下文)$/i.test(trimmed)) {
+    sessions.resetTopic(message.chatId);
+    await deliverReply(
+      message.messageId,
+      "已开新话题（Chat 上下文已清空）。直接说下一件事即可。",
+      config,
+    );
+    return;
+  }
+
   // Plain YES/NO / 确认/取消 for pending rerun (no leading slash required).
   if (
     /^(YES|NO|确认|取消|是的?|否)$/i.test(trimmed) &&
@@ -2337,7 +2546,8 @@ async function handleMessage(config, message) {
   // Slash → runCommand. Deterministic NL host routes (writes + a few reads) → runCommand.
   // Other natural language → Chat Agent (read-only MCP).
   if (!command) {
-    command = parseNlHostCommand(message.text);
+    const snap = sessions.snapshot(message.chatId);
+    command = parseNlHostCommand(message.text, snap);
     if (command) {
       console.error(`[nl-host] → ${command.join(" ")}`);
     }

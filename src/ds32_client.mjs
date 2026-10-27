@@ -1814,7 +1814,7 @@ function formatMinutesLabel(sec) {
   return `${Math.round(sec / 60)}m`;
 }
 
-export function formatSlowStageJobs(result) {
+export function formatSlowStageJobs(result, opts = {}) {
   const {
     hits,
     stageMinSec,
@@ -1852,7 +1852,7 @@ export function formatSlowStageJobs(result) {
       `指定日：/slow date 2026-10-26 · 单国：/slow wh us · 前置检测：/slow all`
     );
   }
-  return formatSlowMarkdown(result || {});
+  return formatSlowMarkdown(result || {}, opts || {});
 }
 
 export function formatFailedList(page) {
