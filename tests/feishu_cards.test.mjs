@@ -197,24 +197,64 @@ test("failedListCard and slowJobsCard buttons", () => {
     hits: [
       {
         workflowId: 22,
-        workflowState: "RUNNING",
+        workflowState: "SUCCESS",
         workflowName: "daily",
+        country: "us",
+        dataDate: "2026-10-25",
         stageId: 3,
-        stageName: "stg",
+        stageName: "DWD-STAGE",
         stageDuration: "20m",
-        jobs: [{ id: 99, duration: "6m", name: "jdbc" }],
+        jobs: [
+          {
+            id: 99,
+            duration: "31m",
+            processInstanceId: 2353720,
+            name: "JDBC TASK",
+            taskScript: "dwd_scraper_product_sku_props",
+            sqlTop: [
+              {
+                sec: 1872,
+                secExact: "1872",
+                secLabel: "31m12s",
+                table: "dwd_scraper_product_sku_props",
+              },
+              {
+                sec: 1211,
+                secExact: "1211",
+                secLabel: "20m11s",
+                table: "dwd_scraper_product_detail_sku",
+              },
+            ],
+          },
+          {
+            id: 88,
+            duration: "16m",
+            processInstanceId: 2353721,
+            name: "JDBC TASK",
+            taskScript: "dws_seller_info",
+            sqlTop: [{ sec: 900, secExact: "900", secLabel: "15m", table: "dws_seller_info" }],
+          },
+        ],
       },
     ],
     scannedInstances: 10,
+    enrichSql: true,
+    countries: ["us", "id"],
+    selectionMode: "latest_success",
     dsReadonly: false,
     projectCode: "9892432515424",
-    uiUrlBuilder: (h) => `https://x/${h.workflowId}`,
+    uiUrlBuilder: (h) => `https://x/${h.processInstanceId}`,
   });
   const sb = JSON.stringify(s);
-  assert.match(sb, /diagnose/);
-  assert.match(sb, /看日志/);
-  assert.match(sb, /打开实例/);
+  assert.doesNotMatch(sb, /"action":"diagnose"/);
+  assert.doesNotMatch(sb, /"action":"rerun_request"/);
+  assert.doesNotMatch(sb, /为什么慢|slow_why/);
+  assert.match(sb, /slow_sql_detail/);
+  assert.match(sb, /最慢 Beeline SQL|跨数仓 job/);
+  assert.match(sb, /dwd_scraper_product_sku_props/);
   assert.match(sb, /9892432515424/);
+  assert.match(sb, /https:\/\/x\/2353720/);
+  assert.doesNotMatch(sb, /【US】/);
 });
 
 test("diagnoseCard and doneCard build", () => {

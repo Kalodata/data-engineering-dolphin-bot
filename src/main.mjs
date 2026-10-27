@@ -10,6 +10,7 @@ import {
   Ds32Client,
   buildActionPlaybook,
   buildProcessInstanceUiUrl,
+  buildTaskInstanceUiUrl,
   classifyFailure,
   extractLogHighlights,
   formatCountryDailyBoard,
@@ -88,6 +89,11 @@ import {
 } from "./card_callback.mjs";
 import { createAuditLog } from "./audit_log.mjs";
 import { startBoardPush, startTieredBoardPush } from "./board_push.mjs";
+import {
+  resolveSlowSqlOption,
+  formatSlowSqlDetailText,
+  hydrateSlowSqlFromLog,
+} from "./slow_sql_store.mjs";
 
 loadDotEnv(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.env"));
 
@@ -897,8 +903,9 @@ async function runCommand(config, command, message) {
       stageNameRe,
       nestDepth,
       enrichSql,
-      enrichJobLimit: 8,
-      stmtTopK: 3,
+      // 0 = 命中的数仓 leaf job 全量拉 Beeline，再按 SQL 秒数全局 TopK
+      enrichJobLimit: 0,
+      stmtTopK: 5,
       stmtMinSec: 60,
     });
     const body = formatSlowStageJobs(result);
@@ -919,10 +926,12 @@ async function runCommand(config, command, message) {
         dsReadonly: config.dsReadonly,
         projectCode: effectiveCode,
         uiUrlBuilder: (hit) =>
-          buildProcessInstanceUiUrl({
+          buildTaskInstanceUiUrl({
             apiUrl: env.apiUrl,
             projectCode: effectiveCode,
-            processInstanceId: hit.workflowId,
+            // leaf only — never top-level 天级 / wrong-country fallback
+            processInstanceId: hit.processInstanceId || null,
+            taskInstanceId: hit.jobId || hit.taskInstanceId,
           }),
       }),
       text: `project ${effectiveCode}\n${body}`,
@@ -2100,6 +2109,24 @@ async function sendText({ chatId, userId, text, card }) {
   await runProcess("lark-cli", args);
 }
 
+/** Feishu markdown/post — native code blocks (language + copy). */
+async function sendMarkdown({ chatId, userId, markdown }) {
+  const args = [
+    "im",
+    "+messages-send",
+    "--as",
+    "bot",
+    "--markdown",
+    String(markdown || ""),
+  ];
+  if (chatId) args.push("--chat-id", chatId);
+  else if (userId) args.push("--user-id", userId);
+  else throw new Error("sendMarkdown requires chatId or userId");
+  const profile = process.env.LARK_PROFILE || process.env.FEISHU_PROFILE;
+  if (profile) args.unshift("--profile", profile);
+  await runProcess("lark-cli", args);
+}
+
 async function sendCard({ chatId, userId, card }) {
   const args = [
     "im",
@@ -2412,8 +2439,8 @@ async function handleCardAction(action) {
       return { toast: { type: "success", content: `诊断 #${id} 已发送` } };
     }
 
-    if (name === "log") {
-      const taskId = Number(v.taskId);
+    if (name === "log" || name === "slow_sql_log") {
+      const taskId = Number(v.option || v.taskId);
       if (!taskId) return { toast: { type: "error", content: "缺少任务 id" } };
       const fakeMsg = {
         chatId: chatId || `cb:${action.openId || "anon"}`,
@@ -2424,6 +2451,46 @@ async function handleCardAction(action) {
       if (chatId) await sendText({ chatId, text });
       else if (action.openId) await sendText({ userId: action.openId, text });
       return { toast: { type: "success", content: `日志 #${taskId}` } };
+    }
+
+    if (name === "slow_sql_detail") {
+      let row = resolveSlowSqlOption(v.option ?? v.index, v.bundleId);
+      if (!row) {
+        return {
+          toast: {
+            type: "error",
+            content: "明细已过期，请重新 /slow",
+          },
+        };
+      }
+      const env = loadDsEnv();
+      const projectCode = getEffectiveProjectCode(
+        chatId,
+        v.projectCode || null,
+        config,
+      );
+      try {
+        const ds = getDsClient(config, projectCode);
+        row = await hydrateSlowSqlFromLog(ds, row);
+      } catch (error) {
+        console.error(`[slow_sql_detail] hydrate: ${error.message}`);
+      }
+      const jobUrl = buildTaskInstanceUiUrl({
+        apiUrl: env.apiUrl,
+        projectCode,
+        processInstanceId: row.processInstanceId || null,
+        taskInstanceId: row.jobId,
+      });
+      const markdown = formatSlowSqlDetailText(row, { jobUrl });
+      try {
+        if (chatId) await sendMarkdown({ chatId, markdown });
+        else if (action.openId) await sendMarkdown({ userId: action.openId, markdown });
+      } catch (error) {
+        console.error(`[slow_sql_detail] markdown failed: ${error.message}`);
+        if (chatId) await sendText({ chatId, text: markdown });
+        else if (action.openId) await sendText({ userId: action.openId, text: markdown });
+      }
+      return { toast: { type: "success", content: `SQL #${row.jobId || "?"}` } };
     }
 
     if (name === "rerun_request") {
