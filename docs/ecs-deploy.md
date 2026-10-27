@@ -20,7 +20,8 @@ Workflow：`.github/workflows/deploy-ecs.yml`
 
 - **触发**：`push` 到 `main`（OIDC 目前也只信任 main；非 main 会 `AssumeRoleWithWebIdentity` 拒绝）
 - **鉴权**：`permissions: id-token: write` + `role-to-assume: dolphin-bot-cicd`（**不要**配 `AWS_ACCESS_KEY_ID`）
-- **步骤**：checkout → OIDC → ECR login → build/push → `update-service --force-new-deployment`
+- **步骤**：checkout → OIDC → ECR login → build/push（`:$SHA` + `:latest`）→ **register task definition（image 钉死 `$SHA`）** → `update-service --task-definition … --force-new-deployment`
+- 仅 `force-new-deployment` 而不改 TD image 时，可能继续跑旧 digest；故 CI 必须 register 新版本
 
 ### 上线顺序
 

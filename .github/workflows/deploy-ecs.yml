@@ -1,7 +1,6 @@
-# CI/CD: main → ECR + ECS update-service（OIDC，无 AK/SK）
+# CI/CD: main → ECR + register task definition (image=:sha) + ECS update-service（OIDC）
 # Role: arn:aws:iam::136376784788:role/dolphin-bot-cicd
-# 首次：push 出镜像后，由运维建 Task Definition + Service；之后本 workflow 只 force-new-deployment。
-# OIDC 信任目前仅 main（非 main 会 AssumeRoleWithWebIdentity 拒绝）。
+# 仅 force-new-deployment 可能继续跑旧 digest；必须 register 新 TD 指向本次 GITHUB_SHA。
 name: deploy-ecs
 
 on:
@@ -40,17 +39,40 @@ jobs:
           docker push "$ECR:${GITHUB_SHA}"
           docker push "$ECR:latest"
 
-      - name: Deploy (force new deployment)
+      - name: Register task definition + deploy
         run: |
           set -euo pipefail
-          # Service 未创建时会失败——预期：先有镜像，运维建好 Service 后再跑或 re-run。
+          IMAGE="$ECR:${GITHUB_SHA}"
+          TD_SRC=deploy/ecs/task-definition.json
+          TD_OUT="$(mktemp)"
+          cp "$TD_SRC" "$TD_OUT"
+          node -e '
+            const fs = require("fs");
+            const p = process.argv[1];
+            const img = process.argv[2];
+            const j = JSON.parse(fs.readFileSync(p, "utf8"));
+            j.containerDefinitions[0].image = img;
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+          ' "$TD_OUT" "$IMAGE"
+          ARN=$(aws ecs register-task-definition \
+            --cli-input-json "file://${TD_OUT}" \
+            --region "$AWS_REGION" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "registered: $ARN"
+          echo "image: $IMAGE"
           aws ecs update-service \
             --cluster "$ECS_CLUSTER" \
             --service "$ECS_SERVICE" \
+            --task-definition "$ARN" \
+            --desired-count 1 \
             --force-new-deployment \
-            --region "$AWS_REGION"
+            --region "$AWS_REGION" \
+            --query 'service.{status:status,desired:desiredCount,running:runningCount,taskDef:taskDefinition}' \
+            --output table
           aws ecs wait services-stable \
             --cluster "$ECS_CLUSTER" \
             --services "$ECS_SERVICE" \
             --region "$AWS_REGION" \
             || echo "::warning::wait services-stable timed out or failed; check ECS console"
+          rm -f "$TD_OUT"
