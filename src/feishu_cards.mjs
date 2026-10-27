@@ -770,7 +770,7 @@ export function slowJobsCard({
         md(
           `扫了 ${scannedInstances} 个实例` +
             (filters ? `（${filters}）` : "") +
-            `：没有「stage≥${stageLabel}m 且 job≥${jobLabel}m」。\n可加大扫描：/slow 40 或 /slow wh id`,
+            `：没有「数仓层 stage≥${stageLabel}m 且 SQL job≥${jobLabel}m」。\n加大扫描：/slow 40 · 含前置检测/导出：/slow all`,
         ),
       ],
     });

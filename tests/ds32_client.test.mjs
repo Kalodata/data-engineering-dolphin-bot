@@ -9,6 +9,8 @@ import {
   formatFailedList,
   formatPracticalDiagnosis,
   formatTaskList,
+  isMeaningfulSlowLeaf,
+  WH_STAGE_NAME_RE,
 } from "../src/ds32_client.mjs";
 
 test("extractLogHighlights finds Exception context", () => {
@@ -357,6 +359,25 @@ test("formatFailedList includes next step", () => {
 
 test("formatTaskList empty", () => {
   assert.match(formatTaskList(9, { totalList: [] }), /没有任务/);
+});
+
+test("slow leaf filter drops wait/gate jobs, keeps JDBC script tasks", () => {
+  assert.equal(
+    isMeaningfulSlowLeaf({ name: "检查采集得数据是否处理完成" }, ""),
+    false,
+  );
+  assert.equal(isMeaningfulSlowLeaf({ name: "为游客模式功能生成数据" }, ""), false);
+  assert.equal(
+    isMeaningfulSlowLeaf(
+      { name: "JDBC TASK" },
+      "dwd/dwd_product_info_daily.sql",
+    ),
+    true,
+  );
+  assert.equal(isMeaningfulSlowLeaf({ name: "dwd_scraper_creator_videos" }, ""), true);
+  assert.match("DWD-STAGE", WH_STAGE_NAME_RE);
+  assert.doesNotMatch("前置检测", WH_STAGE_NAME_RE);
+  assert.doesNotMatch("导出数据给kalodata.com", WH_STAGE_NAME_RE);
 });
 
 test("visitor shell exit 124 is 超时 not 分区/路径 (ignore script echo ERROR / partition text)", () => {

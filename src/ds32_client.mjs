@@ -320,7 +320,7 @@ export class Ds32Client {
         out.push(...nested);
         continue;
       }
-      if (typ === "CONDITIONS") continue;
+      if (typ === "CONDITIONS" || typ === "SWITCH" || typ === "DEPENDENT") continue;
       const sec = parseDurationToSeconds(t.duration);
       if (sec < jobMinSec) continue;
       let taskScript = "";
@@ -332,6 +332,7 @@ export class Ds32Client {
       } catch {
         taskScript = "";
       }
+      if (!isMeaningfulSlowLeaf(t, taskScript)) continue;
       out.push({
         id: t.id,
         name: t.name,
@@ -1499,7 +1500,24 @@ export async function resolveInstanceByCountryDate(
   return results;
 }
 
+/** TikTok daily warehouse layer stages (SQL/JDBC live under these). */
 export const WH_STAGE_NAME_RE = /^(ADS|DWS|DWM|DWD|ODS|DIM)-STAGE$/i;
+
+/**
+ * Gate / wait / export leaves that inflate duration but are not pipeline SQL.
+ * Used by /slow so「前置检测」「检查采集」不再刷屏.
+ */
+export const SLOW_JOB_NOISE_NAME_RE =
+  /前置检测|检查采集|是否处理完成|游客模式|为游客|visitor\s*init|ROUTER|CHECK\s*VALID/i;
+
+/** Keep leaves that look like warehouse SQL/JDBC work. */
+export function isMeaningfulSlowLeaf(task = {}, taskScript = "") {
+  const name = String(task?.name || "");
+  if (SLOW_JOB_NOISE_NAME_RE.test(name)) return false;
+  if (String(taskScript || "").trim()) return true;
+  if (/\.sql\b|JDBC|SQL|\b(dwd|dws|dwm|ads|ods|dim)_/i.test(name)) return true;
+  return false;
+}
 
 function formatMinutesLabel(sec) {
   if (sec >= 3600) {
@@ -1526,13 +1544,14 @@ export function formatSlowStageJobs(result) {
       `扫了 ${scannedInstances ?? 0} 个工作流实例` +
       (filters ? `（${filters}）` : "") +
       `：没有「stage≥${stageLabel} 且内含 job≥${jobLabel}」。\n` +
-      `可加大扫描：/slow 40 或 /slow wh id`
+      `可加大扫描：/slow 40 · 看全部 stage（含前置检测）：/slow all`
     );
   }
+  const scope = stageNameRe ? "数仓层" : "全 stage";
   const lines = [
-    `慢 stage/job（stage≥${stageLabel}，job≥${jobLabel}` +
+    `🐢 慢任务 · ${scope}（stage≥${stageLabel}，job≥${jobLabel}` +
       (filters ? `，${filters}` : "") +
-      `；扫 ${scannedInstances} 个实例，命中 ${hits.length} 个 stage）：`,
+      `；扫 ${scannedInstances} 个，命中 ${hits.length}）：`,
     "",
   ];
   const shown = hits.slice(0, 12);
