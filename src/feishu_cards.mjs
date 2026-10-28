@@ -371,10 +371,27 @@ export function diagnoseCard({
       }),
     );
   }
+  if (processInstanceId) {
+    actions.push(
+      button({
+        label: "Agent 深挖",
+        action: "agent_deep_dive",
+        type: "primary",
+        value: withProjectCode(
+          {
+            processInstanceId: String(processInstanceId),
+            taskId: taskId ? String(taskId) : "",
+            category: String(category || ""),
+          },
+          projectCode,
+        ),
+      }),
+    );
+  }
 
   els.push(hr());
   if (actions.length) els.push(actionRow(actions));
-  els.push(note("也可回复：重跑 / 强制成功 任务 #<id> · YES 确认"));
+  els.push(note("也可回复：重跑 / 强制成功 · 或问「为什么失败」走 Agent 解读"));
 
   return card({
     title: "🩺 失败诊断",
@@ -865,6 +882,20 @@ export function slowJobsCard({
         `没有 ≥${sqlMinM}m 的 Beeline SQL。可改阈值：超过十五分钟的都列出来 · /slow sql 5`,
       ),
     );
+  }
+
+  if (topSql.length) {
+    els.push(
+      actionRow([
+        button({
+          label: "Agent 解读",
+          action: "agent_interpret_slow",
+          type: "primary",
+          value: withProjectCode({}, projectCode),
+        }),
+      ]),
+    );
+    els.push(note("问「为什么慢 / 怎么优化」也会走 Agent，不会再刷列表"));
   }
 
   return card({

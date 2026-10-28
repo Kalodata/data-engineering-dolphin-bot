@@ -39,6 +39,7 @@ function emptySession() {
     summary: "",
     slowResult: null,
     agentId: null,
+    agentDive: null,
   };
 }
 
@@ -195,6 +196,9 @@ export function createSessionStore({ ttlMs = DEFAULT_TTL_MS } = {}) {
       );
     }
     if (s.agentId) lines.push(`- chatAgentId: ${s.agentId}（多轮续聊中）`);
+    if (s.agentDive) {
+      lines.push(`- lastAgentDive: ${String(s.agentDive).slice(0, 400)}`);
+    }
     if (s.summary) {
       lines.push(`- summary: ${String(s.summary).slice(0, 600)}`);
     }
