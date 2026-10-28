@@ -39,6 +39,17 @@ import { resolveCountryCode } from "./country_code.mjs";
 import { parseNlHostCommand } from "./nl_host_route.mjs";
 import { createSessionStore } from "./session_context.mjs";
 import {
+  resolveChatEnrichment,
+  buildEnrichmentPromptBlock,
+} from "./chat_enrich.mjs";
+import {
+  needsAgentDeepDive,
+  isAgentExplainIntent,
+  buildDiagnoseDeepDivePrompt,
+  buildAlertExplorePrompt,
+  buildSlowInterpretPrompt,
+} from "./agent_deep_dive.mjs";
+import {
   buildAgentPromptOptions,
   buildDsOfflineMcpServers,
   loadCloudReposMap,
@@ -202,6 +213,9 @@ function loadConfig(configPath) {
     maxReplyChars: Number(raw.max_reply_chars ?? 6000),
     /** Feishu NL Chat: Agent.resume per chat (default on; FEISHU_CHAT_RESUME=0 to disable). */
     chatAgentResume: raw.chat_agent_resume !== false,
+    /** Diagnose: auto Agent deep-dive when category is 未知/证据不足/执行失败. */
+    agentDeepDiveAuto: raw.agent_deep_dive_auto !== false,
+    agentDeepDiveTimeoutMs: Number(raw.agent_deep_dive_timeout_ms ?? 120_000),
     alertPromptPath: path.resolve(
       raw.alert_prompt_path ?? DEFAULT_ALERT_PROMPT_PATH,
     ),
@@ -1519,6 +1533,40 @@ async function handleDiagnose(config, processInstanceId, message, projectCodeOve
     });
   }
 
+  // 弱类别：自动 Agent 深挖（时间盒）；强类别只出卡，可点「Agent 深挖」
+  let deepDiveText = "";
+  if (
+    config.agentDeepDiveAuto !== false &&
+    needsAgentDeepDive(classification.category) &&
+    process.env.CURSOR_API_KEY
+  ) {
+    try {
+      console.error(
+        `[diagnose] auto Agent deep-dive category=${classification.category} #${instId}`,
+      );
+      deepDiveText = await runDiagnoseAgentDeepDive(config, message, {
+        processInstanceId: instId,
+        taskId: task.id,
+        category: classification.category,
+        summary: text,
+        projectCode,
+      });
+      if (deepDiveText) {
+        text = `${text}\n\n【Agent 深挖】\n${deepDiveText}`;
+        if (message?.chatId) {
+          sessions.update(message.chatId, {
+            summary: String(text).slice(0, 1200),
+            agentDive: String(deepDiveText).slice(0, 800),
+          });
+        }
+      }
+    } catch (error) {
+      console.error(`[diagnose] deep-dive failed: ${error.message}`);
+      deepDiveText = `（Agent 深挖失败：${error.message}）`;
+      text = `${text}\n\n${deepDiveText}`;
+    }
+  }
+
   return {
     card: diagnoseCard({
       category: classification.category,
@@ -1541,6 +1589,57 @@ async function handleDiagnose(config, processInstanceId, message, projectCodeOve
     }),
     text,
   };
+}
+
+async function runDiagnoseAgentDeepDive(config, message, ctx) {
+  const runtimeOpts = agentRuntimeForChat(config, message?.chatId);
+  const mcpNames = runtimeOpts.mcpServers
+    ? Object.keys(runtimeOpts.mcpServers).join(", ")
+    : "ds-offline";
+  const prompt = buildDiagnoseDeepDivePrompt({
+    ...ctx,
+    mcpNames,
+  });
+  const timeoutMs = Number(config.agentDeepDiveTimeoutMs || 120_000);
+  return runCursor(prompt, {
+    model: config.model,
+    timeoutMs,
+    ...runtimeOpts,
+    chatId: message?.chatId || null,
+    resumeChat: false,
+  });
+}
+
+async function runSlowAgentInterpret(config, message, userAsk = "") {
+  const snap = sessions.snapshot(message?.chatId);
+  const runtimeOpts = agentRuntimeForChat(config, message?.chatId);
+  const mcpNames = runtimeOpts.mcpServers
+    ? Object.keys(runtimeOpts.mcpServers).join(", ")
+    : "ds-offline";
+  const prompt = buildSlowInterpretPrompt({
+    summary: sessions.get(message?.chatId).summary || "",
+    slowSqlRows: snap.slowSqlRows || [],
+    projectCode: snap.projectCode || "",
+    mcpNames,
+    userAsk: userAsk || "请解读最慢的几条 Beeline SQL，并给优化方向",
+  });
+  const timeoutMs = Number(config.agentDeepDiveTimeoutMs || 120_000);
+  const answer = await runCursor(prompt, {
+    model: config.model,
+    timeoutMs,
+    ...runtimeOpts,
+    chatId: message?.chatId || null,
+    resumeChat: config.chatAgentResume !== false,
+  });
+  if (message?.chatId && answer) {
+    sessions.update(message.chatId, {
+      agentDive: String(answer).slice(0, 800),
+      summary: `slow interpret: ${String(answer).slice(0, 600)}`,
+    });
+    pushChat(message.chatId, "user", userAsk || "Agent 解读慢 SQL");
+    pushChat(message.chatId, "assistant", answer);
+  }
+  return answer;
 }
 
 async function handleConfirm(config, message, accepted) {
@@ -1674,18 +1773,25 @@ async function handleAlert(config, alertText, message) {
   if (message?.chatId && evidence?.processInstanceId) {
     lastFailureByChat.set(message.chatId, Number(evidence.processInstanceId));
   }
+  if (message?.chatId && evidence?.taskId) {
+    lastTaskByChat.set(message.chatId, Number(evidence.taskId));
+  }
 
   const enrichedText = evidence?.block
     ? `${alertText}\n\n---\n【桥接取证】\n${evidence.block}`
     : alertText;
 
+  const cat = evidence?.classification?.category || "";
+  const forceAgentExplore =
+    needsAgentDeepDive(cat) || !shouldUseAlertTemplate(evidence);
+
   const webhookUrl = process.env.CURSOR_WEBHOOK_ALERT_URL;
   const webhookKey = process.env.CURSOR_WEBHOOK_ALERT_KEY;
   let cardText;
   let interactive = null;
-  if (webhookUrl && webhookKey) {
+  if (webhookUrl && webhookKey && !forceAgentExplore) {
     cardText = await runAlertWebhook(webhookUrl, webhookKey, enrichedText, message);
-  } else if (shouldUseAlertTemplate(evidence)) {
+  } else if (shouldUseAlertTemplate(evidence) && !forceAgentExplore) {
     const env = loadDsEnv();
     const fields = {
       task: evidence.task || { id: evidence.taskId, processInstanceId: evidence.processInstanceId },
@@ -1702,13 +1808,61 @@ async function handleAlert(config, alertText, message) {
       `[alert] template card category=${evidence.classification?.category || "?"} task=#${evidence.taskId}`,
     );
   } else {
-    console.error("[alert] weak evidence → local Agent card");
-    cardText = await runAlertLocal(config, alertText, evidence?.block || "", message);
+    console.error(
+      `[alert] unknown/weak category=${cat || "?"} → force Agent explore`,
+    );
+    const projectCode = getEffectiveProjectCode(message?.chatId, null, config);
+    const runtimeOpts = agentRuntimeForChat(config, message?.chatId);
+    const mcpNames = runtimeOpts.mcpServers
+      ? Object.keys(runtimeOpts.mcpServers).join(", ")
+      : "ds-offline";
+    try {
+      if (process.env.CURSOR_API_KEY) {
+        const prompt = buildAlertExplorePrompt({
+          alertText,
+          evidenceBlock: evidence?.block || "",
+          category: cat || "未知",
+          processInstanceId: evidence?.processInstanceId,
+          taskId: evidence?.taskId,
+          projectCode,
+          mcpNames,
+        });
+        cardText = await runCursor(prompt, {
+          model: config.model,
+          timeoutMs: Number(config.agentDeepDiveTimeoutMs || 120_000),
+          ...runtimeOpts,
+          chatId: message?.chatId || null,
+          resumeChat: false,
+        });
+      } else {
+        cardText = await runAlertLocal(config, alertText, evidence?.block || "", message);
+      }
+    } catch (error) {
+      console.error(`[alert] Agent explore failed: ${error.message}`);
+      cardText = await runAlertLocal(config, alertText, evidence?.block || "", message);
+    }
   }
+
+  if (message?.chatId) {
+    sessions.setLastIntent(message.chatId, "diagnose", {
+      projectCode: String(
+        getEffectiveProjectCode(message.chatId, null, config) || "",
+      ),
+      processInstanceId: evidence?.processInstanceId
+        ? Number(evidence.processInstanceId)
+        : sessions.get(message.chatId).processInstanceId,
+      taskInstanceId: evidence?.taskId
+        ? Number(evidence.taskId)
+        : sessions.get(message.chatId).taskInstanceId,
+      summary: String(cardText || "").slice(0, 1200),
+      agentDive: forceAgentExplore ? String(cardText || "").slice(0, 800) : undefined,
+    });
+  }
+
   if (interactive) {
     return { card: interactive, text: cardText };
   }
-  if (shouldUseAlertTemplate(evidence) && !webhookUrl) {
+  if (shouldUseAlertTemplate(evidence) && !webhookUrl && !forceAgentExplore) {
     return cardText;
   }
   return cardText;
@@ -1774,13 +1928,17 @@ async function runAlertLocal(config, alertText, evidenceBlock = "", message = nu
   });
 }
 
-async function handleChat(config, message) {
+async function handleChat(config, message, enrich = null) {
   const history = chatHistories.get(message.chatId) || [];
   const historyBlock = history
     .slice(-CHAT_HISTORY_MAX)
     .map((m) => `${m.role}: ${m.text}`)
     .join("\n");
   const sessionBlock = sessions.formatForPrompt(message.chatId);
+  const snap = sessions.snapshot(message.chatId);
+  const enrichBlock = enrich
+    ? buildEnrichmentPromptBlock(enrich, snap)
+    : buildEnrichmentPromptBlock(resolveChatEnrichment(message.text, snap), snap);
   const env = loadDsEnv();
   const projectCode =
     getEffectiveProjectCode(message.chatId, null, config) ||
@@ -1793,44 +1951,39 @@ async function handleChat(config, message) {
     : "(none)";
   const repoHint = `本地 bot 工作区可读；调度数据请用 MCP「ds-offline」工具（已挂载：${mcpNames}）`;
 
-  const prompt = `你是通过飞书接入的 Cursor Agent（体验尽量接近 IDE 里对话）。
-用户说法不固定：自行理解意图，用已有只读 MCP 工具组合完成，不要假设固定句式，也不要只推「请用 /xxx」。
+  const prompt = `你是通过飞书接入的 Cursor Agent（体验尽量接近 IDE 里连续对话）。
+用户说法不固定：自行理解意图，用已有只读 MCP 工具组合完成。
 查 DolphinScheduler 必须优先调用 MCP 工具 ds_*（ds-offline），不要声称没有 DS 工具。
 用中文简洁回答。
+
+【自然语言体验硬约束】
+- 禁止用「请使用 /slow」「请用 /diagnose」结束对话；列表类已由宿主处理，你负责解释、对比、根因、优化建议
+- 能查就先查；只缺关键槽（国家/日期/实例）时最多追问一句
+- 同主题多轮：沿用会话状态与工具结果，不要每次重做整表排行
 
 【MCP / DS — 只读核心能力】
 - 已挂载 MCP：${mcpNames}（只读；没有 ds_rerun）
 - 原子工具：ds_status、ds_list_failed、ds_list_tasks、ds_get_log、ds_diagnose、ds_slow、ds_progress、ds_board
-- 自行组合上述工具回答任意运维只读问题；缺证据就继续查，不要编造
-- 写操作（重跑 / 整实例重跑 / 强制成功 / STOP）：本会话无写工具。引导用户发「重跑 <实例id>」或「强制成功 任务 #<id>」（宿主会弹确认卡），或点告警/诊断卡按钮；不要假装已提交
+- 自行组合上述工具回答运维只读问题；缺证据就继续查，不要编造
+- 写操作：引导用户发「重跑 <实例id>」或「强制成功 任务 #<id>」（宿主确认卡）；不要假装已提交
 - 当前项目 code=${projectCode}
 
 【代码上下文】
 - ${repoHint}
-- 用 /use tiktok|amz|shopee 切换调度项目（影响 DS project + MCP 默认项目）
-- 深挖 pipeline SQL：可建议 /diagnose（会走 Cloud 读 GitHub 仓）；本会话以 DS MCP 为主
+- /use tiktok|amz|shopee 切换项目；深挖 pipeline 可建议宿主 /diagnose（Cloud 读仓）
 
-【飞书排版硬约束】
-- 禁止 Markdown 表格（不要用 | 列 |）；改用短行或「· 项 — 值」
-- 少用粗体堆砌；回复宜短
+【飞书排版】
+- 禁止 Markdown 表格；少用粗体；回复宜短
 
-【架构】
-- 飞书 bot Agent 通过 SDK 挂载只读 ds-offline MCP → Ds32Client → DS REST
-- 写操作只走宿主确认卡 + 审计日志；与 IDE MCP 配置相互独立
-- 用户问 mcp/MCP 状态：先调 ds_status，再简短说明
-
-【跟进规则】
-- 优先使用下方「本群会话状态」里的 processInstanceId / taskInstanceId / lastIntent
-- lastIntent=slow：单位=Beeline SQL 语句秒数；「超过N分钟」= SQL≥Nm，禁止改成 job 墙钟列表
-- lastIntent=diagnose/failed：用户说「这个/上面」默认指会话里的实例/任务 id
-- 缺证据再调 MCP；不要编造 id
+【跟进】
+- 优先用下方会话状态里的 id / lastIntent / summary
+- lastIntent=slow：单位=Beeline SQL 秒数，禁止改成 job 墙钟列表塞给用户
 
 约束：
-- 不要 commit/push/删数据/开 PR
-- 禁止建议改工作流定义
+- 不要 commit/push/删数据/开 PR；禁止建议改工作流定义
 - 不输出 token、密码、完整 JDBC 连接串
-- 飞书回复宜短
 
+${enrichBlock ? `${enrichBlock}\n` : ""}
 ${sessionBlock ? `${sessionBlock}\n` : ""}
 ${historyBlock ? `## 近期对话\n${historyBlock}\n` : ""}
 ## 用户本轮
@@ -2348,6 +2501,17 @@ async function deliverReply(messageId, response, config) {
   if (response && typeof response === "object" && response.card) {
     try {
       await replyCard(messageId, response.card);
+      // 诊断自动深挖等：卡片之外再跟一条 Agent 结论
+      const rawText = response.text != null ? String(response.text) : "";
+      if (/【Agent 深挖】/.test(rawText)) {
+        const dive = rawText.split("【Agent 深挖】")[1]?.trim();
+        if (dive) {
+          await reply(
+            messageId,
+            trimReply(`🔎 Agent 深挖\n${dive}`, config.maxReplyChars),
+          );
+        }
+      }
       return;
     } catch (error) {
       console.error(`[replyCard] fallback to text: ${error.message}`);
@@ -2543,13 +2707,35 @@ async function handleMessage(config, message) {
   }
 
   let command = parseCommand(message.text);
-  // Slash → runCommand. Deterministic NL host routes (writes + a few reads) → runCommand.
-  // Other natural language → Chat Agent (read-only MCP).
+  // Slash → runCommand.
+  // Why/how/optimize after slow|diagnose → Chat Agent first（禁止当列表意图）.
+  // Other high-confidence NL → host. Else → Chat.
+  let chatEnrich = null;
   if (!command) {
     const snap = sessions.snapshot(message.chatId);
-    command = parseNlHostCommand(message.text, snap);
-    if (command) {
-      console.error(`[nl-host] → ${command.join(" ")}`);
+    chatEnrich = resolveChatEnrichment(message.text, snap);
+    const explainFirst =
+      isAgentExplainIntent(message.text) &&
+      (snap.lastIntent === "slow" ||
+        snap.lastIntent === "diagnose" ||
+        snap.lastIntent === "failed" ||
+        snap.lastIntent === "log" ||
+        snap.hasSlowCache);
+    if (explainFirst) {
+      if (!chatEnrich) {
+        chatEnrich =
+          snap.lastIntent === "slow" || snap.hasSlowCache
+            ? { mode: "interpret_slow", label: "解读慢 SQL" }
+            : { mode: "interpret_diagnose", label: "解读诊断" };
+      }
+      console.error(`[nl-chat] enrich-first=${chatEnrich.mode}`);
+    } else {
+      command = parseNlHostCommand(message.text, snap);
+      if (command) {
+        console.error(`[nl-host] → ${command.join(" ")}`);
+      } else if (chatEnrich) {
+        console.error(`[nl-chat] enrich=${chatEnrich.mode} (${chatEnrich.label})`);
+      }
     }
   }
 
@@ -2587,8 +2773,8 @@ async function handleMessage(config, message) {
       } catch {
         // ignore
       }
-      // Open NL → Chat Agent (read-only MCP).
-      response = await handleChat(config, message);
+      // Open NL → Chat Agent（解释类带 enrichment，发挥分析能力）
+      response = await handleChat(config, message, chatEnrich);
     } else {
       return;
     }
@@ -2646,7 +2832,74 @@ async function handleCardAction(action) {
       } else if (action.openId && result?.card) {
         await sendCard({ userId: action.openId, card: result.card });
       }
+      if (result?.text && /【Agent 深挖】/.test(String(result.text))) {
+        const dive = String(result.text).split("【Agent 深挖】")[1]?.trim();
+        if (dive) {
+          if (chatId) await sendText({ chatId, text: `🔎 Agent 深挖\n${dive}` });
+          else if (action.openId) await sendText({ userId: action.openId, text: `🔎 Agent 深挖\n${dive}` });
+        }
+      }
       return { toast: { type: "success", content: `诊断 #${id} 已发送` } };
+    }
+
+    if (name === "agent_deep_dive") {
+      const id = Number(v.processInstanceId);
+      if (!id) return { toast: { type: "error", content: "缺少实例 id" } };
+      if (!process.env.CURSOR_API_KEY) {
+        return { toast: { type: "error", content: "未配置 CURSOR_API_KEY" } };
+      }
+      const fakeMsg = {
+        chatId: chatId || `cb:${action.openId || "anon"}`,
+        senderId: action.openId,
+        messageId: action.messageId,
+      };
+      const sess = sessions.get(fakeMsg.chatId);
+      const projectCode = getEffectiveProjectCode(
+        fakeMsg.chatId,
+        v.projectCode || null,
+        config,
+      );
+      const dive = await runDiagnoseAgentDeepDive(config, fakeMsg, {
+        processInstanceId: id,
+        taskId: Number(v.taskId) || sess.taskInstanceId,
+        category: v.category || "未知",
+        summary: sess.summary || "",
+        projectCode,
+      });
+      sessions.setLastIntent(fakeMsg.chatId, "diagnose", {
+        processInstanceId: id,
+        taskInstanceId: Number(v.taskId) || sess.taskInstanceId,
+        projectCode: String(projectCode || ""),
+        summary: String(dive || "").slice(0, 1200),
+        agentDive: String(dive || "").slice(0, 800),
+      });
+      const out = `🔎 Agent 深挖 #${id}\n${dive || "(empty)"}`;
+      if (chatId) await sendText({ chatId, text: out });
+      else if (action.openId) await sendText({ userId: action.openId, text: out });
+      return { toast: { type: "success", content: "Agent 深挖完成" } };
+    }
+
+    if (name === "agent_interpret_slow") {
+      if (!process.env.CURSOR_API_KEY) {
+        return { toast: { type: "error", content: "未配置 CURSOR_API_KEY" } };
+      }
+      const fakeMsg = {
+        chatId: chatId || `cb:${action.openId || "anon"}`,
+        senderId: action.openId,
+        messageId: action.messageId,
+      };
+      if (!sessions.hasSlowCache(fakeMsg.chatId)) {
+        return { toast: { type: "error", content: "请先 /slow" } };
+      }
+      const dive = await runSlowAgentInterpret(
+        config,
+        fakeMsg,
+        "请解读最慢 Beeline SQL 并给优化方向",
+      );
+      const out = `🔎 Agent 慢 SQL 解读\n${dive || "(empty)"}`;
+      if (chatId) await sendText({ chatId, text: out });
+      else if (action.openId) await sendText({ userId: action.openId, text: out });
+      return { toast: { type: "success", content: "Agent 解读完成" } };
     }
 
     if (name === "log" || name === "slow_sql_log") {

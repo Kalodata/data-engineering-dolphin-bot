@@ -4,6 +4,7 @@
  */
 
 import { resolveCountryCode } from "./country_code.mjs";
+import { isAgentExplainIntent } from "./agent_deep_dive.mjs";
 
 const CN_MINUTES = {
   十: 10,
@@ -138,6 +139,19 @@ export function resolveHostIntent(text, session = {}) {
   const slowRows = Array.isArray(session.slowSqlRows) ? session.slowSqlRows : [];
   const fresh = session.fresh !== false;
   const ordinal = parseListOrdinal(t);
+
+  // Why/how/optimize → Chat Agent（禁止当成列表/阈值宿主指令）
+  // 「怎么修」仍走下方诊断宿主。
+  if (
+    isAgentExplainIntent(t) &&
+    (lastIntent === "slow" ||
+      lastIntent === "diagnose" ||
+      lastIntent === "failed" ||
+      lastIntent === "log" ||
+      hasSlow)
+  ) {
+    return null;
+  }
 
   // --- slow Beeline SQL follow-ups ---
   const sqlMin = parseSlowSqlMinutes(t);

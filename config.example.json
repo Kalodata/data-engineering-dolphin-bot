@@ -68,6 +68,8 @@
   "model": "auto",
   "max_reply_chars": 6000,
   "chat_agent_resume": true,
+  "agent_deep_dive_auto": true,
+  "agent_deep_dive_timeout_ms": 120000,
   "alert_prompt_path": "/Users/you/.cursor/agents/alert/PROMPT.md",
   "board_push": {
     "enabled": false,
