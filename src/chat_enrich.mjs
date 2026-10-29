@@ -64,6 +64,7 @@ export function buildEnrichmentPromptBlock(enrich, sessionSnap = {}) {
 - 禁止只回复「请用 /slow」「请用 /diagnose」敷衍；先用会话状态 + MCP 自己查
 - 可以简短追问 1 个缺槽（国家/日期/实例），但能查就先查
 - 结论先给，再列证据；飞书宜短，避免长篇堆砌
+- 飞书纯文本：禁止 **加粗**、### 标题、\`code\`、Markdown 表格与代码块；用「1.」「·」分行
 - 写操作仍只引导用户发「重跑 …」等宿主句式，不要假装已执行`;
 
   if (enrich.mode === "interpret_slow") {
