@@ -51,6 +51,7 @@ import {
 } from "./agent_deep_dive.mjs";
 import {
   buildAgentPromptOptions,
+  modelOption,
   buildDsOfflineMcpServers,
   loadCloudReposMap,
   normalizeCloudRepoKey,
@@ -209,7 +210,7 @@ function loadConfig(configPath) {
         path.resolve(projectPath),
       ]),
     ),
-    model: raw.model ?? "auto",
+    model: raw.model ?? "composer-2.5",
     maxReplyChars: Number(raw.max_reply_chars ?? 6000),
     /** Feishu NL Chat: Agent.resume per chat (default on; FEISHU_CHAT_RESUME=0 to disable). */
     chatAgentResume: raw.chat_agent_resume !== false,
@@ -2168,7 +2169,7 @@ async function maybeAttachCloudCodeAnalysis({
  */
 async function runCursor(prompt, opts = {}) {
   const {
-    model = "auto",
+    model = "composer-2.5",
     timeoutMs = 180_000,
     runtime = "local",
     localCwd = null,
@@ -2181,9 +2182,10 @@ async function runCursor(prompt, opts = {}) {
   if (!process.env.CURSOR_API_KEY) {
     throw new Error("CURSOR_API_KEY is required for chat / /alert / /ask（写在项目 .env）");
   }
+  const resolvedModel = modelOption(model, { runtime });
   const agentOpts = buildAgentPromptOptions({
     apiKey: process.env.CURSOR_API_KEY,
-    model,
+    model: resolvedModel.id,
     runtime,
     localCwd,
     cloudRepos,
@@ -2192,7 +2194,7 @@ async function runCursor(prompt, opts = {}) {
   });
   const mcpLabel = mcpServers ? Object.keys(mcpServers).join(",") : "none";
   console.error(
-    `[cursor] runtime=${runtime} mcp=${mcpLabel}` +
+    `[cursor] runtime=${runtime} model=${resolvedModel.id} mcp=${mcpLabel}` +
       (runtime === "cloud"
         ? ` repos=${(cloudRepos || []).map((r) => r.url).join(",") || "(none)"}`
         : ` cwd=${localCwd}`),
@@ -2229,7 +2231,7 @@ async function runCursor(prompt, opts = {}) {
     const agent = await Agent.create(agentOpts);
     let run = null;
     try {
-      run = await agent.send(prompt);
+      run = await agent.send(prompt, { model: resolvedModel });
       return await waitWithTimeout(run);
     } finally {
       try {
@@ -2242,6 +2244,7 @@ async function runCursor(prompt, opts = {}) {
   }
 
   // Feishu NL Chat: durable agent per chat (resume) when enabled.
+  // Local resume does not keep model — must pass model on every send().
   const resumeEnabled =
     resumeChat &&
     chatId &&
@@ -2255,7 +2258,9 @@ async function runCursor(prompt, opts = {}) {
         try {
           agent = await Agent.resume(prevId, {
             apiKey: process.env.CURSOR_API_KEY,
+            model: resolvedModel,
             ...(localCwd ? { cwd: localCwd } : {}),
+            ...(mcpServers ? { mcpServers } : {}),
           });
           console.error(`[cursor] resume agentId=${prevId}`);
         } catch (error) {
@@ -2268,7 +2273,7 @@ async function runCursor(prompt, opts = {}) {
       } else {
         agent = await Agent.create(agentOpts);
       }
-      const run = await agent.send(prompt);
+      const run = await agent.send(prompt, { model: resolvedModel });
       const text = await waitWithTimeout(run, "Chat");
       if (agent.agentId) sessions.setAgentId(chatId, agent.agentId);
       return text;

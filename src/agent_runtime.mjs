@@ -9,6 +9,35 @@ import { fileURLToPath } from "node:url";
 
 import { loadDsEnv } from "./ds32_client.mjs";
 
+/**
+ * Local SDK rejects bare `auto` / missing model on resume+send.
+ * Prefer an explicit id for local; cloud may still use auto.
+ */
+export const DEFAULT_LOCAL_MODEL_ID = "composer-2.5";
+
+/**
+ * @param {string|{id?:string}|null|undefined} model
+ * @param {{ runtime?: "local"|"cloud" }} [opts]
+ * @returns {string}
+ */
+export function normalizeModelId(model, { runtime = "local" } = {}) {
+  let id = "";
+  if (model && typeof model === "object" && model.id != null) {
+    id = String(model.id).trim();
+  } else if (model != null) {
+    id = String(model).trim();
+  }
+  if (!id || id === "auto") {
+    return runtime === "local" ? DEFAULT_LOCAL_MODEL_ID : "auto";
+  }
+  return id;
+}
+
+/** @returns {{ id: string }} */
+export function modelOption(model, opts = {}) {
+  return { id: normalizeModelId(model, opts) };
+}
+
 /** DS project codes → cloud_repos key (alert watcher has no /use session). */
 export const DS_PROJECT_CODE_TO_CLOUD_KEY = {
   "9892432515424": "tiktok", // TikTok 天级 / daily
@@ -175,7 +204,7 @@ export function buildAgentPromptOptions({
 } = {}) {
   const base = {
     apiKey,
-    model: { id: model || "auto" },
+    model: modelOption(model, { runtime }),
   };
   if (mcpServers && typeof mcpServers === "object" && Object.keys(mcpServers).length) {
     base.mcpServers = mcpServers;
