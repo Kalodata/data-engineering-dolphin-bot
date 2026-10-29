@@ -33,27 +33,23 @@
       "secrets": [
         {
           "name": "LARK_APP_ID",
-          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/lark-app-id"
+          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/lark-app-id-LDMk13"
         },
         {
           "name": "LARK_APP_SECRET",
-          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/lark-app-secret"
+          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/lark-app-secret-DtWVdP"
         },
         {
           "name": "DS_API_TOKEN",
-          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/ds-api-token"
+          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/ds-api-token-WUZ2pw"
         },
         {
           "name": "CURSOR_API_KEY",
-          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/cursor-api-key"
+          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/cursor-api-key-1zIhYF"
         },
         {
           "name": "FEISHU_VERIFICATION_TOKEN",
-          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/feishu-verification-token"
-        },
-        {
-          "name": "HIVE_JDBC_URL",
-          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/hive-jdbc-url"
+          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:136376784788:secret:dolphin-bot/feishu-verification-token-3nfRbu"
         }
       ],
       "healthCheck": {
