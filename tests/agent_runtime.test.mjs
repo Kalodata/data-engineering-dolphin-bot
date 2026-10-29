@@ -9,9 +9,22 @@ import {
   cloudRepoKeyFromProjectCode,
   loadCloudReposMap,
   normalizeCloudRepoKey,
+  normalizeModelId,
+  modelOption,
   resolveCloudReposForSession,
   DEFAULT_CLOUD_REPOS,
+  DEFAULT_LOCAL_MODEL_ID,
 } from "../src/agent_runtime.mjs";
+
+test("normalizeModelId maps auto to composer for local", () => {
+  assert.equal(normalizeModelId("auto", { runtime: "local" }), DEFAULT_LOCAL_MODEL_ID);
+  assert.equal(normalizeModelId(null, { runtime: "local" }), DEFAULT_LOCAL_MODEL_ID);
+  assert.equal(normalizeModelId("auto", { runtime: "cloud" }), "auto");
+  assert.equal(normalizeModelId("composer-2.5"), "composer-2.5");
+  assert.deepEqual(modelOption("auto", { runtime: "local" }), {
+    id: DEFAULT_LOCAL_MODEL_ID,
+  });
+});
 
 test("normalizeCloudRepoKey aliases", () => {
   assert.equal(normalizeCloudRepoKey("amz"), "amazon");
@@ -82,6 +95,7 @@ test("buildAgentPromptOptions local requires cwd", () => {
   });
   assert.equal(opts.local.cwd, "/tmp");
   assert.equal(opts.cloud, undefined);
+  assert.deepEqual(opts.model, { id: DEFAULT_LOCAL_MODEL_ID });
 });
 
 test("buildAgentPromptOptions attaches mcpServers", () => {

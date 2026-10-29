@@ -65,7 +65,7 @@
       "starting_ref": "main"
     }
   },
-  "model": "auto",
+  "model": "composer-2.5",
   "max_reply_chars": 6000,
   "chat_agent_resume": true,
   "agent_deep_dive_auto": true,
