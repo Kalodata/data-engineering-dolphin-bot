@@ -413,25 +413,53 @@ export function isAlertChat(config, chatId) {
   return config.alertChatIds.has(chatId);
 }
 
-/** Feishu IM poorly renders Markdown tables — flatten |a|b| rows. */
+/**
+ * Feishu IM text (--text) does not render Markdown.
+ * Strip **, ###, fences, and flatten |tables| so Agent replies stay readable.
+ */
 export function sanitizeFeishuReply(text) {
-  const lines = String(text || "").split("\n");
+  let s = String(text || "").replace(/\r\n/g, "\n");
+  // fenced code blocks → keep inner text
+  s = s.replace(/```[\w-]*\n?([\s\S]*?)```/g, (_, body) => String(body || "").trimEnd());
+  const lines = s.split("\n");
   const out = [];
   for (const raw of lines) {
-    const line = raw.replace(/\s+$/g, "");
+    let line = raw.replace(/\s+$/g, "");
     if (/^\s*\|?\s*:?-{2,}\s*(\|\s*:?-{2,}\s*)+\|?\s*$/.test(line)) continue;
     if (/^\s*\|.+\|\s*$/.test(line)) {
       const cells = line
         .split("|")
         .map((c) => c.trim())
-        .filter(Boolean);
+        .filter(Boolean)
+        .map(stripInlineMarkdown);
       if (cells.length >= 2) out.push(`· ${cells.join(" — ")}`);
       else if (cells.length === 1) out.push(`· ${cells[0]}`);
       continue;
     }
+    // ATX headings → plain title line
+    line = line.replace(/^\s{0,3}#{1,6}\s+/, "");
+    // list markers
+    line = line.replace(/^\s*[-*+]\s+/, "· ");
+    line = stripInlineMarkdown(line);
     out.push(line);
   }
   return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function stripInlineMarkdown(line) {
+  let s = String(line || "");
+  // bold / italic
+  s = s.replace(/\*\*\*(.+?)\*\*\*/g, "$1");
+  s = s.replace(/\*\*(.+?)\*\*/g, "$1");
+  s = s.replace(/__(.+?)__/g, "$1");
+  s = s.replace(/(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)/g, "$1");
+  s = s.replace(/(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)/g, "$1");
+  // inline code / links
+  s = s.replace(/`([^`]+)`/g, "$1");
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1");
+  // leftover heading/emphasis markers
+  s = s.replace(/^\s*>\s?/, "");
+  return s;
 }
 
 export function looksLikeMcpQuestion(text) {
@@ -2456,7 +2484,8 @@ async function sendText({ chatId, userId, text, card }) {
       console.error(`[sendCard] fallback to text: ${error.message}`);
     }
   }
-  const args = ["im", "+messages-send", "--as", "bot", "--text", text || "(empty)"];
+  const plain = sanitizeFeishuReply(text || "(empty)") || "(empty)";
+  const args = ["im", "+messages-send", "--as", "bot", "--text", plain];
   if (chatId) args.push("--chat-id", chatId);
   else if (userId) args.push("--user-id", userId);
   else throw new Error("sendText requires chatId or userId");

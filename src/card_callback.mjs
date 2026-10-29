@@ -189,10 +189,20 @@ export function startCardCallbackServer({
   };
 }
 
-function isSlowCardAction(name) {
+/** Exported for unit tests — Feishu card callback ~3s budget. */
+export function isSlowCardAction(name) {
+  // Must ACK Feishu within ~3s. Agent / DS-heavy actions run async after toast.
   return [
-    "diagnose", "log",
-    "fs_wf_picked", "fs_drill_confirm", "fs_quality_confirm", "fs_quality_skip",
+    "diagnose",
+    "log",
+    "slow_sql_log",
+    "slow_sql_detail",
+    "agent_interpret_slow",
+    "agent_deep_dive",
+    "fs_wf_picked",
+    "fs_drill_confirm",
+    "fs_quality_confirm",
+    "fs_quality_skip",
   ].includes(String(name || ""));
 }
 

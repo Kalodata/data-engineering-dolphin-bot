@@ -92,6 +92,31 @@ test("sanitizeFeishuReply flattens markdown tables", () => {
   assert.match(out, /· 项 — 状态/);
   assert.match(out, /mcp\.json.*已配/);
   assert.match(out, /下一步：Reload/);
+  assert.equal(out.includes("**"), false);
+});
+
+test("sanitizeFeishuReply strips headings and bold for Feishu text", () => {
+  const raw = [
+    "## Agent 慢 SQL 解读",
+    "",
+    "### 1. dwd_scraper_product_sku_props (**1024s**)",
+    "",
+    "- **可能原因**：分区裁剪失败",
+    "- 优化：`ANALYZE` 临时表",
+    "",
+    "```sql",
+    "SELECT 1",
+    "```",
+  ].join("\n");
+  const out = sanitizeFeishuReply(raw);
+  assert.equal(out.includes("##"), false);
+  assert.equal(out.includes("###"), false);
+  assert.equal(out.includes("**"), false);
+  assert.equal(out.includes("```"), false);
+  assert.match(out, /Agent 慢 SQL 解读/);
+  assert.match(out, /dwd_scraper_product_sku_props/);
+  assert.match(out, /1024s/);
+  assert.match(out, /ANALYZE/);
 });
 
 test("parseNumericIdToken accepts #id", () => {
