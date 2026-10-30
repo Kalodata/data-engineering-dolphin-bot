@@ -1755,6 +1755,29 @@ async function drillForQualityTasks(ds, processInstanceId, depth = 0, maxDepth =
   return results;
 }
 
+function executeTypeLabel(executeType) {
+  if (executeType === "REPEAT_RUNNING") return "整实例重跑 (REPEAT_RUNNING)";
+  if (executeType === "START_FAILURE_TASK_PROCESS") return "从失败处恢复 (START_FAILURE_TASK_PROCESS)";
+  return executeType || "?";
+}
+
+/** Best-effort fetch of workflow name/country/dataDate for a process instance; null on failure. */
+async function fetchInstanceContext(ds, processInstanceId) {
+  if (!processInstanceId) return null;
+  const inst = await ds.getProcessInstance(processInstanceId);
+  return {
+    workflowName: inst?.name || `#${processInstanceId}`,
+    country: getGlobalParam(inst, "country_code") || null,
+    dataDate: getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || null,
+  };
+}
+
+function countryDateLine(ctx) {
+  return [ctx?.country ? ctx.country.toUpperCase() : null, ctx?.dataDate]
+    .filter(Boolean)
+    .join(" / ");
+}
+
 async function executePendingWrite(config, pending) {
   const ds = getDsClient(config, pending.projectCode || null);
   const auditBase = {
@@ -1770,11 +1793,43 @@ async function executePendingWrite(config, pending) {
       resultText =
         `已强制成功：任务 #${taskId} → FORCED_SUCCESS\n` +
         `若工作流仍红/下游未继续，可再点告警卡「重跑」或回「重跑 <实例id>」。`;
+      try {
+        const task = await ds.resolveTaskInstance(taskId, {
+          processInstanceId: pending.processInstanceId || null,
+        });
+        const processInstanceId = task?.processInstanceId || pending.processInstanceId || null;
+        const ctx = await fetchInstanceContext(ds, processInstanceId);
+        if (ctx) {
+          const lines = [`#${processInstanceId} ${clipToast(ctx.workflowName, 60)}`];
+          const cd = countryDateLine(ctx);
+          if (cd) lines.push(cd);
+          lines.push(`任务 #${taskId} ${task?.name || "?"}`);
+          lines.push("");
+          lines.push("若工作流仍红/下游未继续，可再点告警卡「重跑」或回「重跑 <实例id>」。");
+          resultText = lines.join("\n");
+        }
+      } catch (err) {
+        console.error(`[executePendingWrite] force-success context lookup failed: ${err.message}`);
+      }
     } else {
       await ds.execute(pending.processInstanceId, pending.executeType);
       resultText =
         `已提交：实例 #${pending.processInstanceId} → ${pending.executeType}\n` +
         `请到 DS UI 或稍后 /tasks ${pending.processInstanceId} 查看状态。`;
+      try {
+        const ctx = await fetchInstanceContext(ds, pending.processInstanceId);
+        if (ctx) {
+          const lines = [`#${pending.processInstanceId} ${clipToast(ctx.workflowName, 60)}`];
+          const cd = countryDateLine(ctx);
+          if (cd) lines.push(cd);
+          lines.push(executeTypeLabel(pending.executeType));
+          lines.push("");
+          lines.push(`请到 DS UI 或稍后 /tasks ${pending.processInstanceId} 查看状态。`);
+          resultText = lines.join("\n");
+        }
+      } catch (err) {
+        console.error(`[executePendingWrite] rerun context lookup failed: ${err.message}`);
+      }
     }
     auditLog?.write({ ...auditBase, ok: true });
     return resultText;
