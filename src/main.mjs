@@ -829,7 +829,23 @@ async function runCommand(config, command, message) {
     const page = await ds.listProcessInstances({ stateType: "FAILURE", pageSize: n });
     const top = page?.totalList?.[0];
     if (top?.id && message?.chatId) lastFailureByChat.set(message.chatId, Number(top.id));
-    const text = formatFailedList(page);
+
+    // Best-effort country/dataDate enrich for the rows the card actually renders (capped at 8).
+    const enrich = [];
+    for (const row of (page?.totalList || []).slice(0, 8)) {
+      try {
+        const inst = await ds.getProcessInstance(row.id);
+        enrich.push({
+          id: row.id,
+          country: getGlobalParam(inst, "country_code") || null,
+          dataDate: getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || null,
+        });
+      } catch (err) {
+        console.error(`[failed] context lookup failed for #${row.id}: ${err.message}`);
+      }
+    }
+
+    const text = formatFailedList(page, { enrich });
     if (message?.chatId) {
       const ids = (page?.totalList || [])
         .map((r) => Number(r.id))
@@ -851,6 +867,7 @@ async function runCommand(config, command, message) {
         total: page?.total,
         dsReadonly: config.dsReadonly,
         projectCode,
+        enrich,
         uiUrlBuilder: (row) =>
           buildProcessInstanceUiUrl({
             apiUrl: env.apiUrl,

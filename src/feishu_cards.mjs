@@ -576,6 +576,7 @@ export function failedListCard({
   dsReadonly = true,
   uiUrlBuilder = null,
   projectCode = "",
+  enrich = [],
 } = {}) {
   if (!rows.length) {
     return card({
@@ -585,6 +586,7 @@ export function failedListCard({
     });
   }
   const shown = rows.slice(0, 8);
+  const byId = new Map((enrich || []).map((e) => [Number(e.id), e]));
   const els = [
     md(
       `失败实例（共约 ${total ?? rows.length}，显示 ${shown.length} 条）：\n点按钮诊断 / 重跑。`,
@@ -595,9 +597,14 @@ export function failedListCard({
     const id = row.id;
     const uiUrl = typeof uiUrlBuilder === "function" ? uiUrlBuilder(row) : "";
     const link = uiUrl ? ` [打开](${uiUrl})` : "";
+    const extra = byId.get(Number(id));
+    const cd = [extra?.country ? extra.country.toUpperCase() : null, extra?.dataDate]
+      .filter(Boolean)
+      .join(" / ");
     els.push(
       md(
         `**#${id}** ${row.state || "FAILURE"} · ${clip(row.name || "(no name)", 48)}${link}\n` +
+          (cd ? `${cd}\n` : "") +
           `${row.startTime || "-"} → ${row.endTime || "-"}`,
       ),
     );

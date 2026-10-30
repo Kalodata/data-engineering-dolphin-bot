@@ -1855,13 +1855,19 @@ export function formatSlowStageJobs(result, opts = {}) {
   return formatSlowMarkdown(result || {}, opts || {});
 }
 
-export function formatFailedList(page) {
+export function formatFailedList(page, { enrich = [] } = {}) {
   const rows = page?.totalList || [];
   if (!rows.length) return "最近没有 FAILURE 实例。";
+  const byId = new Map((enrich || []).map((e) => [Number(e.id), e]));
   const lines = [`失败实例（共约 ${page.total ?? rows.length}，显示 ${rows.length} 条）：`, ""];
   for (const row of rows) {
+    const extra = byId.get(Number(row.id));
+    const cd = [extra?.country ? extra.country.toUpperCase() : null, extra?.dataDate]
+      .filter(Boolean)
+      .join(" / ");
     lines.push(
-      `#${row.id}  ${row.state}  ${row.startTime || "-"} → ${row.endTime || "-"}`,
+      `#${row.id}  ${row.state}  ${row.startTime || "-"} → ${row.endTime || "-"}` +
+        (cd ? `  [${cd}]` : ""),
     );
     lines.push(`  ${row.name || "(no name)"}`);
   }
