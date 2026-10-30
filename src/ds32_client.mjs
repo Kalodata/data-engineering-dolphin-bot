@@ -1755,8 +1755,17 @@ export async function resolveInstanceByCountryDate(
   ds,
   { country, dataDate, stateType, pageSize = 50 } = {},
 ) {
-  const page = await ds.listProcessInstances({ stateType, pageSize });
-  const candidates = (page?.totalList || []).slice(0, 50);
+  // stateType may be a single DS state or an array (e.g. rerun should match both
+  // FAILURE and STOP); DS list API only accepts one stateType per call, so merge.
+  const stateTypes = Array.isArray(stateType) ? stateType : [stateType];
+  const seen = new Map();
+  for (const st of stateTypes) {
+    const page = await ds.listProcessInstances({ stateType: st, pageSize });
+    for (const c of (page?.totalList || []).slice(0, pageSize)) {
+      if (!seen.has(c.id)) seen.set(c.id, c);
+    }
+  }
+  const candidates = [...seen.values()].slice(0, 50);
   if (!candidates.length) return [];
 
   const settled = await Promise.allSettled(

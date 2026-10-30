@@ -1146,7 +1146,7 @@ async function runCommand(config, command, message) {
       const matches = await resolveInstanceByCountryDate(ds, {
         country,
         dataDate,
-        stateType: "FAILURE",
+        stateType: ["FAILURE", "STOP"],
       });
       if (!matches.length) {
         return (
@@ -1169,8 +1169,11 @@ async function runCommand(config, command, message) {
 
     if (!id) id = Number(lastFailureByChat.get(message.chatId) || 0);
     if (!id) {
-      const page = await ds.listProcessInstances({ stateType: "FAILURE", pageSize: 1 });
-      id = Number(page?.totalList?.[0]?.id || 0);
+      for (const st of ["FAILURE", "STOP"]) {
+        const page = await ds.listProcessInstances({ stateType: st, pageSize: 1 });
+        const cand = Number(page?.totalList?.[0]?.id || 0);
+        if (cand) { id = cand; break; }
+      }
     }
     if (!id) {
       return (
