@@ -1224,6 +1224,11 @@ async function runCommand(config, command, message) {
       text: `将要对实例 #${id} 执行：${opLabel}\n5 分钟内确认或取消。`,
     };
   }
+  if (name === "stop" || name === "pause" || name === "resume") {
+    const executeType =
+      name === "stop" ? "STOP" : name === "pause" ? "PAUSE" : "RECOVER_SUSPENDED_PROCESS";
+    return handleExecuteCommand(config, message, command, name, executeType);
+  }
   if (name === "force-success" || name === "fs") {
     if (config.dsReadonly) {
       return (
@@ -1772,10 +1777,126 @@ async function drillForQualityTasks(ds, processInstanceId, depth = 0, maxDepth =
   return results;
 }
 
+const EXECUTE_OP_META = {
+  REPEAT_RUNNING: {
+    label: "整实例重跑",
+    title: "确认整实例重跑？",
+    risk: "会重跑全部任务节点，影响范围最大。",
+    searchState: "FAILURE",
+  },
+  START_FAILURE_TASK_PROCESS: {
+    label: "从失败处恢复",
+    title: "确认从失败处恢复？",
+    risk: "只重跑失败节点，影响范围小。",
+    searchState: "FAILURE",
+  },
+  STOP: {
+    label: "停止",
+    title: "确认停止？",
+    risk: "会终止正在运行的实例；已跑完的任务不受影响，未跑的任务不会继续。",
+    searchState: "RUNNING_EXECUTION",
+  },
+  PAUSE: {
+    label: "暂停",
+    title: "确认暂停？",
+    risk: "正在运行的任务会跑完后暂停；后续任务不会派发，可再发「恢复」续跑。",
+    searchState: "RUNNING_EXECUTION",
+  },
+  RECOVER_SUSPENDED_PROCESS: {
+    label: "恢复",
+    title: "确认恢复？",
+    risk: "从暂停处继续派发后续任务。",
+    searchState: "PAUSE",
+  },
+};
+
 function executeTypeLabel(executeType) {
-  if (executeType === "REPEAT_RUNNING") return "整实例重跑 (REPEAT_RUNNING)";
-  if (executeType === "START_FAILURE_TASK_PROCESS") return "从失败处恢复 (START_FAILURE_TASK_PROCESS)";
-  return executeType || "?";
+  const meta = EXECUTE_OP_META[executeType];
+  return meta ? `${meta.label} (${executeType})` : executeType || "?";
+}
+
+/** Shared handler for /stop /pause /resume: parse args → resolve instance → confirm card. */
+async function handleExecuteCommand(config, message, command, name, executeType) {
+  const meta = EXECUTE_OP_META[executeType];
+  if (config.dsReadonly) {
+    return (
+      `当前为只读模式（ds_readonly=true）：禁止${meta.label}等写操作。\n` +
+      "需要时在 config.json 设 ds_readonly=false 并重启 bot。"
+    );
+  }
+  const { projectCode, country, dataDate, instanceId } = parseInstanceLookupArgs(
+    command, message?.chatId, config,
+  );
+  const ds = getDsClient(config, projectCode);
+
+  let id = instanceId;
+  if (!id && country) {
+    const matches = await resolveInstanceByCountryDate(ds, {
+      country,
+      dataDate,
+      stateType: meta.searchState,
+    });
+    if (!matches.length) {
+      return (
+        `未找到匹配实例（country=${country}${dataDate ? ` date=${dataDate}` : ""}，状态=${meta.searchState}）。\n` +
+        `可先用 /progress /failed 确认实例状态，或直接 /${name} <processInstanceId>。`
+      );
+    }
+    if (matches.length > 1) {
+      const list = matches
+        .slice(0, 5)
+        .map((inst) => {
+          const dd = getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day");
+          return `#${inst.id}  ${inst.name || "?"}  数据日:${dd || "?"}  ${inst.state || ""}`;
+        })
+        .join("\n");
+      return `找到多个匹配实例，请用 /${name} <id> 精确指定：\n${list}`;
+    }
+    id = Number(matches[0].id);
+  }
+  if (!id) {
+    return (
+      `Usage: /${name} [project] <country> [YYYY-MM-DD]\n` +
+      `或：/${name} <processInstanceId>`
+    );
+  }
+
+  let instanceContext = null;
+  try {
+    const inst = await ds.getProcessInstance(id);
+    instanceContext = {
+      project: projectLabel(projectCode),
+      country: getGlobalParam(inst, "country_code") || null,
+      dataDate: getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day") || null,
+      workflowName: inst?.name || `#${id}`,
+    };
+  } catch { /* ignore */ }
+
+  const pending = pendingConfirms.set(message.chatId, {
+    kind: "execute",
+    processInstanceId: id,
+    executeType,
+    projectCode,
+    openId: message.senderId,
+    summary: meta.label,
+  });
+  const env = loadDsEnv();
+  const uiUrl = buildProcessInstanceUiUrl({ apiUrl: env.apiUrl, projectCode, processInstanceId: id });
+  return {
+    card: confirmCard({
+      title: meta.title,
+      summary: meta.label,
+      risk: meta.risk,
+      nonce: pending.nonce,
+      kind: pending.kind,
+      processInstanceId: id,
+      executeType,
+      uiUrl,
+      showRerunOptions: false,
+      instanceContext,
+    }),
+    text: `将要对实例 #${id} 执行：${meta.label}\n5 分钟内确认或取消。`,
+  };
 }
 
 /** Best-effort fetch of workflow name/country/dataDate for a process instance; null on failure. */

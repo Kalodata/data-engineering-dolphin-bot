@@ -97,7 +97,7 @@ export function welcomeCard({ dsReadonly = true } = {}) {
           "🩺 **诊断** — 日志摘录 + 成因 + 处置步骤\n" +
           "🌍 **各国/单国进度** — 天级开跑到哪了\n" +
           "🐢 **慢任务** — stage / job 耗时\n" +
-          "🔁 **重跑 / 强制成功** — 需二次确认（不改工作流定义）\n" +
+          "🔁 **重跑 / 强制成功 / 停止 / 暂停 / 恢复** — 需二次确认（不改工作流定义）\n" +
           "🚨 **告警** — 定时扫新失败并推处置卡",
       ),
       hr(),
@@ -477,6 +477,9 @@ export function confirmCard({
     const confirmLabel =
       executeType === "REPEAT_RUNNING" ? "确认整实例重跑" :
       executeType === "START_FAILURE_TASK_PROCESS" ? "确认从失败处恢复" :
+      executeType === "STOP" ? "确认停止" :
+      executeType === "PAUSE" ? "确认暂停" :
+      executeType === "RECOVER_SUSPENDED_PROCESS" ? "确认恢复" :
       "确认执行";
     els.push(
       actionRow([

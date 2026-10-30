@@ -33,6 +33,9 @@
 - `/rerun [project] <country> <YYYY-MM-DD>` 或 `/rerun <id>` → 确认卡 → `START_FAILURE_TASK_PROCESS`
 - `/rerun-all [project] <country> <YYYY-MM-DD>` 或 `/rerun-all <id>` → 确认卡 → `REPEAT_RUNNING`
 - `/force-success [project] <country> <YYYY-MM-DD> [子流程名]` 或 `/force-success <taskId>` → `collectEligibleFsTasks` → 选择卡 → 确认卡
+- `/stop [project] <country> <YYYY-MM-DD>` 或 `/stop <id>` → `handleExecuteCommand` → 确认卡 → `STOP`（目标须为 RUNNING_EXECUTION）
+- `/pause [project] <country> <YYYY-MM-DD>` 或 `/pause <id>` → `handleExecuteCommand` → 确认卡 → `PAUSE`（目标须为 RUNNING_EXECUTION）
+- `/resume [project] <country> <YYYY-MM-DD>` 或 `/resume <id>` → `handleExecuteCommand` → 确认卡 → `RECOVER_SUSPENDED_PROCESS`（目标须为 PAUSE）
 - `/slow [wh] [country] [n]` → `ds.findSlowStageJobs`
 - `/tasks <instanceId>` → `ds.listTaskInstances`
 - `/log <taskId>` → `ds.getTaskLogChunks`
