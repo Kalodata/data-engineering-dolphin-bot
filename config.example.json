@@ -81,5 +81,12 @@
     "chat_id": "oc_xxx",
     "hour": 15,
     "minute": 0
+  },
+  "stage_times_push": {
+    "enabled": false,
+    "chat_id": "oc_xxx",
+    "hour": 18,
+    "minute": 0,
+    "countries": ["id"]
   }
 }

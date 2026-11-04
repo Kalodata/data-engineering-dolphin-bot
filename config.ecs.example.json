@@ -79,5 +79,12 @@
     "chat_id": "oc_39183347fc477629b45751147bfe8587",
     "hour": 15,
     "minute": 30
+  },
+  "stage_times_push": {
+    "enabled": false,
+    "chat_id": "oc_39183347fc477629b45751147bfe8587",
+    "hour": 18,
+    "minute": 0,
+    "countries": ["id"]
   }
 }

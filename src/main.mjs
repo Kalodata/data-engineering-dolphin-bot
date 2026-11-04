@@ -14,11 +14,14 @@ import {
   classifyFailure,
   extractLogHighlights,
   formatCountryDailyBoard,
+  formatDurationShort,
   formatFailedList,
   formatPracticalDiagnosis,
   formatProgressReport,
   formatSimpleBoard,
   formatSlowStageJobs,
+  formatStageTimesDrill,
+  formatStageTimesSummary,
   formatTaskList,
   formatTieredBoard,
   getGlobalParam,
@@ -92,6 +95,8 @@ import {
   slowJobsCard,
   runningCard,
   boardCard,
+  stageTimesSummaryCard,
+  stageTimesDrillCard,
   fsWorkflowPickCard,
   fsDrillConfirmCard,
   fsQualityConfirmCard,
@@ -101,7 +106,7 @@ import {
   createConfirmStore,
 } from "./card_callback.mjs";
 import { createAuditLog } from "./audit_log.mjs";
-import { startBoardPush, startTieredBoardPush } from "./board_push.mjs";
+import { startBoardPush, startTieredBoardPush, startStageTimesPush } from "./board_push.mjs";
 import {
   resolveSlowSqlOption,
   formatSlowSqlDetailText,
@@ -125,7 +130,7 @@ const HELP_TEXT = `可以直接打字，自然语言交给 Agent（不固定句�
 写操作弹确认卡（点按钮或回 YES）；仍禁止改工作流定义。
 告警卡可点：诊断 / 重跑 / 看日志。
 快捷：/progress id  /board  /failed  /diagnose
-高级：/slow /tasks /log /mcp /status /help
+高级：/slow /tasks /log /stage-times /mcp /status /help
 换任务发「新话题」可清空 Chat 续聊上下文。`;
 
 const CONFIRM_TTL_MS = 5 * 60 * 1000;
@@ -324,6 +329,19 @@ function loadConfig(configPath) {
         minute: Number(tbp.minute ?? 0),
       };
     })(),
+    stageTimesPush: (() => {
+      const stp = raw.stage_times_push || {};
+      return {
+        enabled: stp.enabled === true,
+        chatId: String(stp.chat_id || ""),
+        hour: Number(stp.hour ?? 18),
+        minute: Number(stp.minute ?? 0),
+        // Pilot: only "id" for now. Add more two-letter codes here to extend — no code change needed.
+        countries: Array.isArray(stp.countries) && stp.countries.length
+          ? stp.countries.map((c) => String(c).toLowerCase())
+          : ["id"],
+      };
+    })(),
     cloudRepos: loadCloudReposMap(
       Object.prototype.hasOwnProperty.call(raw, "cloud_repos") ? raw.cloud_repos : {},
     ),
@@ -352,6 +370,9 @@ function loadConfig(configPath) {
   // board_push chat is implicitly allowed to send commands
   if (config.boardPush?.enabled && config.boardPush?.chatId) {
     config.alertChatIds.add(config.boardPush.chatId);
+  }
+  if (config.stageTimesPush?.enabled && config.stageTimesPush?.chatId) {
+    config.alertChatIds.add(config.stageTimesPush.chatId);
   }
 
   // Effective poll interval after webhook mode is known
@@ -601,7 +622,7 @@ export function parseInstanceLookupArgs(command, chatId, config) {
       country: null,
       dataDate: null,
       instanceId: asId,
-      nodeName: null,
+      nodeName: args.slice(idx + 1).join(" ").trim() || null,
     };
   }
 
@@ -1111,6 +1132,81 @@ async function runCommand(config, command, message) {
         `project ${effectiveCode}\n` +
         `【单位=Beeline SQL 语句秒数，不是 job 墙钟】\n` +
         body,
+    };
+  }
+  if (name === "stage-times") {
+    // /stage-times [project] <country> <YYYY-MM-DD> [节点名] — 分层/节点耗时（只读）
+    // /stage-times <instanceId> [节点名]
+    const { projectCode, country, dataDate, instanceId, nodeName } = parseInstanceLookupArgs(
+      command, message?.chatId, config,
+    );
+    const ds = getDsClient(config, projectCode);
+
+    let id = instanceId;
+    if (!id && country) {
+      const matches = await resolveInstanceByCountryDate(ds, { country, dataDate });
+      if (!matches.length) {
+        return (
+          `未找到匹配实例（country=${country}${dataDate ? ` date=${dataDate}` : ""}）。\n` +
+          `可先用 /failed /progress 确认实例状态，或直接 /stage-times <id>。`
+        );
+      }
+      if (matches.length > 1) {
+        const list = matches
+          .slice(0, 5)
+          .map((inst) => {
+            const dd = getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day");
+            return `#${inst.id}  ${inst.name || "?"}  数据日:${dd || "?"}  ${inst.state || ""}`;
+          })
+          .join("\n");
+        return `找到多个匹配实例，请用 /stage-times <id> [节点名] 精确指定：\n${list}`;
+      }
+      id = Number(matches[0].id);
+    }
+    if (!id) {
+      return (
+        "Usage: /stage-times [project] <country> <YYYY-MM-DD> [节点名]\n" +
+        "或：/stage-times <processInstanceId> [节点名]"
+      );
+    }
+
+    const env = loadDsEnv();
+    const uiUrl = buildProcessInstanceUiUrl({ apiUrl: env.apiUrl, projectCode, processInstanceId: id });
+
+    if (!nodeName) {
+      const stages = await ds.getStageTimesSummary(id, projectCode);
+      return {
+        card: stageTimesSummaryCard({ processInstanceId: id, stages, uiUrl }),
+        text: formatStageTimesSummary(id, stages),
+      };
+    }
+
+    const result = await ds.findStageNodeChildren(id, nodeName, { projectCode });
+    if (result.kind === "not_found") {
+      return `没找到名字包含「${nodeName}」的节点。检查下拼写，或先用 /stage-times ${id} 看顶层节点名再下钻。`;
+    }
+    if (result.kind === "error") {
+      return result.message;
+    }
+    if (result.kind === "ambiguous") {
+      const list = result.matches
+        .map((m) => `- ${m.name}（所属：${m.parentName || "顶层"}，耗时 ${formatDurationShort(m.durationSec)}）`)
+        .join("\n");
+      return `名字「${nodeName}」匹配到多个节点，请换个更具体的名字重新查：\n${list}`;
+    }
+    if (result.kind === "leaf") {
+      return (
+        `节点「${result.node.name}」（所属：${result.parentName || "顶层"}）是叶子任务，没有下一层。\n` +
+        `耗时：${formatDurationShort(result.node.durationSec)}（${result.node.state || "?"}）`
+      );
+    }
+    return {
+      card: stageTimesDrillCard({
+        processInstanceId: id,
+        parentName: result.parentNode.name,
+        children: result.children,
+      }),
+      text: formatStageTimesDrill(id, { parentName: result.parentNode.name, children: result.children }),
     };
   }
   if (name === "log") {
@@ -3551,6 +3647,13 @@ async function main() {
     log: (line) => console.error(line),
   });
 
+  const stageTimesPusher = startStageTimesPush({
+    config,
+    getDs: () => getDsClient(config, KNOWN_PROJECTS.tiktok.code),
+    sendText,
+    log: (line) => console.error(line),
+  });
+
   let dsIngress = null;
   if (config.dsAlertWebhook?.enabled) {
     dsIngress = startDsAlertIngress({
@@ -3634,6 +3737,16 @@ async function main() {
     }
     try {
       boardPusher?.stop?.();
+    } catch {
+      // ignore
+    }
+    try {
+      tieredBoardPusher?.stop?.();
+    } catch {
+      // ignore
+    }
+    try {
+      stageTimesPusher?.stop?.();
     } catch {
       // ignore
     }

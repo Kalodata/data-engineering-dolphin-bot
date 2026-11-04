@@ -43,6 +43,17 @@ export function loadDsEnv(envFile = process.env.DS_ENV_FILE || DEFAULT_ENV_FILE)
   return values;
 }
 
+// /stage-times: resource plumbing stages, not useful for layer timing comparisons.
+const STAGE_SUMMARY_EXCLUDED_NAMES = new Set(["前置检测", "准备资源", "释放资源"]);
+// /stage-times drill-down: generic control-flow nodes repeated under every stage.
+const STAGE_CHILD_EXCLUDED_NAMES = new Set(["check valid", "router", "空节点"]);
+
+/** Leading ASCII-letter run of a node name, lowercased (e.g. "DWD-STAGE" → "dwd"). */
+function extractNamePrefix(name) {
+  const m = String(name || "").match(/^[a-zA-Z]{2,}/);
+  return m ? m[0].toLowerCase() : "";
+}
+
 export class Ds32Client {
   constructor({ apiUrl, apiToken, projectCode }) {
     if (!apiUrl) throw new Error("DS_API_URL missing");
@@ -628,6 +639,141 @@ export class Ds32Client {
       "POST",
       `/projects/${projectCode}/task-instances/${id}/force-success`,
     );
+  }
+
+  /**
+   * Top-level node durations for a workflow instance (single API call, no drilling).
+   * Order matches DS execution order (ascending startTime). Excludes resource
+   * plumbing stages (前置检测/准备资源/释放资源) — not useful for layer timing.
+   */
+  async getStageTimesSummary(processInstanceId, projectCode = this.projectCode) {
+    const page = await this.listTaskInstances({ projectCode, processInstanceId, pageSize: 200 });
+    const tasks = page?.totalList || [];
+    return tasks
+      .slice()
+      .filter((t) => !STAGE_SUMMARY_EXCLUDED_NAMES.has(String(t.name || "").trim()))
+      .sort((a, b) => String(a.startTime || "").localeCompare(String(b.startTime || "")))
+      .map((t) => ({
+        id: t.id,
+        name: t.name || "",
+        taskType: t.taskType || "",
+        state: t.state || "",
+        duration: t.duration || "",
+        durationSec: parseDurationToSeconds(t.duration),
+      }));
+  }
+
+  /**
+   * Find a node anywhere under a workflow instance by case-insensitive substring
+   * match on name, then return ITS direct children's times (one level deeper).
+   * Searches breadth-first by depth (rather than matching+drilling eagerly) so
+   * same-named siblings in different branches (e.g. "CHECK VALID" repeats under
+   * every *-STAGE) surface as an ambiguous list instead of silently picking one.
+   * maxDepth/maxApiCalls bound the cost of searching an unmatched name.
+   */
+  async findStageNodeChildren(
+    processInstanceId,
+    nodeNameQuery,
+    { projectCode = this.projectCode, maxDepth = 6, maxApiCalls = 60 } = {},
+  ) {
+    const query = String(nodeNameQuery || "").trim().toLowerCase();
+    if (!query) return { kind: "error", message: "节点名不能为空" };
+
+    let apiCalls = 0;
+    const listSorted = async (pid) => {
+      apiCalls += 1;
+      const page = await this.listTaskInstances({ projectCode, processInstanceId: pid, pageSize: 200 });
+      return (page?.totalList || [])
+        .slice()
+        .sort((a, b) => String(a.startTime || "").localeCompare(String(b.startTime || "")));
+    };
+
+    let frontier = [{ pid: processInstanceId, parentName: null }];
+    for (let depth = 0; depth < maxDepth && frontier.length; depth++) {
+      const matches = [];
+      const subProcessChildren = [];
+      for (const node of frontier) {
+        if (apiCalls >= maxApiCalls) break;
+        let tasks;
+        try {
+          tasks = await listSorted(node.pid);
+        } catch {
+          continue;
+        }
+        for (const t of tasks) {
+          if (String(t.name || "").toLowerCase().includes(query)) {
+            matches.push({ task: t, parentName: node.parentName });
+          }
+          if (String(t.taskType || "").toUpperCase() === "SUB_PROCESS") {
+            subProcessChildren.push({ task: t, parentName: node.parentName });
+          }
+        }
+      }
+
+      if (matches.length > 1) {
+        return {
+          kind: "ambiguous",
+          matches: matches.map((m) => ({
+            name: m.task.name,
+            parentName: m.parentName,
+            duration: m.task.duration,
+            durationSec: parseDurationToSeconds(m.task.duration),
+          })),
+        };
+      }
+      if (matches.length === 1) {
+        const { task, parentName } = matches[0];
+        if (String(task.taskType || "").toUpperCase() !== "SUB_PROCESS") {
+          return {
+            kind: "leaf",
+            node: { ...task, durationSec: parseDurationToSeconds(task.duration) },
+            parentName,
+          };
+        }
+        if (apiCalls >= maxApiCalls) {
+          return { kind: "error", message: "查询次数超限，节点太深，请缩小范围重试" };
+        }
+        let subId = null;
+        try {
+          apiCalls += 1;
+          subId = await this.getSubProcessInstanceId(task.id, projectCode);
+        } catch {
+          subId = null;
+        }
+        if (!subId) {
+          return { kind: "error", message: `节点 "${task.name}" 无法解析子流程（日志缺失或非 SUB_PROCESS）` };
+        }
+        const levelPrefix = extractNamePrefix(task.name);
+        const children = (await listSorted(subId))
+          .filter((t) => !STAGE_CHILD_EXCLUDED_NAMES.has(String(t.name || "").trim().toLowerCase()))
+          .filter(
+            (t) =>
+              !levelPrefix ||
+              String(t.name || "").trim().toLowerCase().startsWith(levelPrefix),
+          )
+          .map((t) => ({
+            ...t,
+            durationSec: parseDurationToSeconds(t.duration),
+          }));
+        return { kind: "children", parentNode: task, parentName, children };
+      }
+
+      if (apiCalls >= maxApiCalls) break;
+      const nextFrontier = [];
+      for (const sp of subProcessChildren) {
+        if (apiCalls >= maxApiCalls) break;
+        let subId = null;
+        try {
+          apiCalls += 1;
+          subId = await this.getSubProcessInstanceId(sp.task.id, projectCode);
+        } catch {
+          subId = null;
+        }
+        if (subId) nextFrontier.push({ pid: subId, parentName: sp.task.name });
+      }
+      frontier = nextFrontier;
+    }
+    return { kind: "not_found" };
   }
 }
 
@@ -1630,6 +1776,36 @@ export function parseDurationToSeconds(duration) {
   }
   const asNum = Number(s);
   return Number.isFinite(asNum) ? asNum : 0;
+}
+
+export function formatDurationShort(sec) {
+  const total = Math.max(0, Math.round(Number(sec) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h) return `${h}h${m}m`;
+  if (m) return s ? `${m}m${s}s` : `${m}m`;
+  return `${s}s`;
+}
+
+export function formatStageTimesSummary(processInstanceId, stages = []) {
+  if (!stages.length) {
+    return `实例 #${processInstanceId} 没有查到任务数据，可能还没开始跑。`;
+  }
+  const lines = stages.map((s) => `- ${s.name}：${formatDurationShort(s.durationSec)}（${s.state || "?"}）`);
+  return (
+    `工作流实例 #${processInstanceId} 分层耗时：\n${lines.join("\n")}\n` +
+    `下钻：/stage-times ${processInstanceId} <节点名>`
+  );
+}
+
+export function formatStageTimesDrill(processInstanceId, { parentName, children = [] } = {}) {
+  if (!children.length) {
+    return `节点 "${parentName}" 下没有子任务。`;
+  }
+  const sorted = children.slice().sort((a, b) => (b.durationSec || 0) - (a.durationSec || 0));
+  const lines = sorted.map((t) => `- ${t.name}：${formatDurationShort(t.durationSec)}（${t.state || "?"}）`);
+  return `${parentName} → 子任务耗时（慢到快）：\n${lines.join("\n")}`;
 }
 
 export function getGlobalParam(inst, prop) {

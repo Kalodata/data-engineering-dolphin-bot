@@ -2,13 +2,15 @@ import {
   buildProcessInstanceUiUrl,
   formatCountryDailyBoard,
   formatProgressReport,
+  formatStageTimesSummary,
   formatTieredBoard,
   listCountryDailyBoard,
   listRunningProgress,
   listTieredBoard,
   loadDsEnv,
+  resolveInstanceByCountryDate,
 } from "./ds32_client.mjs";
-import { boardCard, runningCard } from "./feishu_cards.mjs";
+import { boardCard, runningCard, stageTimesSummaryCard } from "./feishu_cards.mjs";
 
 export function getBeijingTime(now = new Date()) {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -113,6 +115,73 @@ export function startTieredBoardPush({ config, getDs, sendText, log = console.er
 
   const timer = setInterval(tick, 60_000);
   log(`[tiered-board-push] started, hour=${hour}:${String(minute).padStart(2, "0")} chat=${bp.chatId}`);
+  return {
+    stop: () => {
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+}
+
+/**
+ * Daily per-country stage-times push. Pilot scope: config.stageTimesPush.countries
+ * (default ["id"]) — add more two-letter codes there to extend, no code change needed.
+ */
+export function startStageTimesPush({ config, getDs, sendText, log = console.error }) {
+  const sp = config.stageTimesPush;
+  if (!sp?.enabled || !sp?.chatId) {
+    log("[stage-times-push] disabled or no chat_id configured");
+    return { stop: () => {} };
+  }
+  const hour = sp.hour ?? 18;
+  const minute = sp.minute ?? 0;
+  const countries = sp.countries?.length ? sp.countries : ["id"];
+  let lastPushedDate = "";
+  let stopped = false;
+
+  async function tick() {
+    if (stopped) return;
+    const now = new Date();
+    const { hour: currentHour, minute: currentMinute } = getBeijingTime(now);
+    const todayDate = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Shanghai",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(now);
+    if (lastPushedDate === todayDate) return;
+    if (currentHour !== hour || currentMinute !== minute) return;
+    lastPushedDate = todayDate;
+
+    const ds = getDs();
+    const env = loadDsEnv();
+    const projectCode = ds.projectCode;
+    for (const country of countries) {
+      try {
+        const matches = await resolveInstanceByCountryDate(ds, { country });
+        if (!matches.length) {
+          log(`[stage-times-push] no instance found for country=${country}`);
+          continue;
+        }
+        const inst = matches
+          .slice()
+          .sort((a, b) => String(b.startTime || "").localeCompare(String(a.startTime || "")))[0];
+        const stages = await ds.getStageTimesSummary(inst.id, projectCode);
+        const uiUrl = buildProcessInstanceUiUrl({ apiUrl: env.apiUrl, projectCode, processInstanceId: inst.id });
+        await sendText({
+          chatId: sp.chatId,
+          card: stageTimesSummaryCard({ processInstanceId: inst.id, stages, uiUrl }),
+          text: `[${country.toUpperCase()}] ${formatStageTimesSummary(inst.id, stages)}`,
+        });
+        log(`[stage-times-push] sent stage-times for ${country} (#${inst.id}) to ${sp.chatId}`);
+      } catch (err) {
+        log(`[stage-times-push] error for country=${country}: ${err.message}`);
+      }
+    }
+  }
+
+  const timer = setInterval(tick, 60_000);
+  log(`[stage-times-push] started, hour=${hour}:${String(minute).padStart(2, "0")} countries=${countries.join(",")} chat=${sp.chatId}`);
   return {
     stop: () => {
       stopped = true;
