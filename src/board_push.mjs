@@ -4,6 +4,7 @@ import {
   formatProgressReport,
   formatStageTimesSummary,
   formatTieredBoard,
+  getGlobalParam,
   listCountryDailyBoard,
   listRunningProgress,
   listTieredBoard,
@@ -168,9 +169,16 @@ export function startStageTimesPush({ config, getDs, sendText, log = console.err
           .sort((a, b) => String(b.startTime || "").localeCompare(String(a.startTime || "")))[0];
         const stages = await ds.getStageTimesSummary(inst.id, projectCode);
         const uiUrl = buildProcessInstanceUiUrl({ apiUrl: env.apiUrl, projectCode, processInstanceId: inst.id });
+        const instDataDate = getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day");
         await sendText({
           chatId: sp.chatId,
-          card: stageTimesSummaryCard({ processInstanceId: inst.id, stages, uiUrl }),
+          card: stageTimesSummaryCard({
+            processInstanceId: inst.id,
+            stages,
+            uiUrl,
+            country,
+            dataDate: instDataDate,
+          }),
           text: `[${country.toUpperCase()}] ${formatStageTimesSummary(inst.id, stages)}`,
         });
         log(`[stage-times-push] sent stage-times for ${country} (#${inst.id}) to ${sp.chatId}`);

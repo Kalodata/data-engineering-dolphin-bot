@@ -962,35 +962,79 @@ function fmtDur(sec) {
   return `${s}s`;
 }
 
-/** CJK chars render ~2x the width of latin/digits in Lark's card font. */
-function visualWidth(str) {
-  let w = 0;
-  for (const ch of String(str || "")) {
-    w += /[ᄀ-ᅟ⺀-꓏가-힣豈-﫿＀-｠￠-￦]/.test(ch) ? 2 : 1;
+/**
+ * Schema 2.0 card wrapping a single native `chart` element (VChart-backed,
+ * real bars -- not unicode text) + optional markdown lines underneath.
+ * Schema 2.0 is a distinct top-level structure from the classic cards built
+ * by `card()` above (header/body instead of header/elements); mixing both
+ * schemas across different messages is supported by Feishu.
+ */
+function chartCard2({ title, template = "blue", chartSpec, mdLines = [], height }) {
+  const elements = [
+    {
+      tag: "chart",
+      chart_spec: chartSpec,
+      ...(height ? { height } : { aspect_ratio: "16:9" }),
+    },
+  ];
+  if (mdLines.length) {
+    elements.push({ tag: "div", text: { tag: "lark_md", content: mdLines.join("\n") } });
   }
-  return w;
+  return {
+    schema: "2.0",
+    config: { width_mode: "fill" },
+    header: {
+      template,
+      title: { tag: "plain_text", content: String(title || "Dolphin") },
+    },
+    body: { elements },
+  };
 }
 
-function padLabel(str, width = 18) {
-  const s = String(str || "");
-  return s + " ".repeat(Math.max(1, width - visualWidth(s)));
+/**
+ * Horizontal bar chart_spec: one row per entry, duration baked into the label.
+ * Keeps hover highlight + the per-bar tooltip box (useful: repeats name/duration);
+ * hides only the x-axis crosshair label badge (a meaningless interpolated value
+ * at the cursor's pixel position, not tied to any real data point).
+ */
+function barChartSpec(rows) {
+  return {
+    type: "bar",
+    direction: "horizontal",
+    data: {
+      values: rows.map((r) => ({
+        name: `${r.label}  ${fmtDur(r.sec)}`,
+        value: Math.max(0, Math.round((r.sec || 0) / 60)),
+      })),
+    },
+    xField: "value",
+    yField: "name",
+    crosshair: {
+      xField: { visible: true, label: { visible: false } },
+    },
+  };
 }
 
-/** Text bar chart: proportional unicode bars, one row per entry. */
-function barChartLines(rows, { maxWidth = 20 } = {}) {
-  const maxSec = Math.max(1, ...rows.map((r) => r.sec || 0));
-  return rows
-    .map((r) => {
-      const len = r.sec > 0 ? Math.max(1, Math.round((r.sec / maxSec) * maxWidth)) : 0;
-      const bar = len > 0 ? "█".repeat(len) : "·";
-      return `${padLabel(r.label)}${bar} ${fmtDur(r.sec)}`;
-    })
-    .join("\n");
+function chartHeightPx(rowCount) {
+  return `${Math.min(700, Math.max(200, rowCount * 36))}px`;
+}
+
+/** "US · 2026-10-25" when country/date are known, else fall back to the raw instance id. */
+function stageTimesLabel(processInstanceId, country, dataDate) {
+  return country && dataDate
+    ? `${String(country).toUpperCase()} · ${dataDate}`
+    : `#${processInstanceId}`;
 }
 
 /** Default /stage-times view: pipeline-ordered bar chart of top-level node durations. */
-export function stageTimesSummaryCard({ processInstanceId, stages = [], uiUrl = "" } = {}) {
-  const title = `📊 工作流实例 #${processInstanceId} 分层耗时`;
+export function stageTimesSummaryCard({
+  processInstanceId,
+  stages = [],
+  uiUrl = "",
+  country = null,
+  dataDate = null,
+} = {}) {
+  const title = `📊 ${stageTimesLabel(processInstanceId, country, dataDate)} 分层耗时`;
   if (!stages.length) {
     return card({
       title,
@@ -998,33 +1042,47 @@ export function stageTimesSummaryCard({ processInstanceId, stages = [], uiUrl = 
       elements: [md("没有查到任务数据，实例可能还没开始跑。")],
     });
   }
-  const rows = stages.map((s) => ({ label: clip(s.name, 16), sec: s.durationSec }));
-  const els = [md(barChartLines(rows))];
-  if (uiUrl) els.push(md(`[打开实例](${uiUrl})`));
-  els.push(note(`下钻某个节点：/stage-times ${processInstanceId} <节点名>`));
-  return card({ title, template: "blue", elements: els });
+  const rows = stages.map((s) => ({ label: clip(s.name, 20), sec: s.durationSec }));
+  const mdLines = [];
+  if (uiUrl) mdLines.push(`[打开实例](${uiUrl})`);
+  mdLines.push(`下钻某个节点：/stage-times ${processInstanceId} <节点名>`);
+  return chartCard2({
+    title,
+    template: "blue",
+    chartSpec: barChartSpec(rows),
+    mdLines,
+    height: chartHeightPx(rows.length),
+  });
 }
 
-/** Drill-down view: one node's direct children, sorted slow→fast, capped to maxShown. */
+/** Drill-down view: one node's direct children, sorted slow to fast, capped to maxShown. */
 export function stageTimesDrillCard({
   processInstanceId,
   parentName,
   children = [],
   maxShown = 15,
+  country = null,
+  dataDate = null,
 } = {}) {
-  const title = `📊 ${clip(parentName, 24)} → 子任务耗时`;
+  const title = `📊 ${stageTimesLabel(processInstanceId, country, dataDate)} · ${clip(parentName, 24)} → 子任务耗时`;
   if (!children.length) {
     return card({ title, template: "grey", elements: [md("该节点下没有子任务。")] });
   }
   const sorted = children.slice().sort((a, b) => (b.durationSec || 0) - (a.durationSec || 0));
   const shown = sorted.slice(0, maxShown);
-  const rows = shown.map((t) => ({ label: clip(t.name, 28), sec: t.durationSec }));
-  const els = [md(barChartLines(rows))];
+  const rows = shown.map((t) => ({ label: clip(t.name, 32), sec: t.durationSec }));
+  const mdLines = [];
   if (sorted.length > shown.length) {
-    els.push(note(`另有 ${sorted.length - shown.length} 个子任务未展示（耗时更短）`));
+    mdLines.push(`另有 ${sorted.length - shown.length} 个子任务未展示（耗时更短）`);
   }
-  els.push(note(`继续下钻：/stage-times ${processInstanceId} <子节点名>`));
-  return card({ title, template: "blue", elements: els });
+  mdLines.push(`继续下钻：/stage-times ${processInstanceId} <子节点名>`);
+  return chartCard2({
+    title,
+    template: "blue",
+    chartSpec: barChartSpec(rows),
+    mdLines,
+    height: chartHeightPx(shown.length),
+  });
 }
 
 function sameText(a, b) {

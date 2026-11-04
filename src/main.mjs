@@ -1172,11 +1172,22 @@ async function runCommand(config, command, message) {
 
     const env = loadDsEnv();
     const uiUrl = buildProcessInstanceUiUrl({ apiUrl: env.apiUrl, projectCode, processInstanceId: id });
+    const inst = await ds.getProcessInstance(id, projectCode).catch(() => null);
+    const instCountry = inst ? getGlobalParam(inst, "country_code") : null;
+    const instDataDate = inst
+      ? getGlobalParam(inst, "data_date") || getGlobalParam(inst, "partition_day")
+      : null;
 
     if (!nodeName) {
       const stages = await ds.getStageTimesSummary(id, projectCode);
       return {
-        card: stageTimesSummaryCard({ processInstanceId: id, stages, uiUrl }),
+        card: stageTimesSummaryCard({
+          processInstanceId: id,
+          stages,
+          uiUrl,
+          country: instCountry,
+          dataDate: instDataDate,
+        }),
         text: formatStageTimesSummary(id, stages),
       };
     }
@@ -1205,6 +1216,8 @@ async function runCommand(config, command, message) {
         processInstanceId: id,
         parentName: result.parentNode.name,
         children: result.children,
+        country: instCountry,
+        dataDate: instDataDate,
       }),
       text: formatStageTimesDrill(id, { parentName: result.parentNode.name, children: result.children }),
     };
