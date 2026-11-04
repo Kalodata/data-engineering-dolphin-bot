@@ -81,7 +81,7 @@
     "minute": 30
   },
   "stage_times_push": {
-    "enabled": false,
+    "enabled": true,
     "chat_id": "oc_39183347fc477629b45751147bfe8587",
     "hour": 18,
     "minute": 0,
