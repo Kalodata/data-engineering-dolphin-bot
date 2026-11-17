@@ -41,11 +41,12 @@ test("message send returns ID and reuses the supplied idempotency key", async ()
   assert.equal(await client.sendMessage({ chatId: "oc_test", text: "告警", idempotencyKey: "stable-key" }), "om_123");
 });
 
-test("urgency uses app-only API and preserves invalid recipient information", async () => {
+test("urgency uses app-plus-SMS API once and preserves invalid recipient information", async () => {
   const client = createFeishuUrgentClient({ runCli: async (args) => {
-    assert.ok(args.includes("urgent_app"));
+    assert.ok(args.includes("urgent_sms"));
     assert.ok(!args.includes("urgent_phone"));
-    assert.ok(!args.includes("urgent_sms"));
+    assert.ok(!args.includes("urgent_app"));
+    assert.equal(args[args.indexOf("--message-id") + 1], "om_123");
     assert.deepEqual(JSON.parse(args[args.indexOf("--data") + 1]), { user_id_list: ["ou_1", "ou_2"] });
     return { ok: true, data: { invalid_user_id_list: ["ou_2"] } };
   } });

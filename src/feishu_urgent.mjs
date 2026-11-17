@@ -65,7 +65,7 @@ export function createFeishuUrgentClient({
     async urgentMessage(messageId, userIds) {
       if (!userIds.length || userIds.length > 200) throw new Error("Feishu urgency requires 1–200 users per batch");
       const data = await call([
-        "im", "messages", "urgent_app", "--message-id", messageId,
+        "im", "messages", "urgent_sms", "--message-id", messageId,
         "--user-id-type", "open_id", "--data", JSON.stringify({ user_id_list: userIds }),
       ]);
       return { invalidUserIds: data.invalid_user_id_list || [] };

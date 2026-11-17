@@ -15,7 +15,7 @@ Tech stack: Node ES modules, Intl IANA time zones, node:test, lark-cli, existing
 
 ## Task 2: Reliable urgent delivery
 
-- [x] Add tests in tests/feishu_urgent.test.mjs for member pagination, incomplete lists, message ID and idempotency, app-only urgency, invalid recipients and CLI errors.
+- [x] Add tests in tests/feishu_urgent.test.mjs for member pagination, incomplete lists, message ID and idempotency, app-plus-SMS urgency, invalid recipients and CLI errors.
 - [x] Run tests before creating src/feishu_urgent.mjs, then implement the adapter and rerun.
 - [x] Use argv arrays, bot identity, existing profile, command timeout, and JSON success envelopes. API urgency batches are limited to 200 recipients.
 
@@ -47,3 +47,10 @@ Read-only reviewer found one DS request timeout issue; fixed using a shared 45-s
 - [x] 验证完整相关测试与全量基线，审查最终差异；合并 main。
 
 追加修改验证：相关 68 项全部通过；全量 188 项中 179 通过、9 项原有失败，无新增失败。只读审查通过，差异检查通过。
+
+## 用户追加要求：@群内所有人并发送应用内加急＋短信
+
+- [x] 先修改测试断言，验证原实现缺少 @所有人 且调用应用内接口，出现两个预期失败。
+- [x] 截止告警首行加入 @所有人 标签，发送接口改用 urgent_sms，同一消息只对群用户加急一次。
+- [x] 确认 ECS 固定 lark-cli 1.0.56 支持 urgent_sms 所需参数；不调用 urgent_app 或 urgent_phone。
+- [x] 验证相关 68 项全部通过；全量 188 项中 179 通过、9 项原有失败，无新增失败。只读增量审查通过，合并推送上线。

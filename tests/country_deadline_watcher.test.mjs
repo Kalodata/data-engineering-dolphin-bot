@@ -43,6 +43,11 @@ test("European missing-start alert waits until exactly Beijing 15:40", async (t)
   assert.equal(h.sent.length, 1);
   assert.match(h.sent[0].text, /DE.*2026-11-16.*超时未开始.*北京时间 15:40/);
   assert.equal(h.urged.length, 1);
+  assert.match(h.sent[0].text, /^<at user_id="all"><\/at>\n/);
+  assert.match(h.sent[0].text, /应用内加急＋短信/);
+  assert.equal(h.sent[0].chatId, "oc_test");
+  assert.equal(h.urged[0].messageId, "om_1");
+  assert.deepEqual(h.urged[0].ids, ["ou_0", "ou_1"]);
 });
 
 test("non-European missing-start alert still fires at local 02:10", async (t) => {

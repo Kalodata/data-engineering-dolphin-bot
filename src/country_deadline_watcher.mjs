@@ -116,7 +116,7 @@ export function createCountryDeadlineWatcher({ config, getDs, delivery, now = ()
       if (stopped) return;
       const messageId = await delivery.sendMessage({
         chatId: config.chatId,
-        text: ["天级任务截止告警（全员应用内加急）", ...alerts.map(({ line }) => line)].join("\n"),
+        text: ['<at user_id="all"></at>', "天级任务截止告警（全员应用内加急＋短信）", ...alerts.map(({ line }) => line)].join("\n"),
         idempotencyKey: randomUUID(),
       });
       if (!messageId) throw new Error("Missing urgency message ID");
