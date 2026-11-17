@@ -12,12 +12,12 @@ function loadState(statePath) {
   try {
     const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
     if (!state.checks || typeof state.checks !== "object" || Array.isArray(state.checks) ||
-        !state.pending || typeof state.pending !== "object" || Array.isArray(state.pending)) {
+        (state.pending != null && (typeof state.pending !== "object" || Array.isArray(state.pending)))) {
       throw new Error("Invalid country deadline state");
     }
     return state;
   } catch (error) {
-    if (error.code === "ENOENT") return { checks: {}, pending: {} };
+    if (error.code === "ENOENT") return { checks: {} };
     throw error;
   }
 }
@@ -99,7 +99,7 @@ function dueChecks(config, now) {
 function alertLine(check, inst) {
   const prefix = `${check.country.toUpperCase()} · 数据日 ${check.dataDate}`;
   if (check.kind === "not_started") return `${prefix} · 超时未开始 · 截止 ${getStartDeadlineLabel(check.country)}`;
-  const hour = check.country === "id" ? "15:00" : "13:00";
+  const hour = check.country === "id" ? "15:10" : "13:10";
   const status = inst ? `${inst.state} · 实例 #${inst.id}` : "未开始（未找到实例）";
   return `${prefix} · 超时未完成 · 截止当地时间 ${hour} · 当前 ${status}`;
 }
@@ -109,37 +109,33 @@ export function createCountryDeadlineWatcher({ config, getDs, delivery, now = ()
   let busy = false;
   let stopped = false;
 
-  async function flush(state, id, timestamp) {
-    const pending = state.pending[id];
-    if (!pending || stopped) return;
+  async function sendOnce(alerts) {
     try {
-      const currentMembers = new Set(await delivery.listMemberIds(config.chatId));
-      if (!currentMembers.size) throw new Error("No group users available for urgency");
-      pending.remainingUserIds = pending.remainingUserIds == null
-        ? [...currentMembers]
-        : pending.remainingUserIds.filter((userId) => currentMembers.has(userId));
-      saveState(config.statePath, state, timestamp);
-      if (!pending.messageId) {
-        pending.messageId = await delivery.sendMessage({ chatId: config.chatId, text: pending.text, idempotencyKey: id });
-        if (!pending.messageId) throw new Error("Missing urgency message ID");
-        saveState(config.statePath, state, timestamp);
+      const userIds = [...new Set(await delivery.listMemberIds(config.chatId))];
+      if (!userIds.length) throw new Error("No group users available for urgency");
+      if (stopped) return;
+      const messageId = await delivery.sendMessage({
+        chatId: config.chatId,
+        text: ["天级任务截止告警（全员应用内加急）", ...alerts.map(({ line }) => line)].join("\n"),
+        idempotencyKey: randomUUID(),
+      });
+      if (!messageId) throw new Error("Missing urgency message ID");
+      let failed = false;
+      for (let i = 0; i < userIds.length && !stopped; i += 200) {
+        try {
+          const { invalidUserIds = [] } = await delivery.urgentMessage(messageId, userIds.slice(i, i + 200));
+          if (invalidUserIds.length) {
+            failed = true;
+            log(`[country-deadline] urgency rejected ${invalidUserIds.length} invalid recipients message=${messageId}; no retry`);
+          }
+        } catch (error) {
+          failed = true;
+          log(`[country-deadline] urgency error message=${messageId} batch=${i / 200 + 1}: ${error.message}; no retry`);
+        }
       }
-      while (pending.remainingUserIds.length && !stopped) {
-        const batch = pending.remainingUserIds.slice(0, 200);
-        const { invalidUserIds = [] } = await delivery.urgentMessage(pending.messageId, batch);
-        const invalid = new Set(invalidUserIds);
-        const successful = new Set(batch.filter((userId) => !invalid.has(userId)));
-        pending.remainingUserIds = pending.remainingUserIds.filter((userId) => !successful.has(userId));
-        saveState(config.statePath, state, timestamp);
-        if (invalid.size) throw new Error(`Feishu urgency rejected ${invalid.size} recipients; retained for retry`);
-      }
-      if (pending.remainingUserIds.length) return;
-      for (const key of pending.keys) state.checks[key] = timestamp.getTime();
-      delete state.pending[id];
-      saveState(config.statePath, state, timestamp);
-      log(`[country-deadline] sent message=${pending.messageId} checks=${pending.keys.length} chat=${config.chatId}`);
+      if (!failed && !stopped) log(`[country-deadline] sent message=${messageId} checks=${alerts.length} chat=${config.chatId}`);
     } catch (error) {
-      log(`[country-deadline] delivery error message=${pending.messageId || "pending"}: ${error.message}`);
+      log(`[country-deadline] delivery error: ${error.message}; no retry`);
     }
   }
 
@@ -150,29 +146,32 @@ export function createCountryDeadlineWatcher({ config, getDs, delivery, now = ()
       try {
         const timestamp = now();
         const state = loadState(config.statePath);
-        for (const id of Object.keys(state.pending)) await flush(state, id, timestamp);
-        const reserved = new Set(Object.values(state.pending).flatMap((p) => p.keys));
-        const due = dueChecks(config, timestamp).filter((check) => !state.checks[check.key] && !reserved.has(check.key));
+        // Retire queues from the previous retrying version without sending stale alerts.
+        if (state.pending != null) {
+          for (const pending of Object.values(state.pending)) {
+            if (!Array.isArray(pending?.keys) || pending.keys.some((key) => typeof key !== "string")) {
+              throw new Error("Invalid legacy country deadline state");
+            }
+            for (const key of pending.keys) state.checks[key] = timestamp.getTime();
+          }
+          delete state.pending;
+          saveState(config.statePath, state, timestamp);
+        }
+        const due = dueChecks(config, timestamp).filter((check) => !state.checks[check.key]);
         if (!due.length || stopped) return;
         const latest = await readLatestInstances(getDs(), timestamp, config);
+        if (stopped) return;
         const alerts = [];
         for (const check of due) {
           const inst = latest.get(`${check.country}|${check.dataDate}`);
           if (check.kind === "not_started" ? !inst : inst?.state !== "SUCCESS") {
             alerts.push({ check, line: alertLine(check, inst) });
-          } else state.checks[check.key] = timestamp.getTime();
-        }
-        let id;
-        if (alerts.length) {
-          id = randomUUID();
-          state.pending[id] = {
-            keys: alerts.map(({ check }) => check.key),
-            text: ["天级任务截止告警（全员应用内加急）", ...alerts.map(({ line }) => line)].join("\n"),
-            messageId: null, remainingUserIds: null,
-          };
+          }
+          // Claim before any Feishu call: success, failure or restart must never resend.
+          state.checks[check.key] = timestamp.getTime();
         }
         saveState(config.statePath, state, timestamp);
-        if (id && !stopped) await flush(state, id, timestamp);
+        if (alerts.length && !stopped) await sendOnce(alerts);
       } catch (error) {
         log(`[country-deadline] check error: ${error.message}`);
       } finally {

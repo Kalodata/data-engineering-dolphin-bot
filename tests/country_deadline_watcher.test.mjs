@@ -10,7 +10,7 @@ function instance(country, state, id = 1, dataDate = "2026-11-16", startTime = "
     globalParams: JSON.stringify([{ prop: "country_code", value: country }, { prop: "data_date", value: dataDate }]) };
 }
 
-function setup(t, { countries = ["de"], rows = [], now = "2026-11-17T07:30:00Z", userCount = 2 } = {}) {
+function setup(t, { countries = ["de"], rows = [], now = "2026-11-17T07:40:00Z", userCount = 2 } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "country-urgent-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const sent = [], urged = [], logs = [];
@@ -34,41 +34,41 @@ function setup(t, { countries = ["de"], rows = [], now = "2026-11-17T07:30:00Z",
   };
 }
 
-test("European missing-start alert waits until exactly Beijing 15:30", async (t) => {
-  const h = setup(t, { now: "2026-11-17T07:29:59Z" });
+test("European missing-start alert waits until exactly Beijing 15:40", async (t) => {
+  const h = setup(t, { now: "2026-11-17T07:39:59Z" });
   await h.watcher.tick();
   assert.equal(h.sent.length, 0);
-  h.time("2026-11-17T07:30:00Z");
+  h.time("2026-11-17T07:40:00Z");
   await h.watcher.tick();
   assert.equal(h.sent.length, 1);
-  assert.match(h.sent[0].text, /DE.*2026-11-16.*超时未开始.*北京时间 15:30/);
+  assert.match(h.sent[0].text, /DE.*2026-11-16.*超时未开始.*北京时间 15:40/);
   assert.equal(h.urged.length, 1);
 });
 
-test("non-European missing-start alert still fires at local 02:00", async (t) => {
-  const h = setup(t, { countries: ["id"], now: "2026-11-16T18:59:59Z" });
+test("non-European missing-start alert still fires at local 02:10", async (t) => {
+  const h = setup(t, { countries: ["id"], now: "2026-11-16T19:09:59Z" });
   await h.watcher.tick();
   assert.equal(h.sent.length, 0);
-  h.time("2026-11-16T19:00:00Z");
+  h.time("2026-11-16T19:10:00Z");
   await h.watcher.tick();
-  assert.match(h.sent[0].text, /ID.*2026-11-16.*超时未开始.*当地时间 02:00/);
+  assert.match(h.sent[0].text, /ID.*2026-11-16.*超时未开始.*当地时间 02:10/);
 });
 
-test("Indonesia waits for Jakarta 15:00 to alert a running workflow", async (t) => {
-  const h = setup(t, { countries: ["id"], rows: [instance("id", "RUNNING_EXECUTION")], now: "2026-11-17T07:59:59Z" });
+test("Indonesia waits for Jakarta 15:10 to alert a running workflow", async (t) => {
+  const h = setup(t, { countries: ["id"], rows: [instance("id", "RUNNING_EXECUTION")], now: "2026-11-17T08:09:59Z" });
   await h.watcher.tick();
   assert.equal(h.sent.length, 0);
-  h.time("2026-11-17T08:00:00Z");
+  h.time("2026-11-17T08:10:00Z");
   await h.watcher.tick();
-  assert.match(h.sent[0].text, /ID.*未完成.*15:00.*RUNNING_EXECUTION/);
+  assert.match(h.sent[0].text, /ID.*未完成.*15:10.*RUNNING_EXECUTION/);
 });
 
 test("completion checks all unfinished states and excludes SUCCESS", async (t) => {
   for (const state of ["SUCCESS", "RUNNING_EXECUTION", "FAILURE", "PAUSE", "STOP", "KILL", "SUBMITTED_SUCCESS"]) {
-    const h = setup(t, { countries: ["my"], rows: [instance("my", state)], now: "2026-11-17T04:59:59Z" });
+    const h = setup(t, { countries: ["my"], rows: [instance("my", state)], now: "2026-11-17T05:09:59Z" });
     await h.watcher.tick();
     assert.equal(h.sent.length, 0);
-    h.time("2026-11-17T05:00:00Z");
+    h.time("2026-11-17T05:10:00Z");
     await h.watcher.tick();
     assert.equal(h.sent.length, state === "SUCCESS" ? 0 : 1, state);
   }
@@ -77,19 +77,19 @@ test("completion checks all unfinished states and excludes SUCCESS", async (t) =
 test("US completion after Beijing midnight still finds the local previous day's partition", async (t) => {
   const row = instance("us", "SUCCESS");
   row.name = "TikTok天级任务-37-20261116";
-  const h = setup(t, { countries: ["us"], rows: [row], now: "2026-11-17T18:00:00Z" });
+  const h = setup(t, { countries: ["us"], rows: [row], now: "2026-11-17T18:10:00Z" });
   await h.watcher.tick();
   assert.equal(h.sent.length, 0);
 });
 
 test("latest rerun status takes precedence, including compact data dates", async (t) => {
-  const h = setup(t, { countries: ["my"], rows: [instance("my", "SUCCESS"), instance("my", "FAILURE", 2, "20261116", "2026-11-17 10:00:00")], now: "2026-11-17T05:00:00Z" });
+  const h = setup(t, { countries: ["my"], rows: [instance("my", "SUCCESS"), instance("my", "FAILURE", 2, "20261116", "2026-11-17 10:00:00")], now: "2026-11-17T05:10:00Z" });
   await h.watcher.tick();
   assert.match(h.sent[0].text, /FAILURE.*#2/);
 });
 
 test("simultaneous countries and both absent-instance reasons share one message", async (t) => {
-  const h = setup(t, { countries: ["de", "fr"], now: "2026-11-17T12:00:00Z" });
+  const h = setup(t, { countries: ["de", "fr"], now: "2026-11-17T12:10:00Z" });
   await h.watcher.tick();
   assert.equal(h.sent.length, 1);
   assert.match(h.sent[0].text, /DE.*超时未开始/);
@@ -104,7 +104,7 @@ test("same-country date/type is deduplicated across ticks and process restart", 
   await restarted.tick();
   assert.equal(h.sent.length, 1);
   assert.equal(h.urged.length, 1);
-  h.time("2026-11-18T07:30:00Z");
+  h.time("2026-11-18T07:40:00Z");
   await restarted.tick();
   assert.equal(h.sent.length, 2);
 });
@@ -124,62 +124,90 @@ test("DS failures, missing details and incomplete pagination never become absent
   assert.ok(h.logs.some((s) => /error/i.test(s)));
 });
 
-test("urgency failure retries the saved message without resending successful batches", async (t) => {
-  const h = setup(t, { userCount: 205 });
-  let attempts = 0;
+test("each user batch is attempted once even if another batch fails", async (t) => {
+  const h = setup(t, { userCount: 405 });
+  const calls = [];
   h.delivery.urgentMessage = async (messageId, ids) => {
-    attempts += 1;
-    if (attempts === 2) throw new Error("temporary urgency failure");
-    h.urged.push({ messageId, ids });
+    calls.push({ messageId, ids });
+    if (calls.length === 2) throw new Error("temporary urgency failure");
     return { invalidUserIds: [] };
   };
   await h.watcher.tick();
-  assert.equal(h.sent.length, 1);
-  assert.equal(h.urged[0].ids.length, 200);
-  await createCountryDeadlineWatcher(h.options).tick();
-  assert.equal(h.sent.length, 1);
-  assert.equal(h.urged.length, 2);
-  assert.equal(h.urged[1].ids.length, 5);
-  assert.equal(h.urged[1].messageId, "om_1");
-});
-
-test("failed message send reuses the persisted idempotency key", async (t) => {
-  const h = setup(t);
-  const keys = [];
-  h.delivery.sendMessage = async (message) => {
-    keys.push(message.idempotencyKey);
-    if (keys.length === 1) throw new Error("response lost");
-    return "om_restored";
-  };
   await h.watcher.tick();
   await createCountryDeadlineWatcher(h.options).tick();
-  assert.equal(keys.length, 2);
-  assert.equal(keys[0], keys[1]);
-  assert.equal(h.urged[0].messageId, "om_restored");
+  assert.equal(h.sent.length, 1);
+  assert.deepEqual(calls.map((call) => call.ids.length), [200, 200, 5]);
+  assert.equal(new Set(calls.flatMap((call) => call.ids)).size, 405);
+  assert.ok(h.logs.some((line) => /error/i.test(line)));
 });
 
-test("incomplete member lookup can recover without losing the pending alert", async (t) => {
+test("failed message sends are not retried on another tick or process restart", async (t) => {
   const h = setup(t);
-  h.delivery.listMemberIds = async () => { throw new Error("missing member scope"); };
+  let attempts = 0;
+  h.delivery.sendMessage = async () => { attempts += 1; throw new Error("response lost"); };
   await h.watcher.tick();
+  await h.watcher.tick();
+  await createCountryDeadlineWatcher(h.options).tick();
+  assert.equal(attempts, 1);
+  assert.equal(h.urged.length, 0);
+});
+
+test("member lookup failure does not queue a stale alert for later delivery", async (t) => {
+  const h = setup(t);
+  let attempts = 0;
+  h.delivery.listMemberIds = async () => { attempts += 1; throw new Error("missing member scope"); };
+  await h.watcher.tick();
+  h.delivery.listMemberIds = async () => { attempts += 1; return ["ou_fixed"]; };
+  h.rows([instance("de", "SUCCESS")]);
+  h.time("2026-11-17T12:10:00Z");
+  await h.watcher.tick();
+  assert.equal(attempts, 1);
   assert.equal(h.sent.length, 0);
-  h.delivery.listMemberIds = async () => ["ou_fixed"];
-  await h.watcher.tick();
-  assert.equal(h.sent.length, 1);
-  assert.deepEqual(h.urged[0].ids, ["ou_fixed"]);
+  assert.equal(h.urged.length, 0);
 });
 
-test("partial invalid recipients retry only those still in the group", async (t) => {
+test("invalid urgency recipients are logged without retrying the group", async (t) => {
   const h = setup(t);
-  let calls = 0;
   h.delivery.urgentMessage = async (messageId, ids) => {
     h.urged.push({ messageId, ids });
-    return { invalidUserIds: calls++ === 0 ? ["ou_1"] : [] };
+    return { invalidUserIds: ["ou_1"] };
   };
   await h.watcher.tick();
   await h.watcher.tick();
+  await createCountryDeadlineWatcher(h.options).tick();
   assert.equal(h.sent.length, 1);
-  assert.deepEqual(h.urged[1].ids, ["ou_1"]);
+  assert.equal(h.urged.length, 1);
+  assert.ok(h.logs.some((line) => /invalid|reject/i.test(line)));
+});
+
+test("legacy pending retries are retired without sending old messages", async (t) => {
+  const h = setup(t);
+  const key = "oc_test|2026-11-16|de|not_started";
+  fs.writeFileSync(h.config.statePath, JSON.stringify({ checks: {}, pending: { old: {
+    keys: [key], text: "stale alert", messageId: "om_old", remainingUserIds: ["ou_1"],
+  } } }));
+  await h.watcher.tick();
+  await createCountryDeadlineWatcher(h.options).tick();
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.urged.length, 0);
+  const stored = JSON.parse(fs.readFileSync(h.config.statePath));
+  assert.ok(stored.checks[key]);
+  assert.equal(stored.pending, undefined);
+});
+
+test("unstarted and unfinished are independent once-only alerts for the same data day", async (t) => {
+  const h = setup(t);
+  await h.watcher.tick();
+  assert.equal(h.sent.length, 1);
+  h.time("2026-11-17T12:09:59Z");
+  await h.watcher.tick();
+  assert.equal(h.sent.length, 1);
+  h.time("2026-11-17T12:10:00Z");
+  await h.watcher.tick();
+  await createCountryDeadlineWatcher(h.options).tick();
+  assert.equal(h.sent.length, 2);
+  assert.match(h.sent[1].text, /未完成.*13:10/);
+  assert.doesNotMatch(h.sent[1].text, /超时未开始/);
 });
 
 test("corrupt persistent state fails closed and is never overwritten", async (t) => {

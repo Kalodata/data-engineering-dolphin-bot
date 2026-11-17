@@ -72,7 +72,7 @@ CONFIRM_TTL_MS = 5 * 60 * 1000
 
 - `getGlobalParam(inst, prop)` — 从实例 globalParams 取 country_code / data_date 等
 - `resolveInstanceByCountryDate(ds, {country, dataDate})` — 扫最近 50 条实例 N+1 拿 detail，按 globalParams 精确过滤；工作流名不含国家/日期所以不用 searchVal
-- `listCountryDailyBoard(ds, {})` — TikTok 各国看板，按 dataDate 分组，做超时未开始检测（欧洲为 dataDate+1 北京时间 15:30，其余为当地 02:00）
+- `listCountryDailyBoard(ds, {})` — TikTok 各国看板，按 dataDate 分组，做超时未开始检测（欧洲为 dataDate+1 北京时间 15:40，其余为当地 02:10）
 - `listSimpleBoard(ds, {})` — 非 TikTok 项目，只看运行情况不做 15 国检测
 - `getSubProcessInstanceId(taskInstanceId)` — 拿子流程实例 ID，force-success 向下钻取用
 
@@ -126,8 +126,8 @@ CONFIRM_TTL_MS = 5 * 60 * 1000
 
 ## 各国天级截止告警
 
-`country_deadline_watch` 开启独立每分钟检查，默认沿用天级看板的 24 国及通知群。检查各国当地前一天的数据：当地 13:00 尚未 SUCCESS 就发群消息并向群内全体用户发应用内加急，印尼截止为雅加达 15:00。超时未开始也发全员加急，欧洲阈值统一为北京时间 15:30，其余国家为当地 02:00。定时看板推送时刻保持现有配置。
+`country_deadline_watch` 开启独立每分钟检查，默认沿用天级看板的 24 国及通知群。检查各国当地前一天的数据：当地 13:10 尚未 SUCCESS 就发群消息并向群内全体用户发应用内加急，印尼截止为雅加达 15:10。超时未开始也发全员加急，欧洲阈值统一为北京时间 15:40，其余国家为当地 02:10。定时看板推送时刻保持现有配置。
 
-同轮异常汇总一条消息，以群、国家、数据日、告警类型去重。查询失败或未读完分页时不误报未开始。`.data/country-deadline-state.json` 保存去重状态和待发送任务；重试沿用消息 ID 与幂等键，成功加急的批次不重复。状态文件需要持久卷才能跨 ECS 容器替换保留；当前 ECS 临时磁盘只支持同一文件系统内进程重启恢复。手工损坏状态文件会停止这类检查并记录错误，避免重发全员告警。
+同轮异常汇总一条消息，以群、国家、数据日、告警类型去重。查询失败或未读完分页时不误报未开始。`.data/country-deadline-state.json` 在调用飞书前保存已检查状态；每类告警只尝试发送一次，成员查询、消息发送、加急接口失败或返回无效成员时只记日志，不重试、不补发。超过 200 人时分批，每个用户仅尝试一次，某批失败不阻止其余批次。旧版待重试队列迁移为已检查并丢弃，不发送历史告警。状态文件需要持久卷才能跨 ECS 容器替换保留；当前 ECS 临时磁盘只支持同一文件系统内进程重启去重。手工损坏状态文件会停止这类检查并记录错误，避免重发全员告警。
 
 飞书需要群成员读取（`im:chat.members:read`）和应用内加急（`im:message.urgent` 或 `im:message.urgent:app_send`）权限。发送者为现有 bot，应用内加急每批最多 200 位用户，不发送短信或电话加急。测试使用模拟 API，不向真实群发测试消息。

@@ -51,16 +51,17 @@ export function getScheduledStartUTC(country, dataDate) {
 
 export function getStartDeadlineUTC(country, dataDate) {
   if (EU_COUNTRIES.has(country)) {
-    return localTimeUTC("Asia/Shanghai", shiftDate(dataDate, 1), 15, 30);
+    return localTimeUTC("Asia/Shanghai", shiftDate(dataDate, 1), 15, 40);
   }
-  return getScheduledStartUTC(country, dataDate);
+  const scheduled = getScheduledStartUTC(country, dataDate);
+  return scheduled ? new Date(scheduled.getTime() + 10 * 60_000) : null;
 }
 
 export function getCompletionDeadlineUTC(country, dataDate) {
   if (!COUNTRY_TZ[country] || !dataDate) return null;
-  return localTimeUTC(COUNTRY_TZ[country], shiftDate(dataDate, 1), country === "id" ? 15 : 13);
+  return localTimeUTC(COUNTRY_TZ[country], shiftDate(dataDate, 1), country === "id" ? 15 : 13, 10);
 }
 
 export function getStartDeadlineLabel(country) {
-  return EU_COUNTRIES.has(country) ? "北京时间 15:30" : "当地时间 02:00";
+  return EU_COUNTRIES.has(country) ? "北京时间 15:40" : "当地时间 02:10";
 }
