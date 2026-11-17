@@ -107,6 +107,9 @@ import {
 } from "./card_callback.mjs";
 import { createAuditLog } from "./audit_log.mjs";
 import { startBoardPush, startTieredBoardPush, startStageTimesPush } from "./board_push.mjs";
+import { startCountryDeadlineWatcher } from "./country_deadline_watcher.mjs";
+import { createFeishuUrgentClient } from "./feishu_urgent.mjs";
+import { DAILY_COUNTRIES } from "./country_schedule.mjs";
 import {
   resolveSlowSqlOption,
   formatSlowSqlDetailText,
@@ -199,7 +202,7 @@ function loadDotEnv(envPath) {
   }
 }
 
-function loadConfig(configPath) {
+export function loadConfig(configPath) {
   const resolvedConfigPath = path.isAbsolute(configPath)
     ? configPath
     : path.resolve(process.cwd(), configPath);
@@ -320,6 +323,18 @@ function loadConfig(configPath) {
         minute: Number(bp.minute ?? 0),
       };
     })(),
+    countryDeadlineWatch: (() => {
+      const watch = raw.country_deadline_watch || {};
+      return {
+        enabled: watch.enabled === true,
+        chatId: String(watch.chat_id || raw.board_push?.chat_id || ""),
+        countries: Array.isArray(watch.countries) && watch.countries.length
+          ? [...new Set(watch.countries.map((country) => String(country).toLowerCase()))]
+          : DAILY_COUNTRIES,
+        statePath: path.resolve(path.dirname(resolvedConfigPath), watch.state_path || ".data/country-deadline-state.json"),
+        queryTimeoutMs: Number(watch.query_timeout_ms ?? 45_000),
+      };
+    })(),
     tieredBoardPush: (() => {
       const tbp = raw.tiered_board_push || {};
       return {
@@ -373,6 +388,9 @@ function loadConfig(configPath) {
   }
   if (config.stageTimesPush?.enabled && config.stageTimesPush?.chatId) {
     config.alertChatIds.add(config.stageTimesPush.chatId);
+  }
+  if (config.countryDeadlineWatch?.enabled && config.countryDeadlineWatch?.chatId) {
+    config.alertChatIds.add(config.countryDeadlineWatch.chatId);
   }
 
   // Effective poll interval after webhook mode is known
@@ -3653,6 +3671,13 @@ async function main() {
     log: (line) => console.error(line),
   });
 
+  const countryDeadlineWatcher = startCountryDeadlineWatcher({
+    config: config.countryDeadlineWatch,
+    getDs: () => getDsClient(config, KNOWN_PROJECTS.tiktok.code),
+    delivery: createFeishuUrgentClient(),
+    log: (line) => console.error(line),
+  });
+
   const tieredBoardPusher = startTieredBoardPush({
     config,
     getDs: () => getDsClient(config, KNOWN_PROJECTS.tiered.code),
@@ -3750,6 +3775,11 @@ async function main() {
     }
     try {
       boardPusher?.stop?.();
+    } catch {
+      // ignore
+    }
+    try {
+      countryDeadlineWatcher?.stop?.();
     } catch {
       // ignore
     }

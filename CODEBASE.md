@@ -14,6 +14,9 @@
 - `src/feishu_cards.mjs` — 飞书交互卡片构建（Nova 风格）
 - `src/card_callback.mjs` — HTTP 服务器，接收飞书卡片按钮回调
 - `src/failure_watcher.mjs` — 后台轮询新失败实例并推送告警
+- `src/country_deadline_watcher.mjs` — 每分钟按国家当地日期检查天级任务截止状态，汇总群告警并全员应用内加急
+- `src/country_schedule.mjs` — 看板与加急共用的国家时区、开跑阈值和完成截止时间
+- `src/feishu_urgent.mjs` — bot 身份分页读取群用户、幂等发送消息和分批应用内加急
 - `src/deep_enrich.mjs` — SQL 仓库分析，丰富失败诊断上下文
 - `src/alert_evidence.mjs` — 告警取证（拉日志、分类失败）
 - `src/audit_log.mjs` — 写操作审计日志（重跑/强制成功）
@@ -69,7 +72,7 @@ CONFIRM_TTL_MS = 5 * 60 * 1000
 
 - `getGlobalParam(inst, prop)` — 从实例 globalParams 取 country_code / data_date 等
 - `resolveInstanceByCountryDate(ds, {country, dataDate})` — 扫最近 50 条实例 N+1 拿 detail，按 globalParams 精确过滤；工作流名不含国家/日期所以不用 searchVal
-- `listCountryDailyBoard(ds, {})` — TikTok 15 国看板，按 dataDate 分组，做超时检测（dataDate+1 凌晨 02:00 本地时间）
+- `listCountryDailyBoard(ds, {})` — TikTok 各国看板，按 dataDate 分组，做超时未开始检测（欧洲为 dataDate+1 北京时间 15:30，其余为当地 02:00）
 - `listSimpleBoard(ds, {})` — 非 TikTok 项目，只看运行情况不做 15 国检测
 - `getSubProcessInstanceId(taskInstanceId)` — 拿子流程实例 ID，force-success 向下钻取用
 
@@ -121,7 +124,10 @@ CONFIRM_TTL_MS = 5 * 60 * 1000
 
 ---
 
-## 15 国时区（仅 TikTok /board 超时检测用）
+## 各国天级截止告警
 
-COUNTRY_TZ in ds32_client.mjs：id/vn/th/my/ph/sg/mx/us/gb/de/br/sa/ae/eg/pk
-超时判断：dataDate+1 凌晨 02:00 当地时间 → 转 UTC 比较当前时间
+`country_deadline_watch` 开启独立每分钟检查，默认沿用天级看板的 24 国及通知群。检查各国当地前一天的数据：当地 13:00 尚未 SUCCESS 就发群消息并向群内全体用户发应用内加急，印尼截止为雅加达 15:00。超时未开始也发全员加急，欧洲阈值统一为北京时间 15:30，其余国家为当地 02:00。定时看板推送时刻保持现有配置。
+
+同轮异常汇总一条消息，以群、国家、数据日、告警类型去重。查询失败或未读完分页时不误报未开始。`.data/country-deadline-state.json` 保存去重状态和待发送任务；重试沿用消息 ID 与幂等键，成功加急的批次不重复。状态文件需要持久卷才能跨 ECS 容器替换保留；当前 ECS 临时磁盘只支持同一文件系统内进程重启恢复。手工损坏状态文件会停止这类检查并记录错误，避免重发全员告警。
+
+飞书需要群成员读取（`im:chat.members:read`）和应用内加急（`im:message.urgent` 或 `im:message.urgent:app_send`）权限。发送者为现有 bot，应用内加急每批最多 200 位用户，不发送短信或电话加急。测试使用模拟 API，不向真实群发测试消息。

@@ -76,6 +76,11 @@
     "chat_id": "oc_xxx",
     "hours": [9, 11, 15, 19]
   },
+  "country_deadline_watch": {
+    "enabled": false,
+    "chat_id": "oc_xxx",
+    "state_path": ".data/country-deadline-state.json"
+  },
   "tiered_board_push": {
     "enabled": false,
     "chat_id": "oc_xxx",

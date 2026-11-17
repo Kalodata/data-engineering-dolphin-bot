@@ -683,7 +683,7 @@ export function boardCard({ dayToken, groups = [], cardTitle = null, overdueLabe
     }
     if (overdue.length) {
       const lines = overdue
-        .map((o) => o.message || `${(o.country || "?").toUpperCase()}　本地现在 ${o.localTime}，预计 02:00 已过，仍未见开跑`)
+        .map((o) => o.message || `${(o.country || "?").toUpperCase()}　本地现在 ${o.localTime}，${o.deadlineLabel || "当地时间 02:00"} 已过，仍未见开跑`)
         .join("\n");
       els.push(md(`⚠️ **${overdueLabel}（${overdue.length}）**\n${lines}`));
     }

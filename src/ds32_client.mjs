@@ -1,3 +1,5 @@
+import { COUNTRY_TZ, DAILY_COUNTRIES, getStartDeadlineUTC, getStartDeadlineLabel } from "./country_schedule.mjs";
+export { COUNTRY_TZ, getScheduledStartUTC } from "./country_schedule.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -63,7 +65,7 @@ export class Ds32Client {
     this.projectCode = String(projectCode || "");
   }
 
-  async request(method, apiPath, { params, form } = {}) {
+  async request(method, apiPath, { params, form, signal } = {}) {
     const url = new URL(this.apiUrl + apiPath);
     if (params) {
       for (const [k, v] of Object.entries(params)) {
@@ -82,7 +84,7 @@ export class Ds32Client {
         Object.entries(form).filter(([, v]) => v !== undefined && v !== null),
       ).toString();
     }
-    const response = await fetch(url, { method, headers, body });
+    const response = await fetch(url, { method, headers, body, signal });
     const text = await response.text();
     let json;
     try {
@@ -108,15 +110,19 @@ export class Ds32Client {
     pageNo = 1,
     pageSize = 10,
     searchVal,
+    startDate,
+    endDate,
+    signal,
   } = {}) {
     if (!projectCode) throw new Error("projectCode required (set DS_PROJECT_CODE)");
     return this.request("GET", `/projects/${projectCode}/process-instances`, {
-      params: { pageNo, pageSize, stateType, searchVal },
+      params: { pageNo, pageSize, stateType, searchVal, startDate, endDate },
+      signal,
     });
   }
 
-  async getProcessInstance(processInstanceId, projectCode = this.projectCode) {
-    return this.request("GET", `/projects/${projectCode}/process-instances/${processInstanceId}`);
+  async getProcessInstance(processInstanceId, projectCode = this.projectCode, { signal } = {}) {
+    return this.request("GET", `/projects/${projectCode}/process-instances/${processInstanceId}`, { signal });
   }
 
   /**
@@ -2317,61 +2323,6 @@ export function formatProgressReport({ page, enrich, country }) {
   return header ? `${header}\n\n${body}` : body;
 }
 
-/** IANA timezone per country_code. Each country's daily task starts at local 02:00. */
-export const COUNTRY_TZ = {
-  id: "Asia/Jakarta",
-  vn: "Asia/Ho_Chi_Minh",
-  th: "Asia/Bangkok",
-  my: "Asia/Kuala_Lumpur",
-  ph: "Asia/Manila",
-  sg: "Asia/Singapore",
-  jp: "Asia/Tokyo",
-  us: "America/New_York",
-  mx: "America/Mexico_City",
-  br: "America/Sao_Paulo",
-  gb: "Europe/London",
-  de: "Europe/Berlin",
-  fr: "Europe/Paris",
-  es: "Europe/Madrid",
-  it: "Europe/Rome",
-  at: "Europe/Vienna",
-  be: "Europe/Brussels",
-  cz: "Europe/Prague",
-  gr: "Europe/Athens",
-  hu: "Europe/Budapest",
-  ie: "Europe/Dublin",
-  nl: "Europe/Amsterdam",
-  pl: "Europe/Warsaw",
-  pt: "Europe/Lisbon",
-};
-
-/**
- * Returns the UTC Date when "(dataDate + 1 day) 02:00 local" occurs in the country's timezone.
- * dataDate is the workflow data date (YYYY-MM-DD). Workflows process the previous day's data,
- * so they are scheduled to start at 02:00 local on the NEXT day after the data date.
- */
-export function getScheduledStartUTC(country, dataDate) {
-  const tz = COUNTRY_TZ[country];
-  if (!tz || !dataDate) return null;
-  // dataDate is "YYYY-MM-DD"; scheduled day = dataDate + 1
-  const scheduledDay = new Date(Date.parse(`${dataDate}T00:00:00.000Z`) + 86400000);
-  const scheduledDateStr = new Intl.DateTimeFormat("sv-SE", { timeZone: "UTC" }).format(scheduledDay);
-  // Treat "YYYY-MM-DD 02:00:00" as UTC to get naive timestamp
-  const naiveMs = Date.parse(`${scheduledDateStr}T02:00:00.000Z`);
-  // Re-read that naive timestamp in local timezone to measure offset error
-  const localAtNaive = new Intl.DateTimeFormat("sv-SE", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(new Date(naiveMs));
-  const naiveLocalMs = Date.parse(localAtNaive.replace(" ", "T") + "Z");
-  return new Date(naiveMs + (naiveMs - naiveLocalMs));
-}
-
 /** Returns current local time as "HH:MM" in the country's timezone. */
 function getLocalHHMM(country, now = new Date()) {
   const tz = COUNTRY_TZ[country];
@@ -2422,20 +2373,6 @@ function twoDaysAgoYmdDashShanghai(now = new Date()) {
   return fmt.format(t2);
 }
 
-/** EU country codes whose overdue threshold is Beijing 11:00 (not local 02:00). */
-const EU_COUNTRIES = new Set([
-  "at", "be", "cz", "de", "es", "fr", "gb", "gr", "hu", "ie", "it", "nl", "pl", "pt",
-]);
-
-/** Returns UTC Date for Beijing (Asia/Shanghai) 11:00 on (dataDate + 1 day). */
-function getEuOverdueUTC(dataDate) {
-  if (!dataDate) return null;
-  const nextDay = new Date(Date.parse(`${dataDate}T00:00:00.000Z`) + 86400000);
-  const nextDayStr = new Intl.DateTimeFormat("sv-SE", { timeZone: "UTC" }).format(nextDay);
-  // Beijing 11:00 = UTC 03:00
-  return new Date(Date.parse(`${nextDayStr}T03:00:00.000Z`));
-}
-
 /** Beijing hour >= 15 → tiered board overdue window. */
 function isTieredOverdueTime(now = new Date()) {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -2453,6 +2390,7 @@ function isTieredOverdueTime(now = new Date()) {
 export async function listCountryDailyBoard(
   ds,
   {
+    now = new Date(),
     dayToken = null,
     searchVal = "TikTok天级任务-37",
     knownCountries = null,
@@ -2460,7 +2398,7 @@ export async function listCountryDailyBoard(
     pageSize = 50,
   } = {},
 ) {
-  const token = String(dayToken || todayYmdShanghai());
+  const token = String(dayToken || todayYmdShanghai(now));
   const pages = [];
   // Prefer name contains today's stamp (schedule start day)
   let page = await ds.listProcessInstances({
@@ -2531,14 +2469,9 @@ export async function listCountryDailyBoard(
     });
   }
 
-  const known = knownCountries || [
-    "at", "be", "br", "cz", "de", "es", "fr", "gb", "gr", "hu",
-    "id", "ie", "it", "jp", "mx", "my", "nl", "ph", "pl", "pt",
-    "sg", "th", "us", "vn",
-  ];
-
-  const now = new Date();
+  const known = knownCountries || DAILY_COUNTRIES;
   const targetDate = yesterdayYmdDashShanghai(now);
+  if (!latestByDateCountry.has(targetDate)) latestByDateCountry.set(targetDate, new Map());
   const groups = [...latestByDateCountry.entries()]
     .filter(([dataDate]) => dataDate === targetDate)
     .sort(([a], [b]) => b.localeCompare(a)) // newest dataDate first
@@ -2549,12 +2482,10 @@ export async function listCountryDailyBoard(
       const missing = known.filter((c) => !byCountry.has(c));
       const overdue = missing
         .filter((c) => {
-          const scheduled = EU_COUNTRIES.has(c)
-            ? getEuOverdueUTC(dataDate)
-            : getScheduledStartUTC(c, dataDate);
-          return scheduled != null && now.getTime() > scheduled.getTime();
+          const scheduled = getStartDeadlineUTC(c, dataDate);
+          return scheduled != null && now.getTime() >= scheduled.getTime();
         })
-        .map((c) => ({ country: c, localTime: getLocalHHMM(c, now) }));
+        .map((c) => ({ country: c, localTime: getLocalHHMM(c, now), deadlineLabel: getStartDeadlineLabel(c) }));
       return { dataDate, rows, missing, overdue };
     });
 

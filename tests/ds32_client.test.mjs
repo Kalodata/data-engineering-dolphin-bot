@@ -12,7 +12,32 @@ import {
   isMeaningfulSlowLeaf,
   normalizeDataDate,
   WH_STAGE_NAME_RE,
+  Ds32Client,
 } from "../src/ds32_client.mjs";
+
+test("daily watcher time bounds are forwarded to the DS list API", async () => {
+  const client = new Ds32Client({ apiUrl: "https://ds.example", apiToken: "test", projectCode: "1" });
+  client.request = async (method, url, { params }) => {
+    assert.equal(params.startDate, "2026-11-14 00:00:00");
+    assert.equal(params.endDate, "2026-11-18 00:00:00");
+    return { totalList: [], total: 0 };
+  };
+  await client.listProcessInstances({ startDate: "2026-11-14 00:00:00", endDate: "2026-11-18 00:00:00" });
+});
+
+test("deadline queries pass their abort signal through list, detail and fetch", async (t) => {
+  const client = new Ds32Client({ apiUrl: "https://ds.example", apiToken: "test", projectCode: "1" });
+  const controller = new AbortController();
+  let requests = 0;
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    assert.equal(options.signal, controller.signal);
+    requests += 1;
+    return new Response(JSON.stringify({ code: 0, data: {} }));
+  });
+  await client.listProcessInstances({ signal: controller.signal });
+  await client.getProcessInstance(1, undefined, { signal: controller.signal });
+  assert.equal(requests, 2);
+});
 
 test("extractLogHighlights finds Exception context", () => {
   const log = [
