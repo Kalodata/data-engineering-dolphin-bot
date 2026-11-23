@@ -10,6 +10,7 @@ export const COUNTRY_TZ = {
 };
 
 export const DAILY_COUNTRIES = Object.keys(COUNTRY_TZ).sort();
+const PRECHECK_DEADLINE_HOUR = 8;
 export const EU_COUNTRIES = new Set([
   "at", "be", "cz", "de", "es", "fr", "gb", "gr", "hu", "ie", "it", "nl", "pl", "pt",
 ]);
@@ -64,17 +65,11 @@ export function getCompletionDeadlineUTC(country, dataDate) {
 
 export function getPrecheckDeadlineUTC(country, dataDate) {
   if (!COUNTRY_TZ[country] || !dataDate) return null;
-  const [hour, minute] = precheckDeadlineTime(country);
-  return localTimeUTC(COUNTRY_TZ[country], shiftDate(dataDate, 1), hour, minute);
+  return localTimeUTC(COUNTRY_TZ[country], shiftDate(dataDate, 1), PRECHECK_DEADLINE_HOUR);
 }
 
-function precheckDeadlineTime(country) {
-  return country === "us" ? [4, 30] : [8, 0];
-}
-
-export function getPrecheckDeadlineLabel(country) {
-  const time = precheckDeadlineTime(country).map((part) => String(part).padStart(2, "0")).join(":");
-  return `当地时间 ${time}`;
+export function getPrecheckDeadlineLabel() {
+  return `当地时间 ${String(PRECHECK_DEADLINE_HOUR).padStart(2, "0")}:00`;
 }
 
 export function getStartDeadlineLabel(country) {
