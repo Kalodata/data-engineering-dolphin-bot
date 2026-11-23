@@ -20,6 +20,7 @@ function setup(t, { countries = ["de"], rows = [], now = "2026-11-17T07:40:00Z",
   const ds = {
     async listProcessInstances({ pageNo = 1, pageSize }) { return { totalList: data.slice((pageNo - 1) * pageSize, pageNo * pageSize), total: data.length }; },
     async getProcessInstance(id) { return data.find((r) => r.id === id); },
+    async listTaskInstances() { return { totalList: [], total: 0 }; },
   };
   const delivery = {
     async listMemberIds() { return Array.from({ length: userCount }, (_, i) => `ou_${i}`); },
@@ -77,6 +78,80 @@ test("completion checks all unfinished states and excludes SUCCESS", async (t) =
     await h.watcher.tick();
     assert.equal(h.sent.length, state === "SUCCESS" ? 0 : 1, state);
   }
+});
+
+const runningPrecheck = {
+  id: 81, name: "前置检测", taskType: "SUB_PROCESS", state: "RUNNING_EXECUTION", flag: "YES",
+  startTime: "2026-11-17 11:01:03",
+};
+
+test("US precheck sends SMS at New York 03:00 and shows 03:00 in the alert", async (t) => {
+  const h = setup(t, { countries: ["us"], now: "2026-11-17T07:59:59Z", rows: [
+    instance("us", "RUNNING_EXECUTION", 71, "2026-11-16", "2026-11-17 15:01:00"),
+  ] });
+  h.ds.listTaskInstances = async () => ({
+    totalList: [{ ...runningPrecheck, startTime: "2026-11-17 15:01:00" }], total: 1,
+  });
+  await h.watcher.tick();
+  assert.equal(h.sent.length, 0);
+  h.time("2026-11-17T08:00:00Z");
+  await h.watcher.tick();
+  assert.equal(h.sent.length, 1);
+  assert.match(h.sent[0].text, /US.*前置检测.*仍在运行.*03:00.*实例 #71/);
+  assert.equal(h.urged.length, 1);
+});
+
+test("Italy precheck alerts at Rome 08:00 using the latest workflow and sends urgency once", async (t) => {
+  const h = setup(t, { countries: ["it"], now: "2026-11-17T06:59:59Z", rows: [
+    instance("it", "STOP", 10), instance("it", "RUNNING_EXECUTION", 11, "2026-11-16", "2026-11-17 11:01:00"),
+  ] });
+  const queried = [];
+  h.ds.listTaskInstances = async ({ processInstanceId, signal }) => {
+    queried.push(processInstanceId);
+    assert.ok(signal instanceof AbortSignal);
+    return { totalList: [runningPrecheck], total: 1 };
+  };
+  await h.watcher.tick();
+  assert.equal(h.sent.length, 0);
+  assert.deepEqual(queried, []);
+  h.time("2026-11-17T07:00:00Z");
+  await h.watcher.tick();
+  await createCountryDeadlineWatcher(h.options).tick();
+  assert.deepEqual(queried, [11]);
+  assert.equal(h.sent.length, 1);
+  assert.match(h.sent[0].text, /IT.*2026-11-16.*前置检测.*仍在运行.*08:00.*实例 #11.*节点 #81/);
+  assert.deepEqual(h.urged, [{ messageId: "om_1", ids: ["ou_0", "ou_1"] }]);
+});
+
+test("precheck only alerts for an active node already running at its deadline", async (t) => {
+  for (const nodes of [
+    [],
+    [{ ...runningPrecheck, name: "DWD-STAGE" }],
+    [{ ...runningPrecheck, state: "SUCCESS" }, { ...runningPrecheck, id: 80, flag: "NO" }],
+    [{ ...runningPrecheck, state: "FAILURE" }],
+    [{ ...runningPrecheck, startTime: "2026-11-17 15:00:01" }],
+  ]) {
+    const h = setup(t, { countries: ["it"], rows: [instance("it", "RUNNING_EXECUTION")], now: "2026-11-17T07:00:05Z" });
+    let reads = 0;
+    h.ds.listTaskInstances = async () => { reads += 1; return { totalList: nodes, total: nodes.length }; };
+    await h.watcher.tick();
+    assert.equal(reads, 1);
+    assert.equal(h.sent.length, 0);
+  }
+});
+
+test("a precheck query error does not consume its check or block a due completion alert", async (t) => {
+  const h = setup(t, { countries: ["it"], rows: [instance("it", "RUNNING_EXECUTION")], now: "2026-11-17T12:10:00Z" });
+  h.ds.listTaskInstances = async () => { throw new Error("task API offline"); };
+  await h.watcher.tick();
+  assert.equal(h.sent.length, 1);
+  assert.match(h.sent[0].text, /未完成.*13:10/);
+  assert.match(h.logs.join("\n"), /task API offline/);
+  h.ds.listTaskInstances = async () => ({ totalList: [runningPrecheck], total: 1 });
+  await h.watcher.tick();
+  assert.equal(h.sent.length, 2);
+  assert.match(h.sent[1].text, /前置检测.*仍在运行/);
+  assert.doesNotMatch(h.sent[1].text, /超时未完成/);
 });
 
 test("US completion after Beijing midnight still finds the local previous day's partition", async (t) => {

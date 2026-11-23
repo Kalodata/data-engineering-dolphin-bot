@@ -144,9 +144,11 @@ export class Ds32Client {
     stateType,
     pageNo = 1,
     pageSize = 50,
+    signal,
   } = {}) {
     return this.request("GET", `/projects/${projectCode}/task-instances`, {
       params: { processInstanceId, stateType, pageNo, pageSize },
+      signal,
     });
   }
 

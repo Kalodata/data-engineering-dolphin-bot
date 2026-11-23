@@ -62,6 +62,19 @@ export function getCompletionDeadlineUTC(country, dataDate) {
   return localTimeUTC(COUNTRY_TZ[country], shiftDate(dataDate, 1), country === "id" ? 15 : 13, 10);
 }
 
+export function getPrecheckDeadlineUTC(country, dataDate) {
+  if (!COUNTRY_TZ[country] || !dataDate) return null;
+  return localTimeUTC(COUNTRY_TZ[country], shiftDate(dataDate, 1), precheckDeadlineHour(country));
+}
+
+function precheckDeadlineHour(country) {
+  return country === "us" ? 3 : 8;
+}
+
+export function getPrecheckDeadlineLabel(country) {
+  return `当地时间 ${String(precheckDeadlineHour(country)).padStart(2, "0")}:00`;
+}
+
 export function getStartDeadlineLabel(country) {
   return EU_COUNTRIES.has(country) ? "北京时间 15:40" : "当地时间 02:10";
 }

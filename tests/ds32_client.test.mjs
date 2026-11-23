@@ -36,7 +36,8 @@ test("deadline queries pass their abort signal through list, detail and fetch", 
   });
   await client.listProcessInstances({ signal: controller.signal });
   await client.getProcessInstance(1, undefined, { signal: controller.signal });
-  assert.equal(requests, 2);
+  await client.listTaskInstances({ processInstanceId: 1, signal: controller.signal });
+  assert.equal(requests, 3);
 });
 
 test("extractLogHighlights finds Exception context", () => {
