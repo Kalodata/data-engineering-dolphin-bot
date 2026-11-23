@@ -119,7 +119,7 @@ function alertLine(check, inst, precheck) {
   const prefix = `${check.country.toUpperCase()} · 数据日 ${check.dataDate}`;
   if (check.kind === "not_started") return `${prefix} · 超时未开始 · 截止 ${getStartDeadlineLabel(check.country)}`;
   if (check.kind === "precheck_running") {
-    return `${prefix} · 前置检测仍在运行 · 截止${getPrecheckDeadlineLabel(check.country)} · 实例 #${inst.id} · 节点 #${precheck.id}`;
+    return `${prefix} · 前置检测仍在运行 · 截止${getPrecheckDeadlineLabel()} · 实例 #${inst.id} · 节点 #${precheck.id}`;
   }
   const hour = check.country === "id" ? "15:10" : "13:10";
   const status = inst ? `${inst.state} · 实例 #${inst.id}` : "未开始（未找到实例）";
