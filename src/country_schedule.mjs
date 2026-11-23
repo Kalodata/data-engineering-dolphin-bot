@@ -64,15 +64,17 @@ export function getCompletionDeadlineUTC(country, dataDate) {
 
 export function getPrecheckDeadlineUTC(country, dataDate) {
   if (!COUNTRY_TZ[country] || !dataDate) return null;
-  return localTimeUTC(COUNTRY_TZ[country], shiftDate(dataDate, 1), precheckDeadlineHour(country));
+  const [hour, minute] = precheckDeadlineTime(country);
+  return localTimeUTC(COUNTRY_TZ[country], shiftDate(dataDate, 1), hour, minute);
 }
 
-function precheckDeadlineHour(country) {
-  return country === "us" ? 3 : 8;
+function precheckDeadlineTime(country) {
+  return country === "us" ? [4, 30] : [8, 0];
 }
 
 export function getPrecheckDeadlineLabel(country) {
-  return `当地时间 ${String(precheckDeadlineHour(country)).padStart(2, "0")}:00`;
+  const time = precheckDeadlineTime(country).map((part) => String(part).padStart(2, "0")).join(":");
+  return `当地时间 ${time}`;
 }
 
 export function getStartDeadlineLabel(country) {

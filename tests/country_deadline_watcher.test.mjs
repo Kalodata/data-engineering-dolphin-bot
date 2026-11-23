@@ -85,8 +85,8 @@ const runningPrecheck = {
   startTime: "2026-11-17 11:01:03",
 };
 
-test("US precheck sends SMS at New York 03:00 and shows 03:00 in the alert", async (t) => {
-  const h = setup(t, { countries: ["us"], now: "2026-11-17T07:59:59Z", rows: [
+test("US precheck sends SMS at New York 04:30 and shows 04:30 in the alert", async (t) => {
+  const h = setup(t, { countries: ["us"], now: "2026-11-17T09:29:59Z", rows: [
     instance("us", "RUNNING_EXECUTION", 71, "2026-11-16", "2026-11-17 15:01:00"),
   ] });
   h.ds.listTaskInstances = async () => ({
@@ -94,10 +94,10 @@ test("US precheck sends SMS at New York 03:00 and shows 03:00 in the alert", asy
   });
   await h.watcher.tick();
   assert.equal(h.sent.length, 0);
-  h.time("2026-11-17T08:00:00Z");
+  h.time("2026-11-17T09:30:00Z");
   await h.watcher.tick();
   assert.equal(h.sent.length, 1);
-  assert.match(h.sent[0].text, /US.*前置检测.*仍在运行.*03:00.*实例 #71/);
+  assert.match(h.sent[0].text, /US.*前置检测.*仍在运行.*04:30.*实例 #71/);
   assert.equal(h.urged.length, 1);
 });
 
