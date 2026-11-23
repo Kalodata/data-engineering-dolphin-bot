@@ -18,9 +18,25 @@ test("non-European start deadline stays local 02:10", () => {
 
 test("completion deadline is local 13:10 except Jakarta 15:10", () => {
   assert.equal(schedule.getCompletionDeadlineUTC("id", "2026-11-16").toISOString(), "2026-11-17T08:10:00.000Z");
+  assert.equal(schedule.getCompletionDeadlineUTC("it", "2026-11-16").toISOString(), "2026-11-17T12:10:00.000Z");
   assert.equal(schedule.getCompletionDeadlineUTC("my", "2026-11-16").toISOString(), "2026-11-17T05:10:00.000Z");
   assert.equal(schedule.getCompletionDeadlineUTC("us", "2026-11-16").toISOString(), "2026-11-17T18:10:00.000Z");
   assert.equal(schedule.getCompletionDeadlineUTC("us", "2026-07-16").toISOString(), "2026-07-17T17:10:00.000Z");
+});
+
+test("precheck deadline is New York 03:00 in the US and local 08:00 elsewhere", () => {
+  for (const dataDate of ["2026-11-16", "2026-07-16"]) {
+    for (const [country, timeZone] of Object.entries(schedule.COUNTRY_TZ)) {
+      const deadline = schedule.getPrecheckDeadlineUTC(country, dataDate);
+      const localTime = new Intl.DateTimeFormat("en-GB", {
+        timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+      }).format(deadline);
+      const expected = country === "us" ? "03:00" : "08:00";
+      assert.equal(localTime, expected, country);
+      assert.equal(schedule.getPrecheckDeadlineLabel(country), `当地时间 ${expected}`, country);
+      assert.equal(schedule.dateInTimeZone(deadline, timeZone), schedule.shiftDate(dataDate, 1), country);
+    }
+  }
 });
 
 test("completion uses the correct offset on DST transition dates", () => {

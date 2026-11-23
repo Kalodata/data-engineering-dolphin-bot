@@ -5,6 +5,7 @@ import { getGlobalParam, normalizeDataDate } from "./ds32_client.mjs";
 import {
   COUNTRY_TZ, DAILY_COUNTRIES, getCountryDataDate,
   getStartDeadlineUTC, getCompletionDeadlineUTC, getStartDeadlineLabel,
+  getPrecheckDeadlineUTC, getPrecheckDeadlineLabel,
   dateInTimeZone, shiftDate,
 } from "./country_schedule.mjs";
 
@@ -79,6 +80,23 @@ async function readLatestInstances(ds, now, { maxPages = 10, pageSize = 50, quer
   return latest;
 }
 
+async function readRunningPrecheck(ds, inst, deadline, signal) {
+  if (!inst || inst.state === "SUCCESS") return null;
+  const page = await ds.listTaskInstances({ processInstanceId: inst.id, pageSize: 200, signal });
+  const rows = page?.totalList;
+  if (!Array.isArray(rows) || Number(page.total) > rows.length) {
+    throw new Error(`DS task instance list is incomplete for workflow #${inst.id}`);
+  }
+  const precheck = rows.find((task) => task.name === "前置检测" && task.flag !== "NO");
+  if (precheck?.state !== "RUNNING_EXECUTION") return null;
+
+  // DS returns unzoned task timestamps in Beijing time.
+  const startTime = String(precheck.startTime || "").replace(" ", "T");
+  const startedAt = Date.parse(/(?:Z|[+-]\d{2}:?\d{2})$/.test(startTime) ? startTime : `${startTime}+08:00`);
+  if (!precheck.id || !Number.isFinite(startedAt)) throw new Error(`DS precheck details are incomplete for workflow #${inst.id}`);
+  return startedAt <= deadline.getTime() ? precheck : null;
+}
+
 function dueChecks(config, now) {
   const result = [];
   for (const country of config.countries || DAILY_COUNTRIES) {
@@ -87,18 +105,22 @@ function dueChecks(config, now) {
     for (const [kind, deadline] of [
       ["not_started", getStartDeadlineUTC(country, dataDate)],
       ["not_completed", getCompletionDeadlineUTC(country, dataDate)],
+      ["precheck_running", getPrecheckDeadlineUTC(country, dataDate)],
     ]) {
       if (now >= deadline) result.push({
-        country, dataDate, kind, key: `${config.chatId}|${dataDate}|${country}|${kind}`,
+        country, dataDate, kind, deadline, key: `${config.chatId}|${dataDate}|${country}|${kind}`,
       });
     }
   }
   return result;
 }
 
-function alertLine(check, inst) {
+function alertLine(check, inst, precheck) {
   const prefix = `${check.country.toUpperCase()} · 数据日 ${check.dataDate}`;
   if (check.kind === "not_started") return `${prefix} · 超时未开始 · 截止 ${getStartDeadlineLabel(check.country)}`;
+  if (check.kind === "precheck_running") {
+    return `${prefix} · 前置检测仍在运行 · 截止${getPrecheckDeadlineLabel(check.country)} · 实例 #${inst.id} · 节点 #${precheck.id}`;
+  }
   const hour = check.country === "id" ? "15:10" : "13:10";
   const status = inst ? `${inst.state} · 实例 #${inst.id}` : "未开始（未找到实例）";
   return `${prefix} · 超时未完成 · 截止当地时间 ${hour} · 当前 ${status}`;
@@ -110,6 +132,7 @@ export function createCountryDeadlineWatcher({ config, getDs, delivery, now = ()
   let stopped = false;
 
   async function sendOnce(alerts) {
+    const details = alerts.map(({ check }) => `${check.country}/${check.dataDate}/${check.kind}`).join(",");
     try {
       const userIds = [...new Set(await delivery.listMemberIds(config.chatId))];
       if (!userIds.length) throw new Error("No group users available for urgency");
@@ -133,9 +156,9 @@ export function createCountryDeadlineWatcher({ config, getDs, delivery, now = ()
           log(`[country-deadline] urgency error message=${messageId} batch=${i / 200 + 1}: ${error.message}; no retry`);
         }
       }
-      if (!failed && !stopped) log(`[country-deadline] sent message=${messageId} checks=${alerts.length} chat=${config.chatId}`);
+      if (!failed && !stopped) log(`[country-deadline] sent message=${messageId} checks=${alerts.length} chat=${config.chatId} details=${details}`);
     } catch (error) {
-      log(`[country-deadline] delivery error: ${error.message}; no retry`);
+      log(`[country-deadline] delivery error details=${details}: ${error.message}; no retry`);
     }
   }
 
@@ -159,16 +182,31 @@ export function createCountryDeadlineWatcher({ config, getDs, delivery, now = ()
         }
         const due = dueChecks(config, timestamp).filter((check) => !state.checks[check.key]);
         if (!due.length || stopped) return;
-        const latest = await readLatestInstances(getDs(), timestamp, config);
+        const ds = getDs();
+        const latest = await readLatestInstances(ds, timestamp, config);
+        if (stopped) return;
+        const taskSignal = AbortSignal.timeout(config.queryTimeoutMs ?? 45_000);
+        const evaluated = await Promise.all(due.map(async (check) => {
+          const inst = latest.get(`${check.country}|${check.dataDate}`);
+          if (check.kind === "precheck_running") {
+            try {
+              const precheck = await readRunningPrecheck(ds, inst, check.deadline, taskSignal);
+              return { check, line: precheck ? alertLine(check, inst, precheck) : null };
+            } catch (error) {
+              log(`[country-deadline] precheck query error country=${check.country} dataDate=${check.dataDate}: ${error.message}`);
+              return null;
+            }
+          }
+          const shouldAlert = check.kind === "not_started" ? !inst : inst?.state !== "SUCCESS";
+          return { check, line: shouldAlert ? alertLine(check, inst) : null };
+        }));
         if (stopped) return;
         const alerts = [];
-        for (const check of due) {
-          const inst = latest.get(`${check.country}|${check.dataDate}`);
-          if (check.kind === "not_started" ? !inst : inst?.state !== "SUCCESS") {
-            alerts.push({ check, line: alertLine(check, inst) });
-          }
+        for (const outcome of evaluated) {
+          if (!outcome) continue;
+          if (outcome.line) alerts.push(outcome);
           // Claim before any Feishu call: success, failure or restart must never resend.
-          state.checks[check.key] = timestamp.getTime();
+          state.checks[outcome.check.key] = timestamp.getTime();
         }
         saveState(config.statePath, state, timestamp);
         if (alerts.length && !stopped) await sendOnce(alerts);
